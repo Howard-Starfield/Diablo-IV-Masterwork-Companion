@@ -12,6 +12,9 @@ A Python-based automation tool designed to assist with the masterworking process
 - **You assume all risks** associated with using this software
 - The developers are **not responsible** for any account actions taken by Blizzard
 - **Check the current Terms of Service** before deciding to use this tool
+- 
+-Demo：
+https://images-ext-1.discordapp.net/external/t2CT5HrD3v5qAp5I11ABcx2dqpNPCGyd_pmXHYanhXQ/https/i.imgur.com/n3xf2xd.mp4
 
 ## Features
 

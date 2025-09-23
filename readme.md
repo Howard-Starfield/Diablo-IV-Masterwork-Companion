@@ -1,4 +1,4 @@
-# Helcome to Diablo-IV-Masterwork-Companion!
+# Welcome to Diablo-IV-Masterwork-Companion!
 
 A Python-based automation tool designed to assist with the masterworking process in Diablo IV by automatically detecting and selecting desired affixes.
 

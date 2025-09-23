@@ -1,0 +1,55 @@
+Python Installation (Recommended for developers)
+
+1. **Install Python 3.7+** from [python.org](https://python.org)
+
+2. **Install required dependencies:**
+   ```bash
+   pip install opencv-python numpy pyautogui keyboard Pillow
+   ```
+
+3. **Optional: Install pygame for sound effects:**
+   ```bash
+   pip install pygame
+   ```
+
+4. **Download the tool** and extract to a folder
+
+5. **Run the application:**
+   ```bash
+   python "Diablo-IV-Masterwork-Companion.py"
+   ```
+
+### Method 2: Executable (If available)
+
+1. Download the executable release
+2. Extract to a folder
+3. Run the `.exe` file
+4. All dependencies are included
+
+## Required Resource Files
+
+The tool requires several reference images to function. These should be placed in a `resources/` folder:
+
+**Required Images:**
+- `upgrade_1.png` - The upgrade button
+- `upgrade_2.png` - Alternate upgrade button state
+- `upgrade_3.png` - Third upgrade button variant
+- `skip.png` - The skip button
+- `reset.png` - The reset button
+- `confirm.png` - The confirmation dialog button
+- `affix.png` - **YOUR DESIRED AFFIX** (captured during setup)
+
+**Optional Images:**
+- `mw_window.png` - Reference image for tooltips
+
+**Sound Files** (optional, in `resources/sound/`):
+- `start_effect.mp3` - Plays when bot starts
+- `done.mp3` - Plays when masterworking completes
+
+
+## System Requirements
+
+- **Operating System**: Windows (tested)
+- **Python**: Version 3.7 or higher
+- **Screen Resolution**: Any (tool captures specific UI elements)
+- **Game**: Diablo IV

@@ -14,7 +14,7 @@ A Python-based automation tool designed to assist with the masterworking process
 - **Check the current Terms of Service** before deciding to use this tool
 - 
 -Demo：
-https://images-ext-1.discordapp.net/external/t2CT5HrD3v5qAp5I11ABcx2dqpNPCGyd_pmXHYanhXQ/https/i.imgur.com/n3xf2xd.mp4
+[https://images-ext-1.discordapp.net/external/t2CT5HrD3v5qAp5I11ABcx2dqpNPCGyd_pmXHYanhXQ/https/i.imgur.com/n3xf2xd.mp4](https://imgur.com/n3xf2xd)
 
 ## Features
 

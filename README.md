@@ -1,16 +1,23 @@
 # Diablo Masterwork Companion
 
-A small Windows companion for Diablo IV enchanting. It watches the affix result, compares it with your target, and repeats the reroll flow until it finds a match or you stop it.
+A Windows companion for Diablo IV enchanting. It watches the affix result, compares it with your target, and repeats rerolls until it finds a match or you stop it.
+
+## What It Offers
+
+- Saves your button and affix-area setup.
+- Checks each reroll result for your target affix.
+- Stops when a match is found.
+- Lets you stop any time with `ESC`.
+- Supports unlimited attempts by setting max attempts to `0`.
 
 ## How To Use
 
 1. Open the app.
-2. Select the enchant window and mark the buttons/affix area.
-3. Enter the affix you want.
-4. Start the bot.
-5. Press `ESC` at any time to stop.
-
-Set max attempts to `0` to keep rerolling until a match is found.
+2. Select the enchant window.
+3. Mark the enchant button, affix result area, replace button, and close button.
+4. Enter the affix you want.
+5. Start the bot.
+6. Press `ESC` to stop.
 
 ## Build
 
@@ -23,3 +30,9 @@ The app is created at:
 ```text
 target/release/enchant_ocr_native.exe
 ```
+
+## Ownership
+
+Copyright (c) 2026 Howard Starfield. All rights reserved.
+
+This project is not affiliated with or endorsed by Blizzard Entertainment.

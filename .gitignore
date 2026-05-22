@@ -1,12 +1,15 @@
+# Local notes/backups
 /.git-backups/
 /learn.txt
 
 # Rust build outputs
 /target/
 **/target/
+Cargo.lock.bak
 
 # Local runtime settings and generated release artifacts
 **/enchant_config_native.json
+**/target/**/app_icon.png
 **/*.pdb
 **/*.exe
 **/*.d
@@ -14,5 +17,7 @@
 # OS/editor noise
 Thumbs.db
 .DS_Store
+.vscode/
+.idea/
 *.tmp
 *.log

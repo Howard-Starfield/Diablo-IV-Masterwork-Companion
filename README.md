@@ -22,13 +22,13 @@ A Windows companion for Diablo IV enchanting. It watches the affix result, compa
 ## Build
 
 ```powershell
-cargo build --release -p enchant_ocr_native
+cargo build --release
 ```
 
 The app is created at:
 
 ```text
-target/release/enchant_ocr_native.exe
+target/release/diablo_masterwork_companion.exe
 ```
 
 ## Ownership

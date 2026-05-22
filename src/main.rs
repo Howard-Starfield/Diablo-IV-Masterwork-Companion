@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod backend;
+
 use eframe::{
     App, CreationContext,
     egui::{
@@ -19,11 +21,10 @@ use eframe::{
         Slider, Stroke, TopBottomPanel, Ui, Vec2, ViewportCommand, Widget,
     },
 };
-use enchant_ocr_backend::{
+use crate::backend::{
     config::{EnchantConfig, MouseMovementProfile, default_mouse_movement_profile},
     enchant_loop::{EnchantEvent, EnchantRunner, OcrReader, RegionCapture},
-    match_affix,
-    matcher::MatchResult,
+    matcher::{MatchResult, match_affix},
     platform::{
         EscStopSignal, SendInputController, WindowsOcrReader, XcapRegionCapture,
         enable_per_monitor_dpi_awareness, record_mouse_movement_profile, select_screen_rect,

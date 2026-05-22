@@ -1,9 +1,6 @@
-use std::{fs, path::Path};
-
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{PointRatio, Rect, RectRatio};
+use super::types::{PointRatio, Rect, RectRatio};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MouseMovementProfile {
@@ -66,26 +63,6 @@ pub struct EnchantConfig {
 }
 
 impl EnchantConfig {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let contents = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config {}", path.display()))?;
-        serde_json::from_str(&contents)
-            .with_context(|| format!("failed to parse config {}", path.display()))
-    }
-
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create config directory {}", parent.display())
-            })?;
-        }
-        let contents = serde_json::to_string_pretty(self)?;
-        fs::write(path, contents)
-            .with_context(|| format!("failed to write config {}", path.display()))
-    }
-
     pub fn sample() -> Self {
         Self {
             targets: vec!["Max Health".to_string()],

@@ -31,13 +31,7 @@ impl Rect {
         }
     }
 
-    pub fn contains_point(self, point: Point) -> bool {
-        point.x >= self.x
-            && point.y >= self.y
-            && point.x < self.x + self.width as i32
-            && point.y < self.y + self.height as i32
-    }
-
+    #[cfg(test)]
     pub fn contains_rect(self, rect: Rect) -> bool {
         let self_right = self.x + self.width as i32;
         let self_bottom = self.y + self.height as i32;
@@ -73,15 +67,6 @@ pub struct PointRatio {
     pub y: f32,
 }
 
-impl PointRatio {
-    pub fn from_point(window: Rect, point: Point) -> Self {
-        Self {
-            x: ((point.x - window.x) as f32 / window.width as f32).clamp(0.0, 1.0),
-            y: ((point.y - window.y) as f32 / window.height as f32).clamp(0.0, 1.0),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RectRatio {
     pub x: f32,
@@ -91,6 +76,7 @@ pub struct RectRatio {
 }
 
 impl RectRatio {
+    #[cfg(test)]
     pub fn from_rect(window: Rect, rect: Rect) -> Self {
         Self {
             x: ((rect.x - window.x) as f32 / window.width as f32).clamp(0.0, 1.0),
@@ -112,13 +98,12 @@ impl RectRatio {
 
 #[derive(Debug, Clone)]
 pub struct ScreenImage {
-    pub rect: Rect,
     pub rgba: RgbaImage,
 }
 
 impl ScreenImage {
-    pub fn new(rect: Rect, rgba: RgbaImage) -> Self {
-        Self { rect, rgba }
+    pub fn new(rgba: RgbaImage) -> Self {
+        Self { rgba }
     }
 }
 

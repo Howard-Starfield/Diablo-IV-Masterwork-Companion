@@ -993,6 +993,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "diablo_masterwork_companion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eframe",
+ "futures-lite 2.6.1",
+ "image 0.25.10",
+ "serde",
+ "serde_json",
+ "strsim",
+ "tempfile",
+ "thiserror 2.0.18",
+ "windows 0.62.2",
+ "winresource",
+ "xcap",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1215,34 +1233,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4c3a552cfca14630702449d35f41c84a0d15963273771c6059175a803620f3f"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "enchant_ocr_backend"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "futures-lite 2.6.1",
- "image 0.25.10",
- "serde",
- "serde_json",
- "strsim",
- "tempfile",
- "thiserror 2.0.18",
- "windows 0.62.2",
- "xcap",
-]
-
-[[package]]
-name = "enchant_ocr_native"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "eframe",
- "enchant_ocr_backend",
- "serde",
- "serde_json",
- "winresource",
 ]
 
 [[package]]

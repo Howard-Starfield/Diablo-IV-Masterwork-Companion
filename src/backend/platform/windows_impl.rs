@@ -52,7 +52,7 @@ use windows::{
 };
 use xcap::Monitor;
 
-use crate::{
+use super::super::{
     config::{MouseMovementModel, MouseMovementProfile, MouseMovementSample, MouseMovementStep},
     enchant_loop::{InputController, OcrReader, RegionCapture, StopSignal},
     types::{Point, Rect, ScreenImage},
@@ -83,7 +83,7 @@ impl RegionCapture for XcapRegionCapture {
             .capture_region(local_x, local_y, rect.width, rect.height)
             .with_context(|| format!("failed to capture OCR region {:?}", rect))?;
 
-        Ok(ScreenImage::new(rect, image))
+        Ok(ScreenImage::new(image))
     }
 }
 
@@ -800,22 +800,6 @@ fn lparam_x(lparam: LPARAM) -> i32 {
 
 fn lparam_y(lparam: LPARAM) -> i32 {
     ((lparam.0 as u32 >> 16) & 0xffff) as i16 as i32
-}
-
-pub fn select_screen_point() -> Result<Point> {
-    wait_until_left_button_released()?;
-
-    loop {
-        if escape_pressed() {
-            return Err(anyhow!("point selection cancelled"));
-        }
-        if left_button_pressed() {
-            let point = cursor_pos()?;
-            wait_until_left_button_released()?;
-            return Ok(point);
-        }
-        thread::sleep(Duration::from_millis(16));
-    }
 }
 
 pub fn record_mouse_movement_profile() -> Result<MouseMovementProfile> {

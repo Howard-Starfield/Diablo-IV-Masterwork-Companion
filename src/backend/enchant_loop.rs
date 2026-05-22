@@ -4,7 +4,7 @@ use std::{thread, time::Duration};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use super::{
     config::{EnchantConfig, MouseMovementProfile},
     matcher::{MatchResult, match_affix},
     types::{Point, Rect, ScreenImage},
@@ -36,8 +36,10 @@ pub trait InputController {
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub struct NeverStop;
 
+#[cfg(test)]
 impl StopSignal for NeverStop {
     fn should_stop(&self) -> bool {
         false
@@ -114,10 +116,6 @@ where
             input,
             stop,
         }
-    }
-
-    pub fn config(&self) -> &EnchantConfig {
-        &self.config
     }
 
     pub fn run<F>(&self, mut emit: F) -> Result<EnchantOutcome>
@@ -249,7 +247,7 @@ mod tests {
     use image::RgbaImage;
 
     use super::*;
-    use crate::{
+    use super::super::{
         config::{MouseMovementSample, MouseMovementStep},
         types::{PointRatio, RectRatio},
     };
@@ -257,10 +255,7 @@ mod tests {
     struct FakeCapture;
     impl RegionCapture for FakeCapture {
         fn capture_region(&self, rect: Rect) -> Result<ScreenImage> {
-            Ok(ScreenImage::new(
-                rect,
-                RgbaImage::new(rect.width, rect.height),
-            ))
+            Ok(ScreenImage::new(RgbaImage::new(rect.width, rect.height)))
         }
     }
 

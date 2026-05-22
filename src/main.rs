@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod backend;
+mod engine;
 
 use eframe::{
     App, CreationContext,
@@ -21,7 +21,7 @@ use eframe::{
         Slider, Stroke, TopBottomPanel, Ui, Vec2, ViewportCommand, Widget,
     },
 };
-use crate::backend::{
+use crate::engine::{
     config::{EnchantConfig, MouseMovementProfile, default_mouse_movement_profile},
     enchant_loop::{EnchantEvent, EnchantRunner, OcrReader, RegionCapture},
     matcher::{MatchResult, match_affix},
@@ -65,6 +65,7 @@ fn main() -> eframe::Result<()> {
 struct NativeConfig {
     targets_text: String,
     fuzzy_threshold: f64,
+    #[serde(default)]
     max_attempts: u32,
     enchant_window: Option<Rect>,
     ocr_region: Option<RectRatio>,
@@ -405,7 +406,7 @@ impl NativeApp {
         self.stop_signal = Some(stop.clone());
         self.stop_watcher_done = Some(stop_watcher_done.clone());
         self.status = BotState::Running;
-        self.status_message = "Running. Press ESC or Stop Bot to stop.".to_string();
+        self.status_message = "Running. Press ESC or Stop to stop.".to_string();
         self.attempt = 0;
 
         let tx = self.tx.clone();
@@ -628,7 +629,7 @@ impl NativeApp {
             }
             EnchantEvent::Stopped => {
                 self.status = BotState::Stopped;
-                self.status_message = "Stopped by ESC or Stop Bot.".to_string();
+                self.status_message = "Stopped by ESC or Stop.".to_string();
             }
             _ => {}
         }
@@ -988,9 +989,6 @@ impl NativeApp {
                 });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Calibrate Window").clicked() {
-                    self.begin_capture(ui.ctx(), CaptureKind::EnchantWindow);
-                }
                 if ui.button("Test OCR").clicked() {
                     self.begin_ocr_test();
                 }
@@ -1072,7 +1070,12 @@ impl NativeApp {
                             .add_enabled_ui(can_start, |ui| {
                                 ui.add_sized(
                                     [CALIBRATION_BUTTON_WIDTH, ACTION_BUTTON_HEIGHT],
-                                    Button::new("Start Bot").fill(Color32::from_rgb(246, 111, 25)),
+                                    Button::new(
+                                        RichText::new("Start")
+                                            .strong()
+                                            .color(Color32::BLACK),
+                                    )
+                                    .fill(Color32::from_rgb(246, 111, 25)),
                                 )
                             })
                             .inner;
@@ -1083,7 +1086,11 @@ impl NativeApp {
                             .add_enabled_ui(self.status == BotState::Running, |ui| {
                                 ui.add_sized(
                                     [CALIBRATION_BUTTON_WIDTH, ACTION_BUTTON_HEIGHT],
-                                    Button::new("Stop Bot"),
+                                    Button::new(
+                                        RichText::new("Stop")
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    ),
                                 )
                             })
                             .inner;
@@ -1327,10 +1334,12 @@ fn load_native_config(path: &PathBuf) -> (NativeConfig, bool) {
         }
     };
     let mut config: NativeConfig = serde_json::from_str(&contents).unwrap_or_default();
+    let mut changed = migrated_config;
     if config.mouse_movement.is_none() {
         config.mouse_movement = Some(default_mouse_movement_profile());
+        changed = true;
     }
-    (config, migrated_config)
+    (config, changed)
 }
 
 fn save_native_config(path: &PathBuf, config: &NativeConfig) -> anyhow::Result<()> {

@@ -1,0 +1,18 @@
+/.git-backups/
+/learn.txt
+
+# Rust build outputs
+/target/
+**/target/
+
+# Local runtime settings and generated release artifacts
+**/enchant_config_native.json
+**/*.pdb
+**/*.exe
+**/*.d
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
+*.tmp
+*.log

@@ -1,0 +1,47 @@
+{
+  "targets": [
+    "Max Health"
+  ],
+  "fuzzy_threshold": 0.78,
+  "max_attempts": 0,
+  "enchant_window": {
+    "x": 100,
+    "y": 100,
+    "width": 900,
+    "height": 700
+  },
+  "ocr_region": {
+    "x": 0.35,
+    "y": 0.25,
+    "width": 0.3,
+    "height": 0.12
+  },
+  "enchant_button": {
+    "x": 0.5,
+    "y": 0.86
+  },
+  "replace_button": {
+    "x": 0.42,
+    "y": 0.72
+  },
+  "close_button": {
+    "x": 0.55,
+    "y": 0.72
+  },
+  "mouse_movement": {
+    "duration_ms": 74,
+    "distance_px": 61.269894,
+    "model": {
+      "point_count": 10,
+      "avg_step_ms": 8,
+      "curve_lateral": -0.07725096,
+      "curve_peak_progress": 0.5833777,
+      "target_width_px": 48.0
+    },
+    "movement_steps": [],
+    "samples": []
+  },
+  "wait_after_enchant_ms": 1000,
+  "wait_after_replace_ms": 350,
+  "wait_after_close_ms": 350
+}

@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "enchant_ocr_backend",
+    "enchant_ocr_native",
+]
+resolver = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

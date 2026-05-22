@@ -1,36 +1,25 @@
 # Diablo Masterwork Companion
 
-Native Rust companion for the Diablo IV enchant/reroll workflow.
+A small Windows companion for Diablo IV enchanting. It watches the affix result, compares it with your target, and repeats the reroll flow until it finds a match or you stop it.
 
-## Active Project
+## How To Use
 
-- `enchant_ocr_native`: egui desktop app and calibration UI.
-- `enchant_ocr_backend`: OCR, matching, mouse input, screen capture, and enchant loop logic.
+1. Open the app.
+2. Select the enchant window and mark the buttons/affix area.
+3. Enter the affix you want.
+4. Start the bot.
+5. Press `ESC` at any time to stop.
 
-The old Python implementation and Tauri frontend have been removed from this workspace. The Rust native GUI is the supported app.
+Set max attempts to `0` to keep rerolling until a match is found.
 
-## Development
-
-```powershell
-cargo run -p enchant_ocr_native
-```
-
-## Test
-
-```powershell
-cargo test
-```
-
-## Release Build
+## Build
 
 ```powershell
 cargo build --release -p enchant_ocr_native
 ```
 
-The release exe is written to:
+The app is created at:
 
 ```text
 target/release/enchant_ocr_native.exe
 ```
-
-User settings are stored next to the running `.exe` as `enchant_config_native.json`.

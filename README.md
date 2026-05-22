@@ -38,4 +38,4 @@ target/release/diablo_masterwork_companion.exe
 
 Copyright (c) 2026 Howard Starfield. All rights reserved.
 
-This project is not affiliated with or endorsed by Blizzard Entertainment.
+This project is not affiliated with or endorsed by Blizzard Entertainment..

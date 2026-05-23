@@ -13,7 +13,6 @@ A Windows companion for Diablo IV enchanting. It watches the affix result, compa
 - Stops when a match is found.
 - Lets you stop any time with `ESC`.
 - Supports unlimited attempts by setting max attempts to `0`.
-![Op](./Operating.gif)
 ## How To Use
 
 1. Open the app.

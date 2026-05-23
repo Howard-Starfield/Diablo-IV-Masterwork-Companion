@@ -2,7 +2,7 @@
 
 A Windows companion for Diablo IV enchanting. It watches the affix result, compares it with your target, and repeats rerolls until it finds a match or you stop it.
 
-![Demo](./Operating.gif)
+![Demo](./setup.gif)
 
 
 ## What It Offers

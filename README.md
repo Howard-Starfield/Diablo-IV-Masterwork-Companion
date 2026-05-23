@@ -1,14 +1,13 @@
 # Diablo Masterwork Companion
 
 A Windows companion for Diablo IV enchanting. It watches the affix result, compares it with your target, and repeats rerolls until it finds a match or you stop it.
-
+# Setups
 ![Setups](./setup.gif)
 
-
-Operating.gif
+#Operating
+![Operating](./Operating.gif)
 
 ## What It Offers
-
 - Saves your button and affix-area setup.
 - Checks each reroll result for your target affix.
 - Stops when a match is found.

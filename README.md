@@ -4,7 +4,7 @@ A Windows companion for Diablo IV enchanting. It watches the affix result, compa
 
 ![Setups](./setup.gif)
 
-![Operating](./Opearting.gif)
+![Operating](./Operating.gif)
 
 
 ## What It Offers

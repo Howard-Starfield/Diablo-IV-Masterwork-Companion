@@ -1,32 +1,20 @@
-#[cfg(target_os = "windows")]
-#[allow(dead_code)]
-#[path = "../engine/types.rs"]
-mod shared_types;
+#![allow(dead_code, unused_imports)]
 
 #[cfg(target_os = "windows")]
-mod engine {
-    pub mod types {
-        pub use crate::shared_types::*;
-    }
-}
-
-#[cfg(target_os = "windows")]
-#[allow(dead_code)]
-#[path = "../engine/macro_engine/image_match.rs"]
-mod image_match;
-#[cfg(target_os = "windows")]
-#[path = "../engine/platform/windows_ocr.rs"]
-mod windows_ocr;
+#[path = "../engine/mod.rs"]
+mod engine;
 
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
     use anyhow::{Context, bail};
+    use engine::{
+        macro_engine::{ImageMatchConfig, ImageMatcher},
+        platform::{OcrFrame, WindowsTextRecognizer},
+        types::ScreenImage,
+    };
     use image::imageops;
-    use image_match::{ImageMatchConfig, ImageMatcher};
-    use shared_types::ScreenImage;
-    use windows_ocr::{OcrFrame, WindowsTextRecognizer};
     use xcap::Monitor;
 
     #[derive(Default)]

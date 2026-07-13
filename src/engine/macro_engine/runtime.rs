@@ -1178,6 +1178,7 @@ impl RunExecution<'_, '_> {
             score: evidence.score,
             match_count: evidence.match_count,
             stable_frames: evidence.stable_frames,
+            frame_metadata: evidence.frame_metadata,
             evidence: evidence.details.clone(),
         })
     }
@@ -1849,7 +1850,41 @@ mod tests {
                 score: matched.then_some(0.99),
                 match_count: u32::from(matched),
                 stable_frames: u8::from(matched),
+                frame_metadata: None,
                 details: serde_json::json!({ "fixture": true }),
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MetadataDetector;
+
+    impl ConditionDetector for MetadataDetector {
+        fn observe(
+            &self,
+            request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            Ok(super::super::DetectorEvidence {
+                matched: true,
+                frame_id: 7,
+                captured_at_ms: request.observed_at_ms,
+                match_rect: Some(Rect::new(10, 20, 30, 40)),
+                score: Some(0.99),
+                match_count: 1,
+                stable_frames: 2,
+                frame_metadata: Some(super::super::ImageFrameMetadata {
+                    frame_id: 7,
+                    captured_at_ms: request.observed_at_ms,
+                    window_id: 9,
+                    window_revision: 2,
+                    geometry_revision: 3,
+                    display_profile_revision: 4,
+                    dpi: 96,
+                    region_revision: 1,
+                    rule_revision: 1,
+                }),
+                details: serde_json::Value::Null,
             })
         }
     }
@@ -1914,6 +1949,7 @@ mod tests {
                 score: Some(0.99),
                 match_count: 1,
                 stable_frames: 1,
+                frame_metadata: None,
                 details: serde_json::Value::Null,
             })
         }
@@ -1976,6 +2012,7 @@ mod tests {
                 score: Some(0.99),
                 match_count: 1,
                 stable_frames: 1,
+                frame_metadata: None,
                 details: serde_json::Value::Null,
             })
         }
@@ -2008,6 +2045,7 @@ mod tests {
                 score: Some(0.99),
                 match_count: 1,
                 stable_frames: 1,
+                frame_metadata: None,
                 details: serde_json::Value::Null,
             })
         }
@@ -2097,7 +2135,7 @@ mod tests {
         fixture_runtime_with_detector(FakeDetector::default())
     }
 
-    fn fixture_runtime_with_detector(detector: FakeDetector) -> MacroRuntime {
+    fn fixture_runtime_with_detector(detector: impl ConditionDetector + 'static) -> MacroRuntime {
         MacroRuntime::new(
             Arc::new(FakeCapture),
             Arc::new(detector),
@@ -2512,6 +2550,38 @@ mod tests {
         ] {
             assert!(validate_action_token(&compiled, &action, &mismatched).is_err());
         }
+    }
+
+    #[test]
+    fn observation_token_preserves_typed_frame_metadata() {
+        let definition = fixture_definition(vec![
+            block(
+                "observe",
+                BlockKind::Observe {
+                    condition: text_condition("observe", ObserveMode::CheckNow),
+                },
+            ),
+            block(
+                "click-match",
+                BlockKind::Action {
+                    action: Action::ClickTextMatch {
+                        source_block_id: "observe".to_string(),
+                        button: super::super::MouseButton::Left,
+                    },
+                },
+            ),
+        ]);
+        let events = fixture_runtime_with_detector(MetadataDetector)
+            .run(saved(definition), RunMode::DryRun)
+            .unwrap();
+        let token = events.iter().find_map(|event| match event {
+            RunEvent::ActionPlanned {
+                token: Some(token), ..
+            } => Some(token),
+            _ => None,
+        });
+
+        assert_eq!(token.unwrap().frame_metadata.unwrap().window_id, 9);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::engine::{
     types::{Rect, ScreenImage},
 };
 
-use super::{CompiledMacro, Condition};
+use super::{CompiledMacro, Condition, ImageFrameMetadata};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +24,8 @@ pub struct DetectorEvidence {
     pub score: Option<f64>,
     pub match_count: u32,
     pub stable_frames: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_metadata: Option<ImageFrameMetadata>,
     #[serde(default)]
     pub details: serde_json::Value,
 }
@@ -48,6 +50,30 @@ impl DetectorEvidence {
             score,
             match_count,
             stable_frames,
+            frame_metadata: None,
+            details,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn image_match(
+        matched: bool,
+        frame: ImageFrameMetadata,
+        match_rect: Option<Rect>,
+        score: Option<f64>,
+        match_count: u32,
+        stable_frames: u8,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            matched,
+            frame_id: frame.frame_id,
+            captured_at_ms: frame.captured_at_ms,
+            match_rect: matched.then_some(match_rect).flatten(),
+            score,
+            match_count,
+            stable_frames,
+            frame_metadata: Some(frame),
             details,
         }
     }
@@ -61,6 +87,7 @@ impl DetectorEvidence {
             score: None,
             match_count: 0,
             stable_frames: 0,
+            frame_metadata: None,
             details: serde_json::Value::Null,
         }
     }
@@ -82,6 +109,8 @@ pub struct ObservationToken {
     pub score: Option<f64>,
     pub match_count: u32,
     pub stable_frames: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_metadata: Option<ImageFrameMetadata>,
     pub evidence: serde_json::Value,
 }
 
@@ -132,6 +161,7 @@ impl CaptureSource for UnavailableCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::macro_engine::ImageFrameMetadata;
 
     #[test]
     fn negative_evidence_cannot_retain_click_geometry() {
@@ -147,5 +177,34 @@ mod tests {
         );
 
         assert!(evidence.match_rect.is_none());
+    }
+
+    #[test]
+    fn image_evidence_keeps_typed_frame_identity_but_not_unqualified_geometry() {
+        let frame = ImageFrameMetadata {
+            frame_id: 4,
+            captured_at_ms: 120,
+            window_id: 9,
+            window_revision: 2,
+            geometry_revision: 3,
+            display_profile_revision: 4,
+            dpi: 96,
+            region_revision: 5,
+            rule_revision: 6,
+        };
+
+        let evidence = DetectorEvidence::image_match(
+            false,
+            frame,
+            Some(Rect::new(10, 20, 30, 40)),
+            Some(0.98),
+            1,
+            1,
+            serde_json::json!({"ambiguity_margin": 0.04}),
+        );
+
+        assert_eq!(evidence.frame_metadata, Some(frame));
+        assert!(evidence.match_rect.is_none());
+        assert_eq!(evidence.details["ambiguity_margin"], 0.04);
     }
 }

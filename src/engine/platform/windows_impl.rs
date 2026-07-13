@@ -40,17 +40,18 @@ use windows::{
                 DestroyWindow, DispatchMessageW, GA_ROOT, GWLP_USERDATA, GetAncestor, GetCursorPos,
                 GetSystemMetrics, GetWindowLongPtrW, HTCLIENT, IDC_CROSS, LWA_ALPHA, LoadCursorW,
                 MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SM_CXVIRTUALSCREEN,
-                SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOW, SetCursorPos,
-                SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, ShowWindow,
-                TranslateMessage, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-                WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_LAYERED,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WindowFromPoint,
+                SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNOACTIVATE,
+                SetCursorPos, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
+                ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_DESTROY, WM_KEYDOWN,
+                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT,
+                WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                WS_POPUP, WindowFromPoint,
             },
         },
     },
     core::{HSTRING, PCWSTR, w},
 };
-use xcap::Monitor;
+use xcap::{Monitor, Window};
 
 use super::super::{
     automation::{
@@ -117,10 +118,57 @@ impl WindowClientGeometrySource for Win32ClientGeometrySource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct XcapWindowRegionCapture<G = Win32ClientGeometrySource> {
+#[derive(Debug, Clone)]
+struct CapturedWindowImage {
+    outer_rect: Rect,
+    image: RgbaImage,
+}
+
+trait ConcreteWindowImageSource {
+    fn capture_window(&self, window_id: u32) -> Result<CapturedWindowImage>;
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct XcapConcreteWindowImageSource;
+
+impl ConcreteWindowImageSource for XcapConcreteWindowImageSource {
+    fn capture_window(&self, window_id: u32) -> Result<CapturedWindowImage> {
+        let window = Window::all()
+            .context("failed to enumerate concrete windows for capture")?
+            .into_iter()
+            .find(|window| window.id().ok() == Some(window_id))
+            .ok_or_else(|| anyhow!("selected concrete window is no longer available"))?;
+        anyhow::ensure!(
+            !window.is_minimized().unwrap_or(true),
+            "selected concrete window is minimized"
+        );
+        let outer_rect = Rect::new(
+            window.x().context("failed to query concrete window x")?,
+            window.y().context("failed to query concrete window y")?,
+            window
+                .width()
+                .context("failed to query concrete window width")?,
+            window
+                .height()
+                .context("failed to query concrete window height")?,
+        );
+        let image = window
+            .capture_image()
+            .context("failed to capture concrete window image")?;
+        anyhow::ensure!(
+            image.dimensions() == (outer_rect.width, outer_rect.height),
+            "concrete window capture dimensions changed during capture"
+        );
+        Ok(CapturedWindowImage { outer_rect, image })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XcapWindowRegionCapture<G = Win32ClientGeometrySource, I = XcapConcreteWindowImageSource>
+{
     window_id: u32,
     geometry: G,
+    images: I,
 }
 
 impl XcapWindowRegionCapture<Win32ClientGeometrySource> {
@@ -128,6 +176,7 @@ impl XcapWindowRegionCapture<Win32ClientGeometrySource> {
         Self {
             window_id,
             geometry: Win32ClientGeometrySource,
+            images: XcapConcreteWindowImageSource,
         }
     }
 }
@@ -137,19 +186,50 @@ impl<G> XcapWindowRegionCapture<G> {
         Self {
             window_id,
             geometry,
+            images: XcapConcreteWindowImageSource,
         }
     }
 }
 
-impl<G: WindowClientGeometrySource> XcapWindowRegionCapture<G> {
+impl<G, I> XcapWindowRegionCapture<G, I> {
+    #[cfg(test)]
+    fn with_sources(window_id: u32, geometry: G, images: I) -> Self {
+        Self {
+            window_id,
+            geometry,
+            images,
+        }
+    }
+}
+
+impl<G: WindowClientGeometrySource, I> XcapWindowRegionCapture<G, I> {
     fn screen_rect(&self, local: Rect) -> Result<Rect> {
         window_local_to_screen(self.geometry.client_rect(self.window_id)?, local)
     }
 }
 
-impl<G: WindowClientGeometrySource> CaptureSource for XcapWindowRegionCapture<G> {
+impl<G: WindowClientGeometrySource, I: ConcreteWindowImageSource> CaptureSource
+    for XcapWindowRegionCapture<G, I>
+{
     fn capture(&self, rect: Rect) -> Result<ScreenImage> {
-        XcapRegionCapture.capture(self.screen_rect(rect)?)
+        let requested = self.screen_rect(rect)?;
+        let captured = self.images.capture_window(self.window_id)?;
+        anyhow::ensure!(
+            captured.image.dimensions() == (captured.outer_rect.width, captured.outer_rect.height),
+            "concrete window capture dimensions do not match its outer frame"
+        );
+        let crop = screen_rect_relative_to(captured.outer_rect, requested)
+            .context("requested client region is outside the concrete window image")?;
+        Ok(ScreenImage::new(
+            imageops::crop_imm(
+                &captured.image,
+                crop.x as u32,
+                crop.y as u32,
+                crop.width,
+                crop.height,
+            )
+            .to_image(),
+        ))
     }
 }
 
@@ -241,6 +321,21 @@ fn window_local_to_screen(window: Rect, local: Rect) -> Result<Rect> {
         .and_then(|value| i32::try_from(value).ok())
         .context("window-local capture y coordinate overflowed")?;
     Ok(Rect::new(x, y, local.width, local.height))
+}
+
+fn screen_rect_relative_to(container: Rect, screen: Rect) -> Result<Rect> {
+    anyhow::ensure!(
+        rect_contains(container, screen),
+        "screen region is outside its container"
+    );
+    let x = i64::from(screen.x) - i64::from(container.x);
+    let y = i64::from(screen.y) - i64::from(container.y);
+    Ok(Rect::new(
+        i32::try_from(x).context("relative capture x overflowed")?,
+        i32::try_from(y).context("relative capture y overflowed")?,
+        screen.width,
+        screen.height,
+    ))
 }
 
 #[derive(Debug, Default, Clone)]
@@ -832,6 +927,18 @@ impl CapturedTargetBinding {
             .refresh_authoring_snapshot(&self.expected)?
             .client_rect)
     }
+
+    /// Captures pixels from the concrete HWND image, never from the monitor compositor.
+    /// The caller owns the prepare/capture/observation-only validation bracket.
+    pub fn capture_screen_region(
+        &self,
+        client_rect: Rect,
+        screen_rect: Rect,
+    ) -> Result<ScreenImage> {
+        let local = screen_rect_relative_to(client_rect, screen_rect)
+            .context("authoring capture left the selected target client")?;
+        XcapWindowRegionCapture::new(self.expected.window_id as u32).capture(local)
+    }
 }
 
 pub fn resolve_target_from_selection(selection: Rect) -> Result<CapturedTargetBinding> {
@@ -974,7 +1081,7 @@ fn select_screen_rect_overlay(min_size: u32) -> Result<Rect> {
         ));
         let state_ptr = state.as_mut() as *mut OverlayState;
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+            region_overlay_extended_style(),
             class_name,
             w!("Select Region"),
             WS_POPUP,
@@ -991,8 +1098,7 @@ fn select_screen_rect_overlay(min_size: u32) -> Result<Rect> {
 
         SetLayeredWindowAttributes(hwnd, COLORREF(0), 86, LWA_ALPHA)
             .context("failed to configure translucent region overlay")?;
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
+        let _ = ShowWindow(hwnd, region_overlay_show_command());
 
         let mut msg = MSG::default();
         while state.result.is_none() {
@@ -1020,6 +1126,14 @@ fn select_screen_rect_overlay(min_size: u32) -> Result<Rect> {
             None => Err(anyhow!("screen selection cancelled")),
         }
     }
+}
+
+fn region_overlay_extended_style() -> WINDOW_EX_STYLE {
+    WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+}
+
+fn region_overlay_show_command() -> windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD {
+    SW_SHOWNOACTIVATE
 }
 
 unsafe extern "system" fn region_overlay_proc(
@@ -1597,6 +1711,72 @@ mod tests {
             1,
             "post validation must not restore stolen focus"
         );
+    }
+
+    #[test]
+    fn nonactivating_overlay_lifecycle_preserves_a_valid_target() {
+        let activations = Arc::new(AtomicUsize::new(0));
+        let snapshot = actionable_authoring_snapshot();
+        let binding = authoring_binding(snapshot.clone(), snapshot, Arc::clone(&activations));
+
+        assert!(region_overlay_extended_style().contains(WS_EX_NOACTIVATE));
+        assert_eq!(
+            binding.prepare_client_rect().unwrap(),
+            Rect::new(100, 200, 800, 600)
+        );
+        assert_eq!(
+            binding.validate_client_rect().unwrap(),
+            Rect::new(100, 200, 800, 600)
+        );
+        assert_eq!(
+            activations.load(Ordering::SeqCst),
+            1,
+            "the observation-only post-overlay check must not reactivate the target"
+        );
+    }
+
+    #[test]
+    fn authoring_overlay_is_topmost_but_never_activates() {
+        let style = region_overlay_extended_style();
+
+        assert!(style.contains(WS_EX_TOPMOST));
+        assert!(style.contains(WS_EX_NOACTIVATE));
+        assert_eq!(region_overlay_show_command(), SW_SHOWNOACTIVATE);
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeConcreteWindowImage {
+        outer_rect: Rect,
+        image: RgbaImage,
+    }
+
+    impl ConcreteWindowImageSource for FakeConcreteWindowImage {
+        fn capture_window(&self, _window_id: u32) -> Result<CapturedWindowImage> {
+            Ok(CapturedWindowImage {
+                outer_rect: self.outer_rect,
+                image: self.image.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn concrete_window_capture_crops_the_window_frame_not_monitor_pixels() {
+        let outer_rect = Rect::new(90, 180, 120, 100);
+        let client = FakeClientGeometry {
+            client_rect: Rect::new(100, 200, 100, 70),
+        };
+        let image = RgbaImage::from_fn(120, 100, |x, y| image::Rgba([x as u8, y as u8, 77, 255]));
+        let capture = XcapWindowRegionCapture::with_sources(
+            42,
+            client,
+            FakeConcreteWindowImage { outer_rect, image },
+        );
+
+        let captured = capture.capture(Rect::new(5, 6, 10, 8)).unwrap();
+
+        assert_eq!(captured.rgba.dimensions(), (10, 8));
+        assert_eq!(captured.rgba.get_pixel(0, 0).0, [15, 26, 77, 255]);
+        assert_eq!(captured.rgba.get_pixel(9, 7).0, [24, 33, 77, 255]);
     }
 
     #[test]

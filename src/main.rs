@@ -231,6 +231,7 @@ enum UiEvent {
     EditorAuthoringFinished {
         request: EditorAuthoringRequest,
         outcome: NativeEditorAuthoringOutcome,
+        target_binding: Option<CapturedTargetBinding>,
     },
 }
 
@@ -250,6 +251,12 @@ enum NativeEditorAuthoringOutcome {
 struct PendingTemplateCapture {
     bytes: Vec<u8>,
     previous: Option<AssetRef>,
+}
+
+#[derive(Debug)]
+struct PublishedTemplateCapture {
+    asset: AssetRef,
+    staged_successor: bool,
 }
 
 #[derive(Debug)]
@@ -464,9 +471,9 @@ impl NativeApp {
         let Some(draft) = self.macro_state.draft.clone() else {
             return;
         };
-        let target_binding = self
-            .macro_state
-            .target_profile_for_session(request.session)
+        let target_binding = editor_request_requires_bound_target(&request.kind)
+            .then(|| self.macro_state.target_profile_for_session(request.session))
+            .flatten()
             .and_then(|profile| {
                 authoring_target_for_session(
                     &self.macro_authoring_targets,
@@ -483,11 +490,16 @@ impl NativeApp {
         let repaint = self.egui_ctx.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
-            let outcome = run_editor_authoring_request(&request, &draft, target_binding, assets);
+            let (outcome, captured_target) =
+                run_editor_authoring_request(&request, &draft, target_binding, assets);
             send_ui_event(
                 &tx,
                 &repaint,
-                UiEvent::EditorAuthoringFinished { request, outcome },
+                UiEvent::EditorAuthoringFinished {
+                    request,
+                    outcome,
+                    target_binding: captured_target,
+                },
             );
         });
     }
@@ -636,6 +648,7 @@ impl NativeApp {
                 } => {
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                     let session = request.session;
+                    let mut staged_successor = None;
                     let current = self
                         .macro_state
                         .wizard_request_envelope_is_current(&request, request.kind);
@@ -658,7 +671,14 @@ impl NativeApp {
                                 self.macro_store.as_ref().map(|store| store.assets()),
                                 pending,
                             ) {
-                                Ok(Some(asset)) => WizardAuthoringOutcome::Template { asset },
+                                Ok(Some(published)) => {
+                                    if published.staged_successor {
+                                        staged_successor = Some(published.asset.clone());
+                                    }
+                                    WizardAuthoringOutcome::Template {
+                                        asset: published.asset,
+                                    }
+                                }
                                 Ok(None) => {
                                     self.macro_state.discard_wizard_result_envelope(&request);
                                     self.macro_state.editor_feedback = Some(
@@ -686,14 +706,24 @@ impl NativeApp {
                             }
                         }
                         Err(error) => {
+                            if let Some(asset) = staged_successor {
+                                if let Some(store) = self.macro_store.as_ref() {
+                                    let _ = store.assets().discard_staged_png_revision(&asset);
+                                }
+                            }
                             self.macro_state.editor_feedback =
                                 Some(format!("Discarded macro authoring result: {error:?}"));
                         }
                     }
                 }
-                UiEvent::EditorAuthoringFinished { request, outcome } => {
+                UiEvent::EditorAuthoringFinished {
+                    request,
+                    outcome,
+                    target_binding,
+                } => {
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                     let expected_kind = request.kind.clone();
+                    let mut staged_successor = None;
                     let current = self
                         .macro_state
                         .editor_request_envelope_is_current(&request, &expected_kind);
@@ -717,7 +747,14 @@ impl NativeApp {
                                 self.macro_store.as_ref().map(|store| store.assets()),
                                 pending,
                             ) {
-                                Ok(Some(asset)) => EditorAuthoringOutcome::Template { asset },
+                                Ok(Some(published)) => {
+                                    if published.staged_successor {
+                                        staged_successor = Some(published.asset.clone());
+                                    }
+                                    EditorAuthoringOutcome::Template {
+                                        asset: published.asset,
+                                    }
+                                }
                                 Ok(None) => {
                                     self.macro_state.discard_editor_result_envelope(&request);
                                     self.macro_state.editor_feedback = Some(
@@ -733,12 +770,26 @@ impl NativeApp {
                     let result = EditorAuthoringResult {
                         session: request.session,
                         id: request.id,
-                        fingerprint: request.fingerprint,
+                        fingerprint: request.fingerprint.clone(),
                         outcome,
                     };
-                    if let Err(error) = self.macro_state.apply_editor_authoring_result(result) {
-                        self.macro_state.editor_feedback =
-                            Some(format!("Discarded editor authoring result: {error:?}"));
+                    match self.macro_state.apply_editor_authoring_result(result) {
+                        Ok(()) => {
+                            install_captured_editor_target(
+                                &mut self.macro_authoring_targets,
+                                &request,
+                                target_binding,
+                            );
+                        }
+                        Err(error) => {
+                            if let Some(asset) = staged_successor {
+                                if let Some(store) = self.macro_store.as_ref() {
+                                    let _ = store.assets().discard_staged_png_revision(&asset);
+                                }
+                            }
+                            self.macro_state.editor_feedback =
+                                Some(format!("Discarded editor authoring result: {error:?}"));
+                        }
                     }
                 }
             }
@@ -1671,6 +1722,23 @@ fn authoring_target_for_session<'a, T>(
     targets.get(&session).filter(|target| accepts(target))
 }
 
+fn editor_request_requires_bound_target(kind: &EditorAuthoringKind) -> bool {
+    !matches!(kind, EditorAuthoringKind::CaptureTarget)
+}
+
+fn install_captured_editor_target<T>(
+    targets: &mut HashMap<AuthoringSessionId, T>,
+    request: &EditorAuthoringRequest,
+    captured: Option<T>,
+) -> bool {
+    let Some(captured) = captured.filter(|_| request.kind == EditorAuthoringKind::CaptureTarget)
+    else {
+        return false;
+    };
+    targets.insert(request.session, captured);
+    true
+}
+
 fn prune_authoring_targets<T>(
     targets: &mut HashMap<AuthoringSessionId, T>,
     active_sessions: &[AuthoringSessionId],
@@ -1682,16 +1750,22 @@ fn publish_pending_template_if_current(
     current: bool,
     store: Option<&AssetStore>,
     pending: PendingTemplateCapture,
-) -> anyhow::Result<Option<AssetRef>> {
+) -> anyhow::Result<Option<PublishedTemplateCapture>> {
     if !current {
         return Ok(None);
     }
     let store = store.ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
-    let asset = match pending.previous {
-        Some(previous) => store.put_next_png_revision(&previous, &pending.bytes)?,
-        None => store.put_png(&pending.bytes)?,
+    let (asset, staged_successor) = match pending.previous {
+        Some(previous) => (
+            store.replace_staged_png_revision(&previous, &pending.bytes)?,
+            true,
+        ),
+        None => (store.put_png(&pending.bytes)?, false),
     };
-    Ok(Some(asset))
+    Ok(Some(PublishedTemplateCapture {
+        asset,
+        staged_successor,
+    }))
 }
 
 fn run_macro_authoring_request(
@@ -1720,29 +1794,20 @@ fn run_macro_authoring_request(
                     Some(binding),
                 ));
             }
-            let target = target_binding
-                .as_ref()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "capture the concrete target window first for this authoring session"
-                    )
-                })?
-                .prepare_client_rect()?;
+            let binding = target_binding.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "capture the concrete target window first for this authoring session"
+                )
+            })?;
+            let target = binding.prepare_client_rect()?;
             if matches!(
                 request.kind,
                 WizardAuthoringKind::TestDetector | WizardAuthoringKind::CaptureImageNegative
             ) {
                 let capture_rect = target.rect_from_ratio(wizard.region);
                 let started = Instant::now();
-                let capture = XcapRegionCapture;
-                let image = RegionCapture::capture_region(&capture, capture_rect)?;
-                require_stable_authoring_client(
-                    target,
-                    target_binding
-                        .as_ref()
-                        .expect("target binding checked above")
-                        .validate_client_rect()?,
-                )?;
+                let image = binding.capture_screen_region(target, capture_rect)?;
+                require_stable_authoring_client(target, binding.validate_client_rect()?)?;
                 return match &wizard.detector {
                     WizardDetector::Text => {
                         anyhow::ensure!(
@@ -1884,13 +1949,7 @@ fn run_macro_authoring_request(
                     4
                 },
             })?;
-            require_stable_authoring_client(
-                target,
-                target_binding
-                    .as_ref()
-                    .expect("target binding checked above")
-                    .validate_client_rect()?,
-            )?;
+            require_stable_authoring_client(target, binding.validate_client_rect()?)?;
             let outcome = match response.selection {
                 MacroCaptureSelection::Region(rect) => {
                     NativeWizardAuthoringOutcome::Complete(WizardAuthoringOutcome::Region(rect))
@@ -1902,15 +1961,8 @@ fn run_macro_authoring_request(
                     region: _,
                     screen_rect,
                 } => {
-                    let capture = XcapRegionCapture;
-                    let captured = RegionCapture::capture_region(&capture, screen_rect)?;
-                    require_stable_authoring_client(
-                        target,
-                        target_binding
-                            .as_ref()
-                            .expect("target binding checked above")
-                            .validate_client_rect()?,
-                    )?;
+                    let captured = binding.capture_screen_region(target, screen_rect)?;
+                    require_stable_authoring_client(target, binding.validate_client_rect()?)?;
                     let mut bytes = Vec::new();
                     DynamicImage::ImageRgba8(captured.rgba)
                         .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
@@ -1949,15 +2001,58 @@ fn run_editor_authoring_request(
     draft: &EditorDraft,
     target_binding: Option<CapturedTargetBinding>,
     assets: Option<AssetStore>,
+) -> (NativeEditorAuthoringOutcome, Option<CapturedTargetBinding>) {
+    if request.kind == EditorAuthoringKind::CaptureTarget {
+        let captured =
+            || -> anyhow::Result<(NativeEditorAuthoringOutcome, CapturedTargetBinding)> {
+                let selection = select_screen_rect(40)?;
+                let binding = resolve_target_from_selection(selection)?;
+                let target = binding.profile();
+                let outcome = NativeEditorAuthoringOutcome::Complete(
+                    EditorAuthoringOutcome::TargetGeometry {
+                        process_path: target.process_path.clone(),
+                        window_class: target.window_class.clone(),
+                        title: target.title.clone(),
+                        width: target.client_rect.width,
+                        height: target.client_rect.height,
+                        dpi: target.dpi,
+                    },
+                );
+                Ok((outcome, binding))
+            };
+        return match captured() {
+            Ok((outcome, binding)) => (outcome, Some(binding)),
+            Err(error) if error.to_string().to_ascii_lowercase().contains("cancel") => (
+                NativeEditorAuthoringOutcome::Complete(EditorAuthoringOutcome::Cancelled),
+                None,
+            ),
+            Err(error) => (
+                NativeEditorAuthoringOutcome::Complete(EditorAuthoringOutcome::Failed(
+                    error.to_string(),
+                )),
+                None,
+            ),
+        };
+    }
+    (
+        run_bound_editor_authoring_request(request, draft, target_binding, assets),
+        None,
+    )
+}
+
+fn run_bound_editor_authoring_request(
+    request: &EditorAuthoringRequest,
+    draft: &EditorDraft,
+    target_binding: Option<CapturedTargetBinding>,
+    assets: Option<AssetStore>,
 ) -> NativeEditorAuthoringOutcome {
     let run = || -> anyhow::Result<NativeEditorAuthoringOutcome> {
-        let target = target_binding
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow::anyhow!("capture a concrete target for this authoring session first")
-            })?
-            .prepare_client_rect()?;
+        let binding = target_binding.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("capture a concrete target for this authoring session first")
+        })?;
+        let target = binding.prepare_client_rect()?;
         match &request.kind {
+            EditorAuthoringKind::CaptureTarget => unreachable!("handled before target lookup"),
             EditorAuthoringKind::RecaptureRegion { region_id } => {
                 let kind = if draft
                     .image_rules
@@ -1974,13 +2069,7 @@ fn run_editor_authoring_request(
                     target_client: target,
                     min_size: 4,
                 })?;
-                require_stable_authoring_client(
-                    target,
-                    target_binding
-                        .as_ref()
-                        .expect("target binding checked above")
-                        .validate_client_rect()?,
-                )?;
+                require_stable_authoring_client(target, binding.validate_client_rect()?)?;
                 let MacroCaptureSelection::Region(rect) = response.selection else {
                     anyhow::bail!("region capture returned the wrong result type")
                 };
@@ -2000,25 +2089,13 @@ fn run_editor_authoring_request(
                     target_client: target,
                     min_size: 4,
                 })?;
-                require_stable_authoring_client(
-                    target,
-                    target_binding
-                        .as_ref()
-                        .expect("target binding checked above")
-                        .validate_client_rect()?,
-                )?;
+                require_stable_authoring_client(target, binding.validate_client_rect()?)?;
                 let MacroCaptureSelection::TemplateCrop { screen_rect, .. } = response.selection
                 else {
                     anyhow::bail!("template capture returned the wrong result type")
                 };
-                let captured = RegionCapture::capture_region(&XcapRegionCapture, screen_rect)?;
-                require_stable_authoring_client(
-                    target,
-                    target_binding
-                        .as_ref()
-                        .expect("target binding checked above")
-                        .validate_client_rect()?,
-                )?;
+                let captured = binding.capture_screen_region(target, screen_rect)?;
+                require_stable_authoring_client(target, binding.validate_client_rect()?)?;
                 let mut bytes = Vec::new();
                 DynamicImage::ImageRgba8(captured.rgba)
                     .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
@@ -2047,14 +2124,8 @@ fn run_editor_authoring_request(
                     .ok_or_else(|| anyhow::anyhow!("OCR region is missing"))?;
                 let started = Instant::now();
                 let capture_rect = target.rect_from_ratio(region.rect);
-                let image = RegionCapture::capture_region(&XcapRegionCapture, capture_rect)?;
-                require_stable_authoring_client(
-                    target,
-                    target_binding
-                        .as_ref()
-                        .expect("target binding checked above")
-                        .validate_client_rect()?,
-                )?;
+                let image = binding.capture_screen_region(target, capture_rect)?;
+                require_stable_authoring_client(target, binding.validate_client_rect()?)?;
                 let tested = authoring_test_text_rule(&image, capture_rect, rule)?;
                 let evidence = tested
                     .words
@@ -2106,14 +2177,8 @@ fn run_editor_authoring_request(
                     .transpose()?;
                 let started = Instant::now();
                 let capture_rect = target.rect_from_ratio(region.rect);
-                let image = RegionCapture::capture_region(&XcapRegionCapture, capture_rect)?;
-                require_stable_authoring_client(
-                    target,
-                    target_binding
-                        .as_ref()
-                        .expect("target binding checked above")
-                        .validate_client_rect()?,
-                )?;
+                let image = binding.capture_screen_region(target, capture_rect)?;
+                require_stable_authoring_client(target, binding.validate_client_rect()?)?;
                 let (result, selected) =
                     match_authoring_image(&image, capture_rect, &template, mask.as_ref(), rule)?;
                 if matches!(
@@ -2436,6 +2501,51 @@ mod routing_tests {
     }
 
     #[test]
+    fn accepted_successor_capture_is_staged_until_state_or_store_accepts_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let initial = store.assets().put_png(b"initial").unwrap();
+
+        let published = publish_pending_template_if_current(
+            true,
+            Some(store.assets()),
+            PendingTemplateCapture {
+                bytes: b"candidate successor".to_vec(),
+                previous: Some(initial.clone()),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(published.staged_successor);
+        assert_eq!(published.asset.id, initial.id);
+        assert_eq!(published.asset.revision, 2);
+        let replacement = publish_pending_template_if_current(
+            true,
+            Some(store.assets()),
+            PendingTemplateCapture {
+                bytes: b"replacement after undo".to_vec(),
+                previous: Some(initial.clone()),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(replacement.asset.id, initial.id);
+        assert_eq!(replacement.asset.revision, 2);
+        assert_ne!(replacement.asset.content_hash, published.asset.content_hash);
+        assert!(store.assets().read(&published.asset).is_err());
+        store
+            .assets()
+            .discard_staged_png_revision(&replacement.asset)
+            .unwrap();
+        let retry = store
+            .assets()
+            .stage_next_png_revision(&initial, b"retry")
+            .unwrap();
+        assert_eq!(retry.revision, 2);
+    }
+
+    #[test]
     fn durable_binding_profile_rejects_wrong_window_size_dpi_or_identity() {
         let captured = CapturedTargetProfile {
             process_path: r#"C:\games\Diablo IV.exe"#.into(),
@@ -2486,6 +2596,38 @@ mod routing_tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets.get(&draft_a), Some(&"draft-a"));
         assert!(!targets.contains_key(&wizard_b));
+    }
+
+    #[test]
+    fn editor_target_capture_bootstraps_without_borrowing_another_session_binding() {
+        assert!(!editor_request_requires_bound_target(
+            &EditorAuthoringKind::CaptureTarget
+        ));
+        assert!(editor_request_requires_bound_target(
+            &EditorAuthoringKind::TestOcr {
+                block_id: "observe-1".into(),
+            }
+        ));
+
+        let draft = AuthoringSessionId(10);
+        let wizard = AuthoringSessionId(20);
+        let mut targets = HashMap::from([(draft, "draft-old"), (wizard, "wizard")]);
+        let request = EditorAuthoringRequest {
+            session: draft,
+            id: crate::macro_ui::EditorAuthoringRequestId(1),
+            fingerprint: "starter".into(),
+            kind: EditorAuthoringKind::CaptureTarget,
+            image_negative_samples: vec![],
+        };
+
+        assert!(install_captured_editor_target(
+            &mut targets,
+            &request,
+            Some("draft-retargeted")
+        ));
+
+        assert_eq!(targets.get(&draft), Some(&"draft-retargeted"));
+        assert_eq!(targets.get(&wizard), Some(&"wizard"));
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub struct EditorAuthoringRequestId(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorAuthoringKind {
+    CaptureTarget,
     TestOcr { block_id: String },
     TestImage { block_id: String },
     RecaptureRegion { region_id: String },
@@ -39,6 +40,14 @@ pub struct EditorAuthoringRequest {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditorAuthoringOutcome {
+    TargetGeometry {
+        process_path: String,
+        window_class: String,
+        title: String,
+        width: u32,
+        height: u32,
+        dpi: u32,
+    },
     Region(crate::engine::types::RectRatio),
     Template {
         asset: crate::engine::macro_engine::AssetRef,
@@ -419,6 +428,33 @@ impl MacroPageState {
         self.editor_authoring_dispatched = false;
         self.pending_inspector_intent = None;
         match (request_kind, outcome) {
+            (
+                EditorAuthoringKind::CaptureTarget,
+                EditorAuthoringOutcome::TargetGeometry {
+                    process_path,
+                    window_class,
+                    title,
+                    width,
+                    height,
+                    dpi,
+                },
+            ) => dispatch_editor_command(
+                self,
+                EditorCommand::ReplaceTarget {
+                    target: crate::engine::macro_engine::TargetProfile {
+                        process_path,
+                        window_class,
+                        title_contains: title,
+                        captured_client_width: width,
+                        captured_client_height: height,
+                        captured_dpi: dpi,
+                    },
+                },
+            )
+            .map(|_| {
+                self.editor_image_negative_samples.clear();
+            })
+            .map_err(|_| EditorAuthoringError::EditRejected),
             (
                 EditorAuthoringKind::RecaptureRegion { region_id },
                 EditorAuthoringOutcome::Region(rect),
@@ -974,6 +1010,23 @@ fn status_strip(
                     state.cancel_wizard_authoring();
                 }
                 let can_edit = state.editor_mutations_allowed();
+                if state.draft.is_some() {
+                    let target_label = if state
+                        .draft
+                        .as_ref()
+                        .is_some_and(|draft| draft.target.process_path.is_empty())
+                    {
+                        "Capture Target"
+                    } else {
+                        "Retarget"
+                    };
+                    if ui
+                        .add_enabled(can_edit, Button::new(target_label))
+                        .clicked()
+                    {
+                        begin_editor_authoring(state, EditorAuthoringKind::CaptureTarget);
+                    }
+                }
                 if ui.add_enabled(can_edit, Button::new("Validate")).clicked() {
                     let _ = dispatch_editor_command(state, EditorCommand::MarkValidated);
                 }
@@ -3699,6 +3752,54 @@ mod tests {
         assert_eq!(wizard.target_generation, 1);
         assert!(wizard.region_capture_generation.is_none());
         assert!(wizard.action_capture_generation.is_none());
+    }
+
+    #[test]
+    fn starter_draft_can_capture_target_then_author_with_the_same_session() {
+        let mut state = MacroPageState {
+            draft: Some(EditorDraft::new(starter_macro_definition())),
+            ..MacroPageState::default()
+        };
+        state.begin_draft_session();
+        let session = state.active_draft_session().unwrap();
+
+        begin_editor_authoring(&mut state, EditorAuthoringKind::CaptureTarget);
+        let capture = state.take_editor_authoring_request().unwrap();
+        assert_eq!(capture.session, session);
+        state
+            .apply_editor_authoring_result(EditorAuthoringResult {
+                session,
+                id: capture.id,
+                fingerprint: capture.fingerprint,
+                outcome: EditorAuthoringOutcome::TargetGeometry {
+                    process_path: r#"C:\Games\Diablo IV.exe"#.into(),
+                    window_class: "Diablo IV Main Window".into(),
+                    title: "Diablo IV".into(),
+                    width: 1920,
+                    height: 1080,
+                    dpi: 144,
+                },
+            })
+            .unwrap();
+
+        let draft = state.draft.as_ref().unwrap();
+        assert_eq!(draft.target.process_path, r#"C:\Games\Diablo IV.exe"#);
+        assert_eq!(draft.target.captured_client_width, 1920);
+        assert_eq!(draft.target.captured_client_height, 1080);
+        assert_eq!(draft.target.captured_dpi, 144);
+        assert_eq!(draft.status, DraftStatus::NeedsValidation);
+
+        begin_editor_authoring(
+            &mut state,
+            EditorAuthoringKind::TestOcr {
+                block_id: "observe-1".into(),
+            },
+        );
+        assert_eq!(
+            state.take_editor_authoring_request().unwrap().session,
+            session,
+            "retargeting must preserve the draft session's native binding key"
+        );
     }
 
     #[test]

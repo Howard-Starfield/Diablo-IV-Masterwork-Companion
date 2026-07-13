@@ -2843,6 +2843,7 @@ struct ControllerEventBuffer {
     capacity: usize,
     events: Mutex<VecDeque<RunEvent>>,
     lifecycle: Mutex<ControllerLifecycleProjection>,
+    semantic: Mutex<ControllerSemanticProjection>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -2851,8 +2852,67 @@ pub struct ControllerLifecycleProjection {
     pub run_stopped: Option<RunEvent>,
 }
 
+/// A bounded latest-state view for monitors that cannot rely on replay or journaling.
+///
+/// Each event category has exactly one slot, so memory use is independent of run
+/// duration and definition size. The retained events carry their original sequence,
+/// run, block, and lane identifiers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ControllerSemanticProjection {
+    pub run_started: Option<RunEvent>,
+    pub run_stopped: Option<RunEvent>,
+    pub status: Option<RunEvent>,
+    pub active_block: Option<RunEvent>,
+    pub latest_observation: Option<RunEvent>,
+    pub latest_condition: Option<RunEvent>,
+    pub latest_progress: Option<RunEvent>,
+    pub latest_action: Option<RunEvent>,
+    pub latest_loop: Option<RunEvent>,
+    pub latest_arbitration: Option<RunEvent>,
+    pub latest_polling_delay: Option<RunEvent>,
+    pub latest_error: Option<RunEvent>,
+}
+
 impl ControllerEventBuffer {
     fn push(&self, event: RunEvent) {
+        {
+            let mut semantic = self
+                .semantic
+                .lock()
+                .expect("controller semantic projection poisoned");
+            match &event {
+                RunEvent::RunStarted { .. } => {
+                    *semantic = ControllerSemanticProjection::default();
+                    semantic.run_started = Some(event.clone());
+                }
+                RunEvent::StatusChanged { .. } => semantic.status = Some(event.clone()),
+                RunEvent::BlockEntered { .. } => semantic.active_block = Some(event.clone()),
+                RunEvent::ActionPlanned { .. } | RunEvent::ActionBlocked { .. } => {
+                    semantic.latest_action = Some(event.clone());
+                }
+                RunEvent::ObservationCompleted { .. } => {
+                    semantic.latest_observation = Some(event.clone());
+                }
+                RunEvent::ConditionEvaluated { .. } => {
+                    semantic.latest_condition = Some(event.clone());
+                }
+                RunEvent::ObservationProgress { .. } => {
+                    semantic.latest_progress = Some(event.clone());
+                }
+                RunEvent::LoopYielded { .. } => semantic.latest_loop = Some(event.clone()),
+                RunEvent::ArbitrationCompleted { .. } => {
+                    semantic.latest_arbitration = Some(event.clone());
+                }
+                RunEvent::PollingDelayed { .. } => {
+                    semantic.latest_polling_delay = Some(event.clone());
+                }
+                RunEvent::Error { .. } => semantic.latest_error = Some(event.clone()),
+                RunEvent::RunStopped { .. } => {
+                    semantic.status = Some(event.clone());
+                    semantic.run_stopped = Some(event.clone());
+                }
+            }
+        }
         {
             let mut lifecycle = self
                 .lifecycle
@@ -2910,6 +2970,13 @@ impl ControllerEventBuffer {
         self.lifecycle
             .lock()
             .expect("controller lifecycle projection poisoned")
+            .clone()
+    }
+
+    fn semantic_projection(&self) -> ControllerSemanticProjection {
+        self.semantic
+            .lock()
+            .expect("controller semantic projection poisoned")
             .clone()
     }
 }
@@ -3010,6 +3077,7 @@ impl MacroController {
                 capacity: event_capacity,
                 events: Mutex::new(VecDeque::with_capacity(event_capacity)),
                 lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
+                semantic: Mutex::new(ControllerSemanticProjection::default()),
             }),
             #[cfg(test)]
             cycle_gate: None,
@@ -3242,6 +3310,10 @@ impl MacroController {
         self.events.lifecycle_projection()
     }
 
+    pub fn semantic_projection(&self) -> ControllerSemanticProjection {
+        self.events.semantic_projection()
+    }
+
     pub fn wait_until_idle(&self, timeout: Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -3268,11 +3340,11 @@ impl MacroController {
 }
 
 fn blocks_reach_continuous(blocks: &[Block]) -> bool {
-    blocks.iter().any(|block| {
+    for block in blocks {
         if !block.enabled {
-            return false;
+            continue;
         }
-        match &block.kind {
+        let reaches_continuous = match &block.kind {
             BlockKind::Continuous { .. } => true,
             BlockKind::Observe { condition } => condition_reaches_continuous(condition),
             BlockKind::If {
@@ -3292,15 +3364,26 @@ fn blocks_reach_continuous(blocks: &[Block]) -> bool {
                 group
                     .enabled_lanes_in_priority_order()
                     .any(|(_, lane)| blocks_reach_continuous(&lane.then_body))
-                    || timeout_outcome_reaches_continuous(&group.timeout_outcome)
+                    || (matches!(&group.timeout_ms, Limit::Finite(_))
+                        && timeout_outcome_reaches_continuous(&group.timeout_outcome))
             }
             BlockKind::Action { .. }
             | BlockKind::Wait { .. }
             | BlockKind::StopSuccess
             | BlockKind::StopError { .. }
             | BlockKind::Comment { .. } => false,
+        };
+        if reaches_continuous {
+            return true;
         }
-    })
+        if matches!(
+            &block.kind,
+            BlockKind::StopSuccess | BlockKind::StopError { .. }
+        ) {
+            return false;
+        }
+    }
+    false
 }
 
 fn condition_reaches_continuous(condition: &Condition) -> bool {
@@ -3310,11 +3393,18 @@ fn condition_reaches_continuous(condition: &Condition) -> bool {
     match mode {
         ObserveMode::CheckNow => false,
         ObserveMode::WaitForTrue {
-            timeout_outcome, ..
+            timeout_ms,
+            timeout_outcome,
+            ..
         }
         | ObserveMode::WaitForFalse {
-            timeout_outcome, ..
-        } => timeout_outcome_reaches_continuous(timeout_outcome),
+            timeout_ms,
+            timeout_outcome,
+            ..
+        } => {
+            matches!(timeout_ms, Limit::Finite(_))
+                && timeout_outcome_reaches_continuous(timeout_outcome)
+        }
     }
 }
 
@@ -11015,6 +11105,65 @@ mod tests {
     }
 
     #[test]
+    fn run_once_accepts_continuous_after_unconditional_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MacroStore::open(temp.path()).unwrap());
+        let runtime = fixture_runtime();
+        let definition = fixture_definition(vec![
+            block("stop", BlockKind::StopSuccess),
+            block(
+                "unreachable-continuous",
+                BlockKind::Continuous {
+                    body: vec![point_action("click")],
+                },
+            ),
+        ]);
+        store.save_validated(definition).unwrap();
+        let controller = MacroController::new(runtime, Arc::clone(&store), 128);
+
+        controller
+            .start_saved("macro", ControllerRunRequest::once(RunMode::DryRun))
+            .unwrap();
+        controller.wait_until_idle(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn run_once_accepts_continuous_only_in_unlimited_timeout_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MacroStore::open(temp.path()).unwrap());
+        let runtime = fixture_runtime();
+        let definition = fixture_definition(vec![block(
+            "observe",
+            BlockKind::Observe {
+                condition: text_condition(
+                    "observe",
+                    ObserveMode::WaitForTrue {
+                        timeout_ms: Limit::Unlimited,
+                        timeout_outcome: TimeoutOutcome::RunBody {
+                            body: vec![block(
+                                "unreachable-continuous",
+                                BlockKind::Continuous {
+                                    body: vec![point_action("click")],
+                                },
+                            )],
+                        },
+                    },
+                ),
+            },
+        )]);
+        store.save_validated(definition).unwrap();
+        let controller = MacroController::new(runtime, Arc::clone(&store), 128);
+
+        let result = controller.start_saved("macro", ControllerRunRequest::once(RunMode::DryRun));
+        if result.is_ok() {
+            controller.emergency_stop();
+            controller.wait_until_idle(Duration::from_secs(2)).unwrap();
+        }
+
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
     fn active_run_lease_collision_fails_controller_sink_startup() {
         let temp = tempfile::tempdir().unwrap();
         let store = Arc::new(MacroStore::open(temp.path()).unwrap());
@@ -11023,6 +11172,7 @@ mod tests {
             capacity: 8,
             events: Mutex::new(VecDeque::new()),
             lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
+            semantic: Mutex::new(ControllerSemanticProjection::default()),
         });
         let (startup_tx, startup_rx) = mpsc::channel();
         let sink = ControllerEventSink {
@@ -11060,6 +11210,7 @@ mod tests {
             capacity: 1,
             events: Mutex::new(VecDeque::new()),
             lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
+            semantic: Mutex::new(ControllerSemanticProjection::default()),
         });
         let sink = ControllerEventSink {
             store,
@@ -11098,6 +11249,7 @@ mod tests {
             capacity: 1,
             events: Mutex::new(VecDeque::new()),
             lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
+            semantic: Mutex::new(ControllerSemanticProjection::default()),
         });
         let sink = ControllerEventSink {
             store,
@@ -11118,6 +11270,217 @@ mod tests {
         sink.emit(&controller_stopped_event("capped-run"));
 
         let projection = buffer.lifecycle_projection();
+        assert!(projection.run_started.is_some());
+        assert!(projection.run_stopped.is_some());
+    }
+
+    #[test]
+    fn semantic_projection_survives_disabled_journal_and_tiny_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MacroStore::open(temp.path()).unwrap());
+        let _existing = store.open_journal("semantic-run", JournalLimits::new(1_024, 2));
+        let buffer = Arc::new(ControllerEventBuffer {
+            capacity: 1,
+            events: Mutex::new(VecDeque::new()),
+            lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
+            semantic: Mutex::new(ControllerSemanticProjection::default()),
+        });
+        let sink = ControllerEventSink {
+            store,
+            buffer: Arc::clone(&buffer),
+            journal: Mutex::new(None),
+            active_run: Mutex::new(None),
+            startup: Mutex::new(None),
+            journal_limits: JournalLimits::new(1_024, 2),
+            control: None,
+        };
+        emit_semantic_monitor_events(&sink, "semantic-run");
+
+        assert_semantic_monitor_projection(&buffer.semantic_projection());
+    }
+
+    #[test]
+    fn semantic_projection_survives_capped_journal_and_tiny_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MacroStore::open(temp.path()).unwrap());
+        let buffer = Arc::new(ControllerEventBuffer {
+            capacity: 1,
+            events: Mutex::new(VecDeque::new()),
+            lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
+            semantic: Mutex::new(ControllerSemanticProjection::default()),
+        });
+        let sink = ControllerEventSink {
+            store,
+            buffer: Arc::clone(&buffer),
+            journal: Mutex::new(None),
+            active_run: Mutex::new(None),
+            startup: Mutex::new(None),
+            journal_limits: JournalLimits::new(1, 2),
+            control: None,
+        };
+        emit_semantic_monitor_events(&sink, "semantic-run");
+
+        assert_semantic_monitor_projection(&buffer.semantic_projection());
+    }
+
+    fn emit_semantic_monitor_events(sink: &ControllerEventSink, run_id: &str) {
+        sink.emit(&controller_started_event(run_id));
+        sink.emit(&RunEvent::StatusChanged {
+            sequence: 2,
+            elapsed_ms: 1,
+            run_id: run_id.to_string(),
+            status: RunStatus::Running,
+        });
+        sink.emit(&RunEvent::BlockEntered {
+            sequence: 3,
+            elapsed_ms: 2,
+            run_id: run_id.to_string(),
+            block_id: "watch".to_string(),
+        });
+        sink.emit(&RunEvent::ObservationCompleted {
+            sequence: 4,
+            elapsed_ms: 3,
+            run_id: run_id.to_string(),
+            block_id: "watch".to_string(),
+            evidence: DetectorEvidence {
+                matched: true,
+                frame_id: 1,
+                captured_at_ms: 3,
+                match_rect: None,
+                score: Some(0.9),
+                match_count: 1,
+                stable_frames: 1,
+                frame_metadata: None,
+                details: serde_json::json!({ "fixture": true }),
+            },
+            token: None,
+        });
+        sink.emit(&RunEvent::ConditionEvaluated {
+            sequence: 5,
+            elapsed_ms: 4,
+            run_id: run_id.to_string(),
+            block_id: "watch".to_string(),
+            matched: true,
+        });
+        sink.emit(&RunEvent::ObservationProgress {
+            sequence: 6,
+            elapsed_ms: 5,
+            run_id: run_id.to_string(),
+            block_id: "watch".to_string(),
+            attempts: 2,
+        });
+        sink.emit(&RunEvent::ActionPlanned {
+            sequence: 7,
+            elapsed_ms: 6,
+            run_id: run_id.to_string(),
+            block_id: "click".to_string(),
+            action: Action::ClickPoint {
+                point_id: "point".to_string(),
+                button: super::super::MouseButton::Left,
+            },
+            state: ActionState::Planned,
+            token: None,
+        });
+        sink.emit(&RunEvent::ActionBlocked {
+            sequence: 8,
+            elapsed_ms: 7,
+            run_id: run_id.to_string(),
+            block_id: "click".to_string(),
+            action: Action::ClickPoint {
+                point_id: "point".to_string(),
+                button: super::super::MouseButton::Left,
+            },
+            state: ActionState::Blocked,
+            reason: "dry run".to_string(),
+        });
+        sink.emit(&RunEvent::LoopYielded {
+            sequence: 9,
+            elapsed_ms: 8,
+            run_id: run_id.to_string(),
+            block_id: "loop".to_string(),
+            completed_iterations: 3,
+        });
+        sink.emit(&RunEvent::ArbitrationCompleted {
+            sequence: 10,
+            elapsed_ms: 9,
+            run_id: run_id.to_string(),
+            block_id: "watch".to_string(),
+            winner_lane_id: Some("lane-a".to_string()),
+            discarded_lane_ids: vec!["lane-b".to_string()],
+            safety_bypassed: false,
+            discard_reason: None,
+        });
+        sink.emit(&RunEvent::PollingDelayed {
+            sequence: 11,
+            elapsed_ms: 10,
+            run_id: run_id.to_string(),
+            block_id: "watch".to_string(),
+            lane_id: "lane-b".to_string(),
+            delayed_polls: 4,
+        });
+        sink.emit(&RunEvent::Error {
+            sequence: 12,
+            elapsed_ms: 11,
+            run_id: run_id.to_string(),
+            block_id: Some("watch".to_string()),
+            message: "detector failed".to_string(),
+        });
+        sink.emit(&RunEvent::RunStopped {
+            sequence: 13,
+            elapsed_ms: 12,
+            run_id: run_id.to_string(),
+            status: RunStatus::Stopped,
+            reason: StopReason::Completed,
+        });
+    }
+
+    fn assert_semantic_monitor_projection(projection: &ControllerSemanticProjection) {
+        assert_eq!(projection.status.as_ref().map(RunEvent::sequence), Some(13));
+        assert_eq!(
+            projection.active_block.as_ref().map(RunEvent::sequence),
+            Some(3)
+        );
+        assert_eq!(
+            projection
+                .latest_observation
+                .as_ref()
+                .map(RunEvent::sequence),
+            Some(4)
+        );
+        assert_eq!(
+            projection.latest_condition.as_ref().map(RunEvent::sequence),
+            Some(5)
+        );
+        assert_eq!(
+            projection.latest_progress.as_ref().map(RunEvent::sequence),
+            Some(6)
+        );
+        assert_eq!(
+            projection.latest_action.as_ref().map(RunEvent::sequence),
+            Some(8)
+        );
+        assert_eq!(
+            projection.latest_loop.as_ref().map(RunEvent::sequence),
+            Some(9)
+        );
+        assert_eq!(
+            projection
+                .latest_arbitration
+                .as_ref()
+                .map(RunEvent::sequence),
+            Some(10)
+        );
+        assert_eq!(
+            projection
+                .latest_polling_delay
+                .as_ref()
+                .map(RunEvent::sequence),
+            Some(11)
+        );
+        assert_eq!(
+            projection.latest_error.as_ref().map(RunEvent::sequence),
+            Some(12)
+        );
         assert!(projection.run_started.is_some());
         assert!(projection.run_stopped.is_some());
     }

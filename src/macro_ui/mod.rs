@@ -223,17 +223,7 @@ fn status_strip(
                 );
                 status_fact(ui, "GEOMETRY", "Snapshot only");
                 status_fact(ui, "REVISION", revision_summary(state, monitor).as_str());
-                status_fact(
-                    ui,
-                    "VALIDATION",
-                    if state.draft.is_none() {
-                        "No definition"
-                    } else if problems.is_empty() {
-                        "Valid"
-                    } else {
-                        "Needs revalidation"
-                    },
-                );
+                status_fact(ui, "VALIDATION", validation_summary(state, problems));
             });
             ui.add_space(9.0);
             ui.horizontal_wrapped(|ui| {
@@ -266,6 +256,15 @@ fn status_strip(
             });
         });
     navigate
+}
+
+fn validation_summary(state: &MacroPageState, problems: &[ValidationProblem]) -> &'static str {
+    match state.draft.as_ref() {
+        None => "No definition",
+        Some(_) if !problems.is_empty() => "Needs revalidation",
+        Some(draft) if draft.status == DraftStatus::NeedsValidation => "Needs revalidation",
+        Some(_) => "Valid",
+    }
 }
 
 fn starter_macro_definition() -> crate::engine::macro_engine::MacroDefinition {
@@ -592,7 +591,7 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
         }
     });
     let Some(selected) = selected else { return };
-    if let Some((group_id, index, len)) = state
+    if let Some((group_id, index, len, enabled)) = state
         .draft
         .as_ref()
         .and_then(|draft| locate_watch_lane(draft, &selected))
@@ -618,9 +617,29 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                 let _ = dispatch_editor_command(
                     state,
                     EditorCommand::MoveLane {
-                        group_id,
+                        group_id: group_id.clone(),
                         lane_id: selected.clone(),
                         to_index: index + 1,
+                    },
+                );
+            }
+            if ui
+                .add_enabled(
+                    editable,
+                    Button::new(if enabled {
+                        "Disable lane"
+                    } else {
+                        "Enable lane"
+                    }),
+                )
+                .clicked()
+            {
+                let _ = dispatch_editor_command(
+                    state,
+                    EditorCommand::SetLaneEnabled {
+                        group_id,
+                        lane_id: selected.clone(),
+                        enabled: !enabled,
                     },
                 );
             }
@@ -836,15 +855,15 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                     }
                 }
             });
+            let replacements = state
+                .draft
+                .as_ref()
+                .map(|draft| replacement_choices(draft, &block, &path))
+                .unwrap_or_default();
             ui.horizontal_wrapped(|ui| {
-                for (label, kind) in [
-                    ("Replace as Wait", ReplacementKind::Wait),
-                    ("Replace as Note", ReplacementKind::Note),
-                    ("Replace as Stop", ReplacementKind::Stop),
-                ] {
+                for (label, preview) in replacements {
                     if ui.add_enabled(editable, Button::new(label)).clicked() {
-                        state.pending_conversion =
-                            Some(replace_block_preview(&block, path.clone(), kind));
+                        state.pending_conversion = Some(preview);
                     }
                 }
             });
@@ -909,6 +928,13 @@ fn conversion_preview_ui(ui: &mut Ui, pending: &mut PendingConversion) {
             pending.required_values = vec![("max_iterations".into(), maximum.to_string())];
         }
         EditorCommand::ReplaceBlock { replacement, .. } => match &mut replacement.kind {
+            crate::engine::macro_engine::BlockKind::RepeatN { count, .. } => {
+                ui.horizontal(|ui| {
+                    ui.label("Count");
+                    ui.add(egui::DragValue::new(count).clamp_range(0..=u32::MAX));
+                });
+                pending.required_values = vec![("count".into(), count.to_string())];
+            }
             crate::engine::macro_engine::BlockKind::Wait { duration_ms } => {
                 ui.horizontal(|ui| {
                     ui.label("Duration ms");
@@ -990,6 +1016,43 @@ fn pending_conversion_valid(draft: &EditorDraft, pending: &PendingConversion) ->
         EditorCommand::ReplaceBlock { replacement, .. } => match &replacement.kind {
             BlockKind::Wait { duration_ms } => *duration_ms > 0,
             BlockKind::Comment { text } => !text.trim().is_empty(),
+            BlockKind::RepeatN { count, .. } => *count > 0,
+            BlockKind::Observe {
+                condition: crate::engine::macro_engine::Condition::Text { rule_id, .. },
+            } => draft.text_rules.iter().any(|rule| rule.id == *rule_id),
+            BlockKind::Observe {
+                condition: crate::engine::macro_engine::Condition::Image { rule_id, .. },
+            } => draft.image_rules.iter().any(|rule| rule.id == *rule_id),
+            BlockKind::Action {
+                action:
+                    crate::engine::macro_engine::Action::ClickTextMatch {
+                        source_block_id, ..
+                    },
+            } => locate_block_path(draft, source_block_id)
+                .and_then(|path| block_at_path(draft, &path))
+                .is_some_and(|block| {
+                    matches!(
+                        block.kind,
+                        BlockKind::Observe {
+                            condition: crate::engine::macro_engine::Condition::Text { .. }
+                        }
+                    )
+                }),
+            BlockKind::Action {
+                action:
+                    crate::engine::macro_engine::Action::ClickImageMatch {
+                        source_block_id, ..
+                    },
+            } => locate_block_path(draft, source_block_id)
+                .and_then(|path| block_at_path(draft, &path))
+                .is_some_and(|block| {
+                    matches!(
+                        block.kind,
+                        BlockKind::Observe {
+                            condition: crate::engine::macro_engine::Condition::Image { .. }
+                        }
+                    )
+                }),
             _ => true,
         },
         _ => true,
@@ -1120,31 +1183,33 @@ fn conversion_choices(
             ),
         ]),
         BlockKind::Action {
-            action: Action::ClickPoint { button, .. } | Action::ClickRegion { button, .. },
+            action: Action::ClickPoint { .. } | Action::ClickRegion { .. },
         } => {
-            targets.extend(draft.points.iter().map(|point| {
-                (
-                    format!("Point: {}", point.id),
-                    ConversionTarget::ClickPoint {
-                        point_id: point.id.clone(),
-                        button: *button,
-                    },
-                )
-            }));
-            targets.extend(draft.regions.iter().map(|region| {
-                (
-                    format!("Region: {}", region.id),
-                    ConversionTarget::ClickRegion {
-                        region_id: region.id.clone(),
-                        button: *button,
-                    },
-                )
-            }));
+            for button in [MouseButton::Left, MouseButton::Right] {
+                targets.extend(draft.points.iter().map(|point| {
+                    (
+                        format!("Point: {} ({button:?})", point.id),
+                        ConversionTarget::ClickPoint {
+                            point_id: point.id.clone(),
+                            button,
+                        },
+                    )
+                }));
+                targets.extend(draft.regions.iter().map(|region| {
+                    (
+                        format!("Region: {} ({button:?})", region.id),
+                        ConversionTarget::ClickRegion {
+                            region_id: region.id.clone(),
+                            button,
+                        },
+                    )
+                }));
+            }
         }
         BlockKind::RepeatN { .. } => {
-            if let Some((source_id, condition)) = observation_source(draft, None) {
+            for (source_id, condition) in observation_sources(draft) {
                 targets.push((
-                    "Repeat Until".into(),
+                    format!("Repeat Until: {source_id}"),
                     ConversionTarget::RepeatUntil {
                         condition: condition_with_source(condition, source_id),
                         max_iterations: Limit::Finite(100),
@@ -1221,8 +1286,13 @@ fn conversion_target_changes(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReplacementKind {
+    DetectorText(String),
+    DetectorImage(String),
+    ActionText(String),
+    ActionImage(String),
+    Loop,
     Wait,
     Note,
     Stop,
@@ -1233,8 +1303,55 @@ fn replace_block_preview(
     path: BlockPath,
     replacement_kind: ReplacementKind,
 ) -> PendingConversion {
-    use crate::engine::macro_engine::{Block, BlockKind};
+    use crate::engine::macro_engine::{
+        Action, Block, BlockKind, Condition, MouseButton, ObserveMode,
+    };
     let (kind, required_values) = match replacement_kind {
+        ReplacementKind::DetectorText(rule_id) => (
+            BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: block.id.clone(),
+                    rule_id: rule_id.clone(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+            vec![("text_rule".into(), rule_id)],
+        ),
+        ReplacementKind::DetectorImage(rule_id) => (
+            BlockKind::Observe {
+                condition: Condition::Image {
+                    source_block_id: block.id.clone(),
+                    rule_id: rule_id.clone(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+            vec![("image_rule".into(), rule_id)],
+        ),
+        ReplacementKind::ActionText(source_id) => (
+            BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: source_id.clone(),
+                    button: MouseButton::Left,
+                },
+            },
+            vec![("text_source".into(), source_id)],
+        ),
+        ReplacementKind::ActionImage(source_id) => (
+            BlockKind::Action {
+                action: Action::ClickImageMatch {
+                    source_block_id: source_id.clone(),
+                    button: MouseButton::Left,
+                },
+            },
+            vec![("image_source".into(), source_id)],
+        ),
+        ReplacementKind::Loop => (
+            BlockKind::RepeatN {
+                count: 2,
+                body: vec![],
+            },
+            vec![("count".into(), "2".into())],
+        ),
         ReplacementKind::Wait => (
             BlockKind::Wait { duration_ms: 250 },
             vec![("duration_ms".into(), "250".into())],
@@ -1273,6 +1390,54 @@ fn replace_block_preview(
                 | BlockKind::WatchGroup { .. }
         ),
     }
+}
+
+fn replacement_choices(
+    draft: &EditorDraft,
+    block: &crate::engine::macro_engine::Block,
+    path: &BlockPath,
+) -> Vec<(String, PendingConversion)> {
+    let mut kinds = Vec::new();
+    kinds.extend(draft.text_rules.iter().map(|rule| {
+        (
+            format!("Detector: Text {}", rule.id),
+            ReplacementKind::DetectorText(rule.id.clone()),
+        )
+    }));
+    kinds.extend(draft.image_rules.iter().map(|rule| {
+        (
+            format!("Detector: Image {}", rule.id),
+            ReplacementKind::DetectorImage(rule.id.clone()),
+        )
+    }));
+    kinds.extend(
+        observation_sources(draft)
+            .into_iter()
+            .map(|(id, condition)| match condition {
+                crate::engine::macro_engine::Condition::Text { .. } => (
+                    format!("Action: Text source {id}"),
+                    ReplacementKind::ActionText(id),
+                ),
+                crate::engine::macro_engine::Condition::Image { .. } => (
+                    format!("Action: Image source {id}"),
+                    ReplacementKind::ActionImage(id),
+                ),
+            }),
+    );
+    kinds.extend(
+        [
+            ("Replace as Loop", ReplacementKind::Loop),
+            ("Replace as Wait", ReplacementKind::Wait),
+            ("Replace as Note", ReplacementKind::Note),
+            ("Replace as Stop", ReplacementKind::Stop),
+        ]
+        .into_iter()
+        .map(|(label, kind)| (label.into(), kind)),
+    );
+    kinds
+        .into_iter()
+        .map(|(label, kind)| (label, replace_block_preview(block, path.clone(), kind)))
+        .collect()
 }
 
 fn conversion_target_family(target: &ConversionTarget) -> BlockFamily {
@@ -1474,7 +1639,15 @@ fn insertion_target(draft: &EditorDraft, selected_id: Option<&str>) -> Insertion
             index: draft.blocks.len(),
         };
     };
-    if let Some((watch_id, _, _)) = locate_watch_lane(draft, selected_id) {
+    if let Some(owner_id) = selected_id.strip_suffix("-timeout") {
+        let container = ContainerPath::TimeoutBody {
+            owner_id: owner_id.into(),
+        };
+        if let Some(index) = container_len(draft, &container) {
+            return InsertionTarget { container, index };
+        }
+    }
+    if let Some((watch_id, _, _, _)) = locate_watch_lane(draft, selected_id) {
         let container = ContainerPath::WatchLaneBody {
             watch_id,
             lane_id: selected_id.into(),
@@ -1552,6 +1725,28 @@ fn observation_source(
         None
     }
     find(&draft.blocks)
+}
+
+fn observation_sources(
+    draft: &EditorDraft,
+) -> Vec<(String, crate::engine::macro_engine::Condition)> {
+    use crate::engine::macro_engine::BlockKind;
+    fn collect(
+        blocks: &[crate::engine::macro_engine::Block],
+        out: &mut Vec<(String, crate::engine::macro_engine::Condition)>,
+    ) {
+        for block in blocks {
+            if let BlockKind::Observe { condition } = &block.kind {
+                out.push((block.id.clone(), condition.clone()));
+            }
+            for child in palette_child_slices(block) {
+                collect(child, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    collect(&draft.blocks, &mut out);
+    out
 }
 
 fn palette_child_slices(
@@ -1741,6 +1936,28 @@ mod tests {
             target.container,
             ContainerPath::LoopBody { loop_id: repeat_id }
         );
+
+        let BlockKind::Observe { condition } = &mut draft.blocks[0].kind else {
+            panic!()
+        };
+        let Condition::Text { mode, .. } = condition else {
+            panic!()
+        };
+        *mode = ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Finite(100),
+            timeout_outcome: TimeoutOutcome::RunBody { body: vec![] },
+        };
+        let EditorCommand::InsertBlock { target, .. } =
+            palette_command(&draft, Some("observe-1-timeout"), PaletteKind::Wait).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            target.container,
+            ContainerPath::TimeoutBody {
+                owner_id: "observe-1".into()
+            }
+        );
     }
 
     #[test]
@@ -1783,6 +2000,74 @@ mod tests {
     }
 
     #[test]
+    fn inspector_dispatch_persists_required_text_and_image_rule_fields() {
+        let mut state = MacroPageState {
+            draft: Some(fixture()),
+            ..MacroPageState::default()
+        };
+        let mut text = state.draft.as_ref().unwrap().text_rules[0].clone();
+        text.match_mode = TextMatchMode::Absent;
+        text.case_sensitive = true;
+        text.allow_cross_line = true;
+        text.preprocess = PreprocessProfile::HighContrast;
+        text.match_policy = MatchSelectionPolicy::Topmost;
+        text.timeout_ms = Limit::Finite(7_500);
+        text.stable_frames = 4;
+        let command = inspector_editor_command(
+            state.draft.as_ref(),
+            &inspector::InspectorIntent::ReplaceTextRule { rule: text },
+        )
+        .unwrap()
+        .unwrap();
+        dispatch_editor_command(&mut state, command).unwrap();
+        let text = &state.draft.as_ref().unwrap().text_rules[0];
+        assert_eq!(text.match_mode, TextMatchMode::Absent);
+        assert!(text.case_sensitive && text.allow_cross_line);
+        assert_eq!(text.preprocess, PreprocessProfile::HighContrast);
+        assert_eq!(text.match_policy, MatchSelectionPolicy::Topmost);
+        assert_eq!(text.timeout_ms, Limit::Finite(7_500));
+        assert_eq!(text.stable_frames, 4);
+
+        let template = |id: &str| AssetRef {
+            id: id.into(),
+            revision: 1,
+            content_hash: format!("hash-{id}"),
+        };
+        state.draft.as_mut().unwrap().image_rules.push(ImageRule {
+            id: "image-rule".into(),
+            revision: 1,
+            region_id: "scan".into(),
+            template: template("old"),
+            transparent_mask: None,
+            threshold: 0.9,
+            scales_percent: vec![100],
+            stable_frames: 2,
+            maximum_center_drift_px: 5,
+            minimum_runner_up_margin: 0.05,
+            verification: None,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 250,
+            timeout_ms: Limit::Unlimited,
+        });
+        let mut image = state.draft.as_ref().unwrap().image_rules[0].clone();
+        image.template = template("new");
+        image.match_policy = MatchSelectionPolicy::Bottommost;
+        image.timeout_ms = Limit::Finite(9_000);
+        let command = inspector_editor_command(
+            state.draft.as_ref(),
+            &inspector::InspectorIntent::ReplaceImageRule { rule: image },
+        )
+        .unwrap()
+        .unwrap();
+        dispatch_editor_command(&mut state, command).unwrap();
+        let image = &state.draft.as_ref().unwrap().image_rules[0];
+        assert_eq!(image.template.id, "new");
+        assert_eq!(image.match_policy, MatchSelectionPolicy::Bottommost);
+        assert_eq!(image.timeout_ms, Limit::Finite(9_000));
+        assert_eq!(image.verification, None);
+    }
+
+    #[test]
     fn conversion_previews_expose_replace_confirmation_and_required_values() {
         let draft = fixture();
         let block = &draft.blocks[0];
@@ -1806,6 +2091,88 @@ mod tests {
             replacement.required_values,
             vec![("duration_ms".into(), "250".into())]
         );
+    }
+
+    #[test]
+    fn conversion_choices_cover_saved_targets_buttons_and_replacement_families() {
+        use crate::engine::types::{PointRatio, RectRatio};
+        let mut draft = fixture();
+        draft.points.push(PointDefinition {
+            id: "point".into(),
+            revision: 1,
+            point: PointRatio { x: 0.5, y: 0.5 },
+        });
+        draft.regions.push(RegionDefinition {
+            id: "region".into(),
+            revision: 1,
+            rect: RectRatio {
+                x: 0.1,
+                y: 0.1,
+                width: 0.2,
+                height: 0.2,
+            },
+        });
+        draft.image_rules.push(ImageRule {
+            id: "image-rule".into(),
+            revision: 1,
+            region_id: "region".into(),
+            template: AssetRef {
+                id: "template".into(),
+                revision: 1,
+                content_hash: "hash".into(),
+            },
+            transparent_mask: None,
+            threshold: 0.9,
+            scales_percent: vec![100],
+            stable_frames: 2,
+            maximum_center_drift_px: 5,
+            minimum_runner_up_margin: 0.05,
+            verification: None,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 250,
+            timeout_ms: Limit::Unlimited,
+        });
+        draft.blocks.push(Block {
+            id: "observe-image".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Image {
+                    source_block_id: "observe-image".into(),
+                    rule_id: "image-rule".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        });
+        draft.blocks.push(Block {
+            id: "saved-click".into(),
+            enabled: true,
+            kind: BlockKind::Action {
+                action: Action::ClickPoint {
+                    point_id: "point".into(),
+                    button: MouseButton::Left,
+                },
+            },
+        });
+        let block = draft.blocks.last().unwrap();
+        let path = locate_block_path(&draft, &block.id).unwrap();
+        let labels = conversion_choices(&draft, block, &path)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>();
+        assert!(!labels.contains(&"Point: point (Left)".into()));
+        assert!(labels.contains(&"Point: point (Right)".into()));
+        assert!(labels.contains(&"Region: region (Left)".into()));
+        assert!(labels.contains(&"Region: region (Right)".into()));
+
+        let replacements = replacement_choices(&draft, block, &path)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>();
+        assert!(replacements.contains(&"Detector: Text rule".into()));
+        assert!(replacements.contains(&"Detector: Image image-rule".into()));
+        assert!(replacements.contains(&"Action: Text source observe-1".into()));
+        assert!(replacements.contains(&"Action: Image source observe-image".into()));
+        assert!(replacements.contains(&"Replace as Loop".into()));
     }
 
     #[test]
@@ -1869,5 +2236,34 @@ mod tests {
         assert_eq!(draft.blocks.len(), 1);
         assert!(locate_block_path(&draft, "observe-1").is_some());
         assert!(!draft.text_rules.is_empty());
+    }
+
+    #[test]
+    fn validation_status_honors_editor_draft_staleness() {
+        let mut state = MacroPageState {
+            draft: Some(fixture()),
+            ..MacroPageState::default()
+        };
+        assert_eq!(validation_summary(&state, &[]), "Valid");
+        dispatch_editor_command(
+            &mut state,
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+                block: Block {
+                    id: "note".into(),
+                    enabled: true,
+                    kind: BlockKind::Comment {
+                        text: "changed".into(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(validation_summary(&state, &[]), "Needs revalidation");
+        state.draft.as_mut().unwrap().status = DraftStatus::Ready;
+        assert_eq!(validation_summary(&state, &[]), "Valid");
     }
 }

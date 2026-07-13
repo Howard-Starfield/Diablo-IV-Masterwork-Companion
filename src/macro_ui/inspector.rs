@@ -1,8 +1,9 @@
-use eframe::egui::{Button, Color32, DragValue, RichText, Slider, TextEdit, Ui};
+use eframe::egui::{Button, Checkbox, Color32, DragValue, RichText, Slider, TextEdit, Ui};
 
 use crate::engine::macro_engine::{
-    Block, BlockKind, Condition, ImageRule, Limit, MacroDefinition, ObserveMode, PassiveCondition,
-    TextRule, TimeoutOutcome, ValidationProblem,
+    AssetRef, Block, BlockKind, Condition, ImageRule, Limit, MacroDefinition, MatchSelectionPolicy,
+    ObserveMode, PassiveCondition, PreprocessProfile, TextMatchMode, TextRule, TimeoutOutcome,
+    ValidationProblem,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +89,7 @@ pub struct ImageInspector {
     pub rule: ImageRule,
     pub observe_mode: ObserveMode,
     pub repeat_until_max: Option<Limit<u64>>,
+    pub available_templates: Vec<AssetRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +171,7 @@ pub fn project_inspector(
                             selected_problems(),
                             flow_fields(&block.kind),
                             repeat_until_max(&block.kind),
+                            &definition.image_rules,
                         )
                     })
                     .unwrap_or(InspectorProjection::Empty),
@@ -220,6 +223,7 @@ pub fn project_inspector(
                         problems,
                         vec![],
                         None,
+                        &definition.image_rules,
                     )
                 })
                 .unwrap_or(InspectorProjection::Empty),
@@ -289,6 +293,7 @@ fn image_projection(
     problems: Vec<String>,
     flow_fields: Vec<(String, String)>,
     repeat_until_max: Option<Limit<u64>>,
+    image_rules: &[ImageRule],
 ) -> InspectorProjection {
     InspectorProjection::Image(ImageInspector {
         block_id: id.into(),
@@ -315,6 +320,10 @@ fn image_projection(
         rule: rule.clone(),
         observe_mode: mode.clone(),
         repeat_until_max,
+        available_templates: image_rules
+            .iter()
+            .map(|rule| rule.template.clone())
+            .collect(),
     })
 }
 fn flow_projection(id: &str, kind: &BlockKind, problems: Vec<String>) -> InspectorProjection {
@@ -492,16 +501,50 @@ pub fn show(
             let original_rule = rule.clone();
             editable_string(ui, "Region", &mut rule.region_id, editable);
             editable_string(ui, "Expected", &mut rule.expected, editable);
+            if ui
+                .add_enabled(
+                    editable,
+                    Button::new(format!("Text match: {:?}", rule.match_mode)),
+                )
+                .clicked()
+            {
+                rule.match_mode = next_text_match_mode(rule.match_mode);
+            }
             editable_number(ui, "Threshold", &mut rule.threshold, 0.0..=1.0, editable);
-            field(ui, "Normalization", &p.normalization);
-            field(ui, "Profile", &p.profile);
+            ui.add_enabled(
+                editable,
+                Checkbox::new(&mut rule.case_sensitive, "Case sensitive"),
+            );
+            ui.add_enabled(
+                editable,
+                Checkbox::new(&mut rule.allow_cross_line, "Allow cross-line"),
+            );
+            if ui
+                .add_enabled(
+                    editable,
+                    Button::new(format!("Preprocess: {:?}", rule.preprocess)),
+                )
+                .clicked()
+            {
+                rule.preprocess = next_preprocess(rule.preprocess);
+            }
+            if ui
+                .add_enabled(
+                    editable,
+                    Button::new(format!("Policy: {:?}", rule.match_policy)),
+                )
+                .clicked()
+            {
+                rule.match_policy = next_policy(rule.match_policy);
+            }
             editable_u64(ui, "Polling ms", &mut rule.poll_interval_ms, editable);
-            field(ui, "Timeout", &p.timeout);
-            field(ui, "Policy", &p.policy);
+            editable_u8(ui, "Stable frames", &mut rule.stable_frames, editable);
+            limit_editor(ui, "Rule timeout ms", &mut rule.timeout_ms, editable);
             if rule != original_rule {
                 intent = Some(InspectorIntent::ReplaceTextRule { rule });
             }
             mode_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
+            mode_timeout_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
             repeat_until_editor(
                 ui,
                 &p.block_id,
@@ -523,6 +566,7 @@ pub fn show(
             let mut rule = p.rule.clone();
             let original_rule = rule.clone();
             editable_string(ui, "Region", &mut rule.region_id, editable);
+            template_editor(ui, &mut rule.template, &p.available_templates, editable);
             let scales_changed = image_scales_editor(ui, &mut rule.scales_percent, editable);
             editable_f32(ui, "Threshold", &mut rule.threshold, 0.0..=1.0, editable);
             editable_u8(ui, "Stable frames", &mut rule.stable_frames, editable);
@@ -534,8 +578,16 @@ pub fn show(
                 editable,
             );
             editable_u64(ui, "Polling ms", &mut rule.poll_interval_ms, editable);
-            field(ui, "Timeout", &p.timeout);
-            field(ui, "Policy", &p.policy);
+            limit_editor(ui, "Rule timeout ms", &mut rule.timeout_ms, editable);
+            if ui
+                .add_enabled(
+                    editable,
+                    Button::new(format!("Policy: {:?}", rule.match_policy)),
+                )
+                .clicked()
+            {
+                rule.match_policy = next_policy(rule.match_policy);
+            }
             if rule != original_rule {
                 intent = if scales_changed {
                     match validate_image_scales(&rule.scales_percent) {
@@ -547,6 +599,7 @@ pub fn show(
                 };
             }
             mode_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
+            mode_timeout_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
             repeat_until_editor(
                 ui,
                 &p.block_id,
@@ -638,6 +691,79 @@ fn editable_u8(ui: &mut Ui, label: &str, value: &mut u8, editable: bool) {
     });
 }
 
+fn next_text_match_mode(mode: TextMatchMode) -> TextMatchMode {
+    match mode {
+        TextMatchMode::Exact => TextMatchMode::Contains,
+        TextMatchMode::Contains => TextMatchMode::Fuzzy,
+        TextMatchMode::Fuzzy => TextMatchMode::Absent,
+        TextMatchMode::Absent => TextMatchMode::Exact,
+    }
+}
+
+fn next_preprocess(profile: PreprocessProfile) -> PreprocessProfile {
+    match profile {
+        PreprocessProfile::Original => PreprocessProfile::Grayscale,
+        PreprocessProfile::Grayscale => PreprocessProfile::HighContrast,
+        PreprocessProfile::HighContrast => PreprocessProfile::SmallText,
+        PreprocessProfile::SmallText => PreprocessProfile::Original,
+    }
+}
+
+fn next_policy(policy: MatchSelectionPolicy) -> MatchSelectionPolicy {
+    match policy {
+        MatchSelectionPolicy::ExactlyOne => MatchSelectionPolicy::HighestScore,
+        MatchSelectionPolicy::HighestScore => MatchSelectionPolicy::FirstReadingOrder,
+        MatchSelectionPolicy::FirstReadingOrder => MatchSelectionPolicy::Topmost,
+        MatchSelectionPolicy::Topmost => MatchSelectionPolicy::Bottommost,
+        MatchSelectionPolicy::Bottommost => MatchSelectionPolicy::ExactlyOne,
+    }
+}
+
+fn limit_editor(ui: &mut Ui, label: &str, limit: &mut Limit<u64>, editable: bool) {
+    let mut value = match limit {
+        Limit::Finite(value) => *value,
+        Limit::Unlimited => 5_000,
+    };
+    let before = value;
+    editable_u64(ui, label, &mut value, editable);
+    if value != before {
+        *limit = Limit::Finite(value);
+    }
+    if ui
+        .add_enabled(
+            editable,
+            Button::new(if matches!(limit, Limit::Unlimited) {
+                "Use finite timeout"
+            } else {
+                "Use unlimited timeout"
+            }),
+        )
+        .clicked()
+    {
+        *limit = if matches!(limit, Limit::Unlimited) {
+            Limit::Finite(value)
+        } else {
+            Limit::Unlimited
+        };
+    }
+}
+
+fn template_editor(ui: &mut Ui, template: &mut AssetRef, available: &[AssetRef], editable: bool) {
+    ui.label(format!("Template: {}", template.id));
+    ui.horizontal_wrapped(|ui| {
+        for candidate in available {
+            if candidate != template
+                && ui
+                    .add_enabled(editable, Button::new(format!("Use {}", candidate.id)))
+                    .clicked()
+            {
+                *template = candidate.clone();
+                break;
+            }
+        }
+    });
+}
+
 fn image_scales_editor(ui: &mut Ui, scales: &mut Vec<u16>, editable: bool) -> bool {
     let mut changed = false;
     ui.label("Scales percent");
@@ -717,6 +843,46 @@ fn mode_editor(
             block_id: block_id.into(),
             mode,
         });
+    }
+}
+
+fn mode_timeout_editor(
+    ui: &mut Ui,
+    block_id: &str,
+    current: &ObserveMode,
+    editable: bool,
+    intent: &mut Option<InspectorIntent>,
+) {
+    let mut timeout = match current {
+        ObserveMode::WaitForTrue { timeout_ms, .. }
+        | ObserveMode::WaitForFalse { timeout_ms, .. } => timeout_ms.clone(),
+        ObserveMode::CheckNow => return,
+    };
+    let before = timeout.clone();
+    limit_editor(ui, "Observe wait timeout ms", &mut timeout, editable);
+    if timeout != before {
+        *intent = Some(InspectorIntent::SetConditionMode {
+            block_id: block_id.into(),
+            mode: observe_mode_with_timeout(current, timeout).expect("wait mode"),
+        });
+    }
+}
+
+fn observe_mode_with_timeout(current: &ObserveMode, timeout_ms: Limit<u64>) -> Option<ObserveMode> {
+    match current {
+        ObserveMode::WaitForTrue {
+            timeout_outcome, ..
+        } => Some(ObserveMode::WaitForTrue {
+            timeout_ms,
+            timeout_outcome: timeout_outcome.clone(),
+        }),
+        ObserveMode::WaitForFalse {
+            timeout_outcome, ..
+        } => Some(ObserveMode::WaitForFalse {
+            timeout_ms,
+            timeout_outcome: timeout_outcome.clone(),
+        }),
+        ObserveMode::CheckNow => None,
     }
 }
 
@@ -1078,5 +1244,64 @@ mod tests {
         assert!(validate_image_scales(&[100, 100]).is_err());
         assert!(validate_image_scales(&[0]).is_err());
         assert!(validate_image_scales(&vec![100; DEFAULT_MAX_SCALES + 1]).is_err());
+    }
+
+    #[test]
+    fn required_text_editor_enums_cycle_through_every_canonical_choice() {
+        let mut mode = TextMatchMode::Exact;
+        for expected in [
+            TextMatchMode::Contains,
+            TextMatchMode::Fuzzy,
+            TextMatchMode::Absent,
+            TextMatchMode::Exact,
+        ] {
+            mode = next_text_match_mode(mode);
+            assert_eq!(mode, expected);
+        }
+        let mut profile = PreprocessProfile::Original;
+        for expected in [
+            PreprocessProfile::Grayscale,
+            PreprocessProfile::HighContrast,
+            PreprocessProfile::SmallText,
+            PreprocessProfile::Original,
+        ] {
+            profile = next_preprocess(profile);
+            assert_eq!(profile, expected);
+        }
+        let mut policy = MatchSelectionPolicy::ExactlyOne;
+        for expected in [
+            MatchSelectionPolicy::HighestScore,
+            MatchSelectionPolicy::FirstReadingOrder,
+            MatchSelectionPolicy::Topmost,
+            MatchSelectionPolicy::Bottommost,
+            MatchSelectionPolicy::ExactlyOne,
+        ] {
+            policy = next_policy(policy);
+            assert_eq!(policy, expected);
+        }
+    }
+
+    #[test]
+    fn observe_timeout_edit_preserves_timeout_outcome_body() {
+        let current = ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Finite(100),
+            timeout_outcome: TimeoutOutcome::RunBody {
+                body: vec![Block {
+                    id: "fallback".into(),
+                    enabled: true,
+                    kind: BlockKind::Comment {
+                        text: "keep".into(),
+                    },
+                }],
+            },
+        };
+        let edited = observe_mode_with_timeout(&current, Limit::Unlimited).unwrap();
+        assert!(matches!(
+            edited,
+            ObserveMode::WaitForTrue {
+                timeout_ms: Limit::Unlimited,
+                timeout_outcome: TimeoutOutcome::RunBody { ref body },
+            } if body[0].id == "fallback"
+        ));
     }
 }

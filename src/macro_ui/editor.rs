@@ -640,9 +640,12 @@ fn apply_to_definition(
         EditorCommand::ConvertBlock { path, target } => {
             let block = find_block_in_container_mut(&mut definition.blocks, &path)?
                 .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
+            let before = block.clone();
             let source = block.id.clone();
             convert_block(block, target)?;
-            invalidated.insert(source);
+            if *block != before {
+                invalidated.insert(source);
+            }
         }
         EditorCommand::SetConditionMode { path, mode } => {
             let block = find_block_in_container_mut(&mut definition.blocks, &path)?
@@ -653,12 +656,19 @@ fn apply_to_definition(
                 | BlockKind::RepeatUntil { condition, .. } => condition,
                 _ => return Err(EditorError::IncompatibleConversion),
             };
-            match condition {
+            let changed = match condition {
                 Condition::Text { mode: current, .. } | Condition::Image { mode: current, .. } => {
-                    *current = mode
+                    if *current == mode {
+                        false
+                    } else {
+                        *current = mode;
+                        true
+                    }
                 }
+            };
+            if changed {
+                invalidated.insert(path.block_id);
             }
-            invalidated.insert(path.block_id);
         }
         EditorCommand::SetWaitDuration { path, duration_ms } => {
             let block = find_block_in_container_mut(&mut definition.blocks, &path)?
@@ -1336,6 +1346,18 @@ fn rewrite_ids(block: &mut Block, map: &HashMap<String, String>) {
         }
         _ => {}
     }
+    match &mut block.kind {
+        BlockKind::Observe { condition }
+        | BlockKind::If { condition, .. }
+        | BlockKind::RepeatUntil { condition, .. } => {
+            if let Some(body) = condition_timeout_body_mut(condition) {
+                for child in body {
+                    rewrite_ids(child, map);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 fn rewrite_kind_sources(kind: &mut BlockKind, map: &HashMap<String, String>) {
     match kind {
@@ -1556,12 +1578,17 @@ pub fn container_len(definition: &MacroDefinition, container: &ContainerPath) ->
 pub fn locate_watch_lane(
     definition: &MacroDefinition,
     lane_id: &str,
-) -> Option<(String, usize, usize)> {
-    fn scan(blocks: &[Block], lane_id: &str) -> Option<(String, usize, usize)> {
+) -> Option<(String, usize, usize, bool)> {
+    fn scan(blocks: &[Block], lane_id: &str) -> Option<(String, usize, usize, bool)> {
         for block in blocks {
             if let BlockKind::WatchGroup { group } = &block.kind {
                 if let Some(index) = group.lanes.iter().position(|lane| lane.id == lane_id) {
-                    return Some((block.id.clone(), index, group.lanes.len()));
+                    return Some((
+                        block.id.clone(),
+                        index,
+                        group.lanes.len(),
+                        group.lanes[index].enabled,
+                    ));
                 }
             }
             for child in child_containers(block) {
@@ -2309,6 +2336,189 @@ mod tests {
             .unwrap();
         }
         assert_eq!(draft.undo_len(), EDITOR_UNDO_LIMIT);
+    }
+
+    #[test]
+    fn duplication_remaps_timeout_descendants_and_internal_references() {
+        let timeout_source = Block {
+            id: "timeout-source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "timeout-source".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        };
+        let owner = Block {
+            id: "owner".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "owner".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::WaitForTrue {
+                        timeout_ms: Limit::Finite(100),
+                        timeout_outcome: TimeoutOutcome::RunBody {
+                            body: vec![
+                                timeout_source,
+                                Block {
+                                    id: "timeout-click".into(),
+                                    enabled: true,
+                                    kind: BlockKind::Action {
+                                        action: Action::ClickTextMatch {
+                                            source_block_id: "timeout-source".into(),
+                                            button: MouseButton::Left,
+                                        },
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                },
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![owner]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::DuplicateBlock {
+                source: path("owner"),
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+            },
+        )
+        .unwrap();
+
+        let duplicate = &draft.blocks[1];
+        let BlockKind::Observe { condition } = &duplicate.kind else {
+            panic!()
+        };
+        let body = condition_timeout_body(condition).unwrap();
+        assert_eq!(duplicate.id, "owner-copy");
+        assert_eq!(body[0].id, "timeout-source-copy");
+        assert_eq!(body[1].id, "timeout-click-copy");
+        assert!(matches!(
+            body[1].kind,
+            BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    ref source_block_id,
+                    ..
+                }
+            } if source_block_id == "timeout-source-copy"
+        ));
+    }
+
+    #[test]
+    fn timeout_body_children_are_structural_insertion_reorder_and_move_targets() {
+        let owner = Block {
+            id: "owner".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "owner".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::WaitForTrue {
+                        timeout_ms: Limit::Finite(100),
+                        timeout_outcome: TimeoutOutcome::RunBody {
+                            body: vec![comment("first")],
+                        },
+                    },
+                },
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![owner]));
+        let first = locate_block_path(&draft, "first").unwrap();
+        assert_eq!(
+            first.container,
+            ContainerPath::TimeoutBody {
+                owner_id: "owner".into()
+            }
+        );
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: first.container.clone(),
+                    index: 1,
+                },
+                block: comment("second"),
+            },
+        )
+        .unwrap();
+        let second = locate_block_path(&draft, "second").unwrap();
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::ReorderSibling {
+                path: second,
+                to_index: 0,
+            },
+        )
+        .unwrap();
+        let first = locate_block_path(&draft, "first").unwrap();
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::MoveBlock {
+                source: first,
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(draft.blocks[1].id, "first");
+        let timeout = container_len(
+            &draft,
+            &ContainerPath::TimeoutBody {
+                owner_id: "owner".into(),
+            },
+        );
+        assert_eq!(timeout, Some(1));
+    }
+
+    #[test]
+    fn identical_conversion_and_condition_mode_are_true_no_ops() {
+        let observe = Block {
+            id: "observe".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "observe".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![observe]));
+        let revision = draft.revision;
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::ConvertBlock {
+                    path: path("observe"),
+                    target: ConversionTarget::TextObservation {
+                        mode: ObserveMode::CheckNow,
+                    },
+                },
+            ),
+            Ok(EditOutcome::NoChange)
+        );
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::SetConditionMode {
+                    path: path("observe"),
+                    mode: ObserveMode::CheckNow,
+                },
+            ),
+            Ok(EditOutcome::NoChange)
+        );
+        assert_eq!(draft.revision, revision);
+        assert_eq!(draft.undo_len(), 0);
+        assert!(draft.invalidated_source_ids().is_empty());
     }
 
     #[test]

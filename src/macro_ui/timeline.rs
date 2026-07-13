@@ -40,18 +40,24 @@ fn append_blocks(blocks: &[Block], depth: usize, rows: &mut Vec<TimelineRow>) {
             BlockKind::If {
                 then_body,
                 else_body,
-                ..
+                condition,
             } => {
                 append_container(&format!("{}-then", block.id), depth + 1, "THEN", rows);
                 append_blocks(then_body, depth + 2, rows);
                 append_container(&format!("{}-else", block.id), depth + 1, "ELSE", rows);
                 append_blocks(else_body, depth + 2, rows);
+                append_condition_timeout(condition, block, depth, rows);
             }
-            BlockKind::RepeatN { body, .. }
-            | BlockKind::RepeatUntil { body, .. }
-            | BlockKind::Continuous { body } => {
+            BlockKind::RepeatN { body, .. } | BlockKind::Continuous { body } => {
                 append_blocks(body, depth + 1, rows);
                 append_loop_marker(block, depth + 1, rows);
+            }
+            BlockKind::RepeatUntil {
+                condition, body, ..
+            } => {
+                append_blocks(body, depth + 1, rows);
+                append_loop_marker(block, depth + 1, rows);
+                append_condition_timeout(condition, block, depth, rows);
             }
             BlockKind::WatchGroup { group } => {
                 for (index, lane) in group.lanes.iter().enumerate() {
@@ -69,7 +75,7 @@ fn append_blocks(blocks: &[Block], depth: usize, rows: &mut Vec<TimelineRow>) {
                     append_blocks(&lane.then_body, depth + 3, rows);
                 }
                 if let TimeoutOutcome::RunBody { body } = &group.timeout_outcome {
-                    append_container(
+                    append_timeout_container(
                         &format!("{}-timeout", block.id),
                         depth + 1,
                         "ON TIMEOUT",
@@ -78,13 +84,62 @@ fn append_blocks(blocks: &[Block], depth: usize, rows: &mut Vec<TimelineRow>) {
                     append_blocks(body, depth + 2, rows);
                 }
             }
-            BlockKind::Observe { .. }
-            | BlockKind::Action { .. }
+            BlockKind::Observe { condition } => {
+                append_condition_timeout(condition, block, depth, rows);
+            }
+            BlockKind::Action { .. }
             | BlockKind::Wait { .. }
             | BlockKind::StopSuccess
             | BlockKind::StopError { .. }
             | BlockKind::Comment { .. } => {}
         }
+    }
+}
+
+fn append_condition_timeout(
+    condition: &Condition,
+    owner: &Block,
+    depth: usize,
+    rows: &mut Vec<TimelineRow>,
+) {
+    if let Some(body) = condition_timeout_body(condition) {
+        append_timeout_container(
+            &format!("{}-timeout", owner.id),
+            depth + 1,
+            "ON TIMEOUT",
+            rows,
+        );
+        append_blocks(body, depth + 2, rows);
+    }
+}
+
+fn append_timeout_container(id: &str, depth: usize, label: &str, rows: &mut Vec<TimelineRow>) {
+    rows.push(TimelineRow {
+        id: id.to_string(),
+        depth,
+        label: label.to_string(),
+        summary: "Owned timeout branch".to_string(),
+        lane_priority: None,
+        enabled: true,
+        is_loop_marker: false,
+        is_selectable: true,
+    });
+}
+
+fn condition_timeout_body(condition: &Condition) -> Option<&[Block]> {
+    let mode = match condition {
+        Condition::Text { mode, .. } | Condition::Image { mode, .. } => mode,
+    };
+    match mode {
+        ObserveMode::WaitForTrue {
+            timeout_outcome: TimeoutOutcome::RunBody { body },
+            ..
+        }
+        | ObserveMode::WaitForFalse {
+            timeout_outcome: TimeoutOutcome::RunBody { body },
+            ..
+        } => Some(body),
+        _ => None,
     }
 }
 
@@ -128,7 +183,7 @@ fn block_summary(kind: &BlockKind) -> (String, String) {
         } => (
             "REPEAT UNTIL".into(),
             format!(
-                "{} · {} iterations",
+                "{} | {} iterations",
                 condition_summary(condition),
                 format_limit(max_iterations)
             ),
@@ -137,7 +192,7 @@ fn block_summary(kind: &BlockKind) -> (String, String) {
         BlockKind::WatchGroup { group } => (
             "WATCH GROUP".into(),
             format!(
-                "{} lanes · {} timeout",
+                "{} lanes | {} timeout",
                 group.lanes.len(),
                 format_limit(&group.timeout_ms)
             ),
@@ -151,18 +206,18 @@ fn block_summary(kind: &BlockKind) -> (String, String) {
 fn condition_summary(condition: &Condition) -> String {
     match condition {
         Condition::Text { rule_id, mode, .. } => {
-            format!("{} text · {rule_id}", observe_verb(mode))
+            format!("{} text | {rule_id}", observe_verb(mode))
         }
         Condition::Image { rule_id, mode, .. } => {
-            format!("{} image · {rule_id}", observe_verb(mode))
+            format!("{} image | {rule_id}", observe_verb(mode))
         }
     }
 }
 
 fn passive_condition_summary(condition: &PassiveCondition) -> String {
     match condition {
-        PassiveCondition::Text { rule_id, .. } => format!("Watch text · {rule_id}"),
-        PassiveCondition::Image { rule_id, .. } => format!("Watch image · {rule_id}"),
+        PassiveCondition::Text { rule_id, .. } => format!("Watch text | {rule_id}"),
+        PassiveCondition::Image { rule_id, .. } => format!("Watch image | {rule_id}"),
     }
 }
 
@@ -178,9 +233,9 @@ fn action_summary(action: &Action) -> String {
     match action {
         Action::ClickTextMatch { button, .. } => format!("{button:?}-click text match"),
         Action::ClickImageMatch { button, .. } => format!("{button:?}-click image match"),
-        Action::ClickPoint { point_id, button } => format!("{button:?}-click point · {point_id}"),
+        Action::ClickPoint { point_id, button } => format!("{button:?}-click point | {point_id}"),
         Action::ClickRegion { region_id, button } => {
-            format!("{button:?}-click region · {region_id}")
+            format!("{button:?}-click region | {region_id}")
         }
         Action::MoveOnly { .. } => "Move pointer without clicking".into(),
     }
@@ -286,7 +341,8 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use crate::engine::macro_engine::{
-        Block, BlockKind, Limit, PassiveCondition, TimeoutOutcome, WatchGroup, WatchLane,
+        Block, BlockKind, Condition, Limit, ObserveMode, PassiveCondition, TimeoutOutcome,
+        WatchGroup, WatchLane,
     };
 
     use super::*;
@@ -353,5 +409,65 @@ mod tests {
         assert_eq!(marker.summary, "Return to loop start");
         assert!(marker.is_loop_marker);
         assert!(!marker.is_selectable);
+    }
+
+    #[test]
+    fn condition_timeout_bodies_project_as_owned_selectable_rows() {
+        let condition = |owner: &str, child: &str| Condition::Text {
+            source_block_id: owner.into(),
+            rule_id: "rule".into(),
+            mode: ObserveMode::WaitForTrue {
+                timeout_ms: Limit::Finite(100),
+                timeout_outcome: TimeoutOutcome::RunBody {
+                    body: vec![Block {
+                        id: child.into(),
+                        enabled: true,
+                        kind: BlockKind::Comment {
+                            text: "fallback".into(),
+                        },
+                    }],
+                },
+            },
+        };
+        let rows = project_timeline(&[
+            Block {
+                id: "observe".into(),
+                enabled: true,
+                kind: BlockKind::Observe {
+                    condition: condition("observe", "observe-timeout-child"),
+                },
+            },
+            Block {
+                id: "if".into(),
+                enabled: true,
+                kind: BlockKind::If {
+                    condition: condition("observe", "if-timeout-child"),
+                    then_body: vec![],
+                    else_body: vec![],
+                },
+            },
+            Block {
+                id: "repeat".into(),
+                enabled: true,
+                kind: BlockKind::RepeatUntil {
+                    condition: condition("observe", "repeat-timeout-child"),
+                    max_iterations: Limit::Finite(2),
+                    body: vec![],
+                },
+            },
+        ]);
+
+        for (marker, child) in [
+            ("observe-timeout", "observe-timeout-child"),
+            ("if-timeout", "if-timeout-child"),
+            ("repeat-timeout", "repeat-timeout-child"),
+        ] {
+            let marker = rows.iter().find(|row| row.id == marker).unwrap();
+            assert_eq!(marker.label, "ON TIMEOUT");
+            assert!(marker.is_selectable);
+            let child = rows.iter().find(|row| row.id == child).unwrap();
+            assert!(child.is_selectable);
+            assert!(child.depth > marker.depth);
+        }
     }
 }

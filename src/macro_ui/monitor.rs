@@ -1108,11 +1108,13 @@ mod tests {
         let before_first_new_yield = vec![
             started(1, "run", "alpha", 7, "hash"),
             yielded(2, "run", "sibling", 7),
-            yielded(3, "run", "outer", 1),
-            yielded(4, "run", "inner", 2),
-            entered(5, "run", "outer"),
-            entered(6, "run", "inner"),
-            entered(7, "run", "inner-body"),
+            entered(3, "run", "outer"),
+            entered(4, "run", "inner"),
+            entered(5, "run", "inner-body"),
+            yielded(6, "run", "inner", 2),
+            yielded(7, "run", "outer", 1),
+            entered(8, "run", "inner"),
+            entered(9, "run", "inner-body"),
         ];
 
         let before = project_monitor(Some("alpha"), Some(&snapshot), &before_first_new_yield);
@@ -1120,16 +1122,17 @@ mod tests {
         assert_eq!(before.active_loop.as_deref(), Some("inner"));
         assert_eq!(before.loop_iterations, None);
         assert_eq!(before.loop_iterations_by_id.get("inner"), None);
-        assert_eq!(before.loop_iterations_by_id.get("outer"), None);
+        assert_eq!(before.loop_iterations_by_id.get("outer"), Some(&1));
         assert_eq!(before.loop_iterations_by_id.get("sibling"), Some(&7));
 
         let mut after_first_new_yield = before_first_new_yield;
-        after_first_new_yield.push(yielded(8, "run", "inner", 1));
+        after_first_new_yield.push(yielded(10, "run", "inner", 1));
         let after = project_monitor(Some("alpha"), Some(&snapshot), &after_first_new_yield);
 
         assert_eq!(after.active_loop.as_deref(), Some("inner"));
         assert_eq!(after.loop_iterations, Some(1));
         assert_eq!(after.loop_iterations_by_id.get("inner"), Some(&1));
+        assert_eq!(after.loop_iterations_by_id.get("outer"), Some(&1));
         assert_eq!(after.loop_iterations_by_id.get("sibling"), Some(&7));
     }
 }

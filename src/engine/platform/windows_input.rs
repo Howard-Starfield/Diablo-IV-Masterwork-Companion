@@ -1,150 +1,68 @@
-use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
-    time::Duration,
-};
+use std::{sync::Arc, thread, time::Duration};
 
 use anyhow::{Result, anyhow};
 use windows::Win32::{
-    Foundation::POINT,
+    Foundation::{GetLastError, POINT, SetLastError, WIN32_ERROR},
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
-            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEINPUT, SendInput,
-            VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+            INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+            MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
         },
-        WindowsAndMessaging::{GetCursorPos, SetCursorPos},
+        WindowsAndMessaging::{
+            GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        },
     },
 };
 
+use super::windows_mouse_hook::{
+    ManualMouseActivityObserver, MouseEventSource, RUNTIME_INPUT_MARKER,
+    WindowsMouseHookEventSource,
+};
 use crate::engine::{
     automation::{InputSink, MouseButton, StopSource},
     config::MouseMovementProfile,
-    macro_engine::{InputDispatchOutcome, LiveActionInput, MovementOutcome},
+    macro_engine::{
+        BlockReason, InputDispatchOutcome, LiveActionInput, MovementOutcome, SendInputFailure,
+    },
     types::Point,
 };
 
-const RUNTIME_INPUT_MARKER: usize = 0x4D_41_43_52_4F; // "MACRO"
 const DEFAULT_MANUAL_MOVEMENT_THRESHOLD_PX: i32 = 4;
 
-trait InputProbe: Send + Sync {
-    fn cursor_position(&self) -> Result<Point>;
-    fn any_mouse_button_down(&self) -> bool;
-}
-
-#[derive(Debug, Default)]
-struct WindowsInputProbe;
-
-impl InputProbe for WindowsInputProbe {
-    fn cursor_position(&self) -> Result<Point> {
-        let mut point = POINT::default();
-        unsafe { GetCursorPos(&mut point) }?;
-        Ok(Point::new(point.x, point.y))
-    }
-
-    fn any_mouse_button_down(&self) -> bool {
-        let mut observed = false;
-        for button in [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2] {
-            // Check both the high "currently down" bit and the low "pressed since last query"
-            // bit so a short physical click between polling samples is still takeover.
-            observed |= unsafe { GetAsyncKeyState(button.0 as i32) } != 0;
-        }
-        observed
-    }
-}
-
-/// Polling manual-takeover detector shared by one run-owned macro input sink.
+/// Sequenced low-level-hook takeover detector shared by one run-owned macro input sink.
 pub struct ManualInputMonitor {
-    probe: Arc<dyn InputProbe>,
-    baseline: Mutex<Point>,
-    runtime_owned: AtomicBool,
-    movement_threshold_px: i32,
+    observer: ManualMouseActivityObserver,
 }
 
 impl std::fmt::Debug for ManualInputMonitor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ManualInputMonitor")
-            .field("runtime_owned", &self.runtime_owned.load(Ordering::Acquire))
-            .field("movement_threshold_px", &self.movement_threshold_px)
             .finish_non_exhaustive()
     }
 }
 
 impl ManualInputMonitor {
     pub fn new() -> Result<Self> {
-        Self::with_probe(
-            Arc::new(WindowsInputProbe),
-            DEFAULT_MANUAL_MOVEMENT_THRESHOLD_PX,
-        )
+        let source = Arc::new(WindowsMouseHookEventSource::install()?);
+        Ok(Self::with_event_source(source))
     }
 
-    fn with_probe(probe: Arc<dyn InputProbe>, movement_threshold_px: i32) -> Result<Self> {
-        anyhow::ensure!(
-            movement_threshold_px > 0,
-            "manual movement threshold must be positive"
-        );
-        let baseline = probe.cursor_position()?;
-        Ok(Self {
-            probe,
-            baseline: Mutex::new(baseline),
-            runtime_owned: AtomicBool::new(false),
-            movement_threshold_px,
-        })
+    pub fn with_event_source(source: Arc<dyn MouseEventSource>) -> Self {
+        Self {
+            observer: ManualMouseActivityObserver::new(source),
+        }
     }
 
     pub fn manual_takeover_detected(&self) -> Result<bool> {
-        if self.runtime_owned.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        self.takeover_from(
-            *self
-                .baseline
-                .lock()
-                .expect("manual input baseline poisoned"),
-        )
+        Ok(self.observer.takeover_detected())
     }
 
     pub fn reset_baseline(&self) -> Result<()> {
-        let current = self.probe.cursor_position()?;
-        self.record_runtime_position(current);
+        self.observer.reset_baseline();
         Ok(())
-    }
-
-    fn takeover_from(&self, expected_cursor: Point) -> Result<bool> {
-        if self.probe.any_mouse_button_down() {
-            return Ok(true);
-        }
-        let current = self.probe.cursor_position()?;
-        let dx = i64::from(current.x) - i64::from(expected_cursor.x);
-        let dy = i64::from(current.y) - i64::from(expected_cursor.y);
-        let threshold = i64::from(self.movement_threshold_px);
-        Ok(dx * dx + dy * dy >= threshold * threshold)
-    }
-
-    fn begin_runtime_input(&self) -> RuntimeInputOwnership<'_> {
-        self.runtime_owned.store(true, Ordering::Release);
-        RuntimeInputOwnership { monitor: self }
-    }
-
-    fn record_runtime_position(&self, point: Point) {
-        *self
-            .baseline
-            .lock()
-            .expect("manual input baseline poisoned") = point;
-    }
-}
-
-struct RuntimeInputOwnership<'a> {
-    monitor: &'a ManualInputMonitor,
-}
-
-impl Drop for RuntimeInputOwnership<'_> {
-    fn drop(&mut self) {
-        self.monitor.runtime_owned.store(false, Ordering::Release);
     }
 }
 
@@ -174,9 +92,7 @@ impl WindowsInputSink {
         movement: Option<&MouseMovementProfile>,
         stop: &dyn StopSource,
     ) -> Result<MovementOutcome> {
-        let start = self.monitor.probe.cursor_position()?;
-        let _ownership = self.monitor.begin_runtime_input();
-        self.monitor.record_runtime_position(start);
+        let start = cursor_position()?;
         let duration_ms = movement
             .filter(|profile| profile.is_usable())
             .map_or(0, |profile| profile.duration_ms.clamp(1, 2_000));
@@ -185,12 +101,11 @@ impl WindowsInputSink {
         } else {
             (duration_ms / 8).clamp(2, 90)
         };
-        let mut previous = start;
         for segment in 1..=segments {
             if stop.is_stopped() {
                 return Ok(MovementOutcome::Cancelled);
             }
-            if self.monitor.takeover_from(previous)? {
+            if self.monitor.manual_takeover_detected()? {
                 return Ok(MovementOutcome::ManualTakeover);
             }
             let progress = segment as f64 / segments as f64;
@@ -200,9 +115,7 @@ impl WindowsInputSink {
                 (f64::from(start.x) + dx as f64 * progress).round() as i32,
                 (f64::from(start.y) + dy as f64 * progress).round() as i32,
             );
-            unsafe { SetCursorPos(next.x, next.y) }?;
-            self.monitor.record_runtime_position(next);
-            previous = next;
+            send_marked_move(next).map_err(|failure| anyhow!(failure.to_string()))?;
             if duration_ms > 0 && segment < segments {
                 thread::sleep(Duration::from_millis((duration_ms / segments).max(1)));
             }
@@ -215,12 +128,12 @@ impl WindowsInputSink {
         point: Point,
         button: MouseButton,
         stop: &dyn StopSource,
+        commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
     ) -> InputDispatchOutcome {
-        let _ownership = self.monitor.begin_runtime_input();
         if stop.is_stopped() {
             return InputDispatchOutcome::BlockedStopped;
         }
-        match self.monitor.takeover_from(point) {
+        match self.monitor.manual_takeover_detected() {
             Ok(true) => return InputDispatchOutcome::BlockedManualTakeover,
             Ok(false) => {}
             Err(error) => {
@@ -232,25 +145,39 @@ impl WindowsInputSink {
         if stop.is_stopped() {
             return InputDispatchOutcome::BlockedStopped;
         }
+        let current = match cursor_position() {
+            Ok(current) => current,
+            Err(error) => {
+                return InputDispatchOutcome::BlockedInputFailure {
+                    message: error.to_string(),
+                };
+            }
+        };
+        if point_distance_squared(current, point)
+            >= i64::from(DEFAULT_MANUAL_MOVEMENT_THRESHOLD_PX).pow(2)
+        {
+            return InputDispatchOutcome::BlockedManualTakeover;
+        }
+        if let Err(reason) = commit() {
+            return InputDispatchOutcome::BlockedCommit { reason };
+        }
         let (down, up) = match button {
             MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
             MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
         };
         let inputs = [marked_mouse_input(down), marked_mouse_input(up)];
-        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-        if sent != inputs.len() as u32 {
-            return InputDispatchOutcome::UncertainDispatch {
-                message: format!("SendInput sent {sent}/{} mouse events", inputs.len()),
-            };
+        match dispatch_inputs(&WindowsSendInputApi, &inputs) {
+            Ok(()) => InputDispatchOutcome::Dispatched,
+            Err(failure) => InputDispatchOutcome::UncertainDispatch { failure },
         }
-        // Consume button transition bits while runtime ownership is marked so our own injected
-        // click cannot be mistaken for a physical takeover on the next prepared action.
-        let _ = self.monitor.probe.any_mouse_button_down();
-        InputDispatchOutcome::Dispatched
     }
 }
 
 impl LiveActionInput for WindowsInputSink {
+    fn reset_manual_baseline(&self) -> Result<()> {
+        WindowsInputSink::reset_manual_baseline(self)
+    }
+
     fn manual_takeover_detected(&self) -> Result<bool> {
         self.monitor.manual_takeover_detected()
     }
@@ -269,8 +196,9 @@ impl LiveActionInput for WindowsInputSink {
         point: Point,
         button: MouseButton,
         stop: &dyn StopSource,
+        commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
     ) -> InputDispatchOutcome {
-        self.send_click(point, button, stop)
+        self.send_click(point, button, stop, commit)
     }
 }
 
@@ -295,20 +223,112 @@ impl InputSink for WindowsInputSink {
             MovementOutcome::Reached
         ) && !stop.is_stopped()
         {
-            match self.send_click(point, button, stop) {
+            let mut commit = || Ok(());
+            match self.send_click(point, button, stop, &mut commit) {
                 InputDispatchOutcome::Dispatched => {}
                 InputDispatchOutcome::BlockedStopped => return Ok(()),
                 InputDispatchOutcome::BlockedManualTakeover => {
                     return Err(anyhow!("manual mouse takeover blocked input"));
                 }
-                InputDispatchOutcome::BlockedInputFailure { message }
-                | InputDispatchOutcome::UncertainDispatch { message } => {
+                InputDispatchOutcome::BlockedInputFailure { message } => {
                     return Err(anyhow!(message));
+                }
+                InputDispatchOutcome::BlockedCommit { reason } => {
+                    return Err(anyhow!("input commit was blocked: {reason:?}"));
+                }
+                InputDispatchOutcome::UncertainDispatch { failure } => {
+                    return Err(anyhow!(failure.to_string()));
                 }
             }
         }
         Ok(())
     }
+}
+
+fn cursor_position() -> Result<Point> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point) }?;
+    Ok(Point::new(point.x, point.y))
+}
+
+fn point_distance_squared(left: Point, right: Point) -> i64 {
+    let dx = i64::from(left.x) - i64::from(right.x);
+    let dy = i64::from(left.y) - i64::from(right.y);
+    dx * dx + dy * dy
+}
+
+trait SendInputApi {
+    fn send(&self, inputs: &[INPUT]) -> (u32, u32);
+}
+
+struct WindowsSendInputApi;
+
+impl SendInputApi for WindowsSendInputApi {
+    fn send(&self, inputs: &[INPUT]) -> (u32, u32) {
+        unsafe {
+            SetLastError(WIN32_ERROR(0));
+            let inserted = SendInput(inputs, std::mem::size_of::<INPUT>() as i32);
+            let error_code = GetLastError().0;
+            (inserted, error_code)
+        }
+    }
+}
+
+fn dispatch_inputs(
+    api: &dyn SendInputApi,
+    inputs: &[INPUT],
+) -> std::result::Result<(), SendInputFailure> {
+    let expected = u32::try_from(inputs.len()).unwrap_or(u32::MAX);
+    let (inserted, error_code) = api.send(inputs);
+    if inserted == expected {
+        Ok(())
+    } else if inserted == 0 {
+        Err(SendInputFailure::ZeroInsertion {
+            expected,
+            error_code,
+        })
+    } else {
+        Err(SendInputFailure::PartialInsertion {
+            inserted,
+            expected,
+            error_code,
+        })
+    }
+}
+
+fn send_marked_move(point: Point) -> std::result::Result<(), SendInputFailure> {
+    let x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    if width <= 1 || height <= 1 {
+        return Err(SendInputFailure::ZeroInsertion {
+            expected: 1,
+            error_code: 0,
+        });
+    }
+    let normalized_x = ((i64::from(point.x) - i64::from(x)) * 65_535)
+        .checked_div(i64::from(width - 1))
+        .and_then(|value| i32::try_from(value.clamp(0, 65_535)).ok())
+        .unwrap_or(0);
+    let normalized_y = ((i64::from(point.y) - i64::from(y)) * 65_535)
+        .checked_div(i64::from(height - 1))
+        .and_then(|value| i32::try_from(value.clamp(0, 65_535)).ok())
+        .unwrap_or(0);
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: normalized_x,
+                dy: normalized_y,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: RUNTIME_INPUT_MARKER,
+            },
+        },
+    };
+    dispatch_inputs(&WindowsSendInputApi, &[input])
 }
 
 fn marked_mouse_input(
@@ -333,19 +353,20 @@ fn marked_mouse_input(
 mod tests {
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
     use anyhow::{Result, bail};
 
-    use super::{InputProbe, ManualInputMonitor};
+    use super::{SendInputApi, dispatch_inputs};
 
     use crate::engine::{
         automation::{Clock, MouseButton, StopSource, TargetGuard, TargetSnapshot},
         macro_engine::{
-            ActionCommitter, ActionOutcome, ActionPrepareRequest, ActionState, BlockReason,
-            CommitContext, InputDispatchOutcome, LiveActionInput, MovementOutcome,
-            ObservationToken, TakeoverPolicy,
+            ActionAttemptId, ActionAuthorization, ActionCommitter, ActionOutcome,
+            ActionPrepareRequest, ActionState, BlockReason, CommitContext, InputDispatchOutcome,
+            Limit, LiveActionInput, LiveActionSession, LiveControlSink, MovementOutcome,
+            ObservationToken, ResumeAuthorization, SendInputFailure, TakeoverPolicy,
         },
         types::{Point, Rect},
     };
@@ -389,6 +410,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingInput {
         calls: Mutex<Vec<&'static str>>,
+        baseline_resets: AtomicU64,
         takeover: AtomicBool,
         fail_dispatch: AtomicBool,
         stop_during_dispatch: Mutex<Option<Arc<Stop>>>,
@@ -396,6 +418,11 @@ mod tests {
     }
 
     impl LiveActionInput for RecordingInput {
+        fn reset_manual_baseline(&self) -> Result<()> {
+            self.baseline_resets.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
         fn manual_takeover_detected(&self) -> Result<bool> {
             Ok(self.takeover.load(Ordering::Acquire))
         }
@@ -424,14 +451,21 @@ mod tests {
             _point: Point,
             _button: MouseButton,
             _stop: &dyn StopSource,
+            commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
         ) -> InputDispatchOutcome {
+            if let Err(reason) = commit() {
+                return InputDispatchOutcome::BlockedCommit { reason };
+            }
             self.calls.lock().unwrap().push("dispatch");
             if let Some(stop) = self.stop_during_dispatch.lock().unwrap().as_ref() {
                 stop.0.store(true, Ordering::Release);
             }
             if self.fail_dispatch.load(Ordering::Acquire) {
                 return InputDispatchOutcome::UncertainDispatch {
-                    message: "uncertain send".to_string(),
+                    failure: SendInputFailure::ZeroInsertion {
+                        expected: 2,
+                        error_code: 5,
+                    },
                 };
             }
             InputDispatchOutcome::Dispatched
@@ -468,7 +502,7 @@ mod tests {
             rule_revision: 1,
             frame_id: 8,
             captured_at_ms: 10,
-            match_rect: Some(Rect::new(120, 120, 20, 20)),
+            match_rect: Some(Rect::new(20, 20, 20, 20)),
             score: Some(0.99),
             match_count: 1,
             stable_frames: 2,
@@ -477,6 +511,8 @@ mod tests {
                 captured_at_ms: 10,
                 window_id: 91,
                 window_revision: 1,
+                client_x: 100,
+                client_y: 100,
                 client_width: 800,
                 client_height: 600,
                 geometry_revision: 2,
@@ -490,27 +526,62 @@ mod tests {
     }
 
     fn request() -> ActionPrepareRequest {
-        ActionPrepareRequest {
-            block_id: "click".to_string(),
-            expected_target: target(),
-            destination: Point::new(130, 130),
-            button: MouseButton::Left,
-            observation: Some(token()),
-            observation_target: Some(target()),
-            movement: None,
-            run_id: "run-1".to_string(),
-            generation: 4,
-            maximum_observation_age_ms: 1_000,
-            minimum_click_interval_ms: 50,
-            takeover_policy: TakeoverPolicy::Pause,
+        static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let authorization = ActionAuthorization::for_test(
+            ActionAttemptId::for_test("run-1", NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)),
+            target(),
+            Point::new(130, 130),
+            MouseButton::Left,
+            Some(token()),
+            4,
+            1_000,
+        );
+        ActionPrepareRequest::new(
+            authorization,
+            None,
+            50,
+            TakeoverPolicy::Pause,
+            ResumeAuthorization::for_test(target()),
+        )
+    }
+
+    #[derive(Default)]
+    struct RecordingControl {
+        paused: AtomicBool,
+        stopped: AtomicBool,
+    }
+
+    impl LiveControlSink for RecordingControl {
+        fn pause_for_manual_takeover(&self) {
+            self.paused.store(true, Ordering::Release);
+        }
+        fn stop_for_manual_takeover(&self) {
+            self.stopped.store(true, Ordering::Release);
         }
     }
 
     fn committer(targets: Vec<TargetSnapshot>, input: Arc<RecordingInput>) -> ActionCommitter {
-        ActionCommitter::new(
+        committer_with_limits(targets, input, Limit::Finite(100), 128)
+    }
+
+    fn committer_with_limits(
+        targets: Vec<TargetSnapshot>,
+        input: Arc<RecordingInput>,
+        maximum_clicks: Limit<u64>,
+        maximum_attempts: usize,
+    ) -> ActionCommitter {
+        let session = LiveActionSession::new(
             Arc::new(ScriptedTarget(Mutex::new(targets))),
             input,
+            Arc::new(RecordingControl::default()),
+        );
+        session.activate_for_test(target());
+        ActionCommitter::new(
+            session,
             Arc::new(FixedClock(100)),
+            "run-1",
+            maximum_clicks,
+            maximum_attempts,
         )
     }
 
@@ -606,7 +677,7 @@ mod tests {
         ));
 
         let mut outside = request();
-        outside.destination = Point::new(900, 130);
+        outside.set_destination_for_test(Point::new(900, 130));
         let prepared = committer.prepare(outside).unwrap();
         assert!(matches!(
             committer.commit(
@@ -627,7 +698,7 @@ mod tests {
         let input = Arc::new(RecordingInput::default());
         let committer = committer(vec![target()], input.clone());
         let mut old = request();
-        old.maximum_observation_age_ms = 50;
+        old.set_maximum_observation_age_for_test(50);
         let prepared = committer.prepare(old).unwrap();
         assert!(matches!(
             committer.commit(
@@ -642,7 +713,7 @@ mod tests {
         ));
 
         let mut outside_match = request();
-        outside_match.destination = Point::new(500, 500);
+        outside_match.set_destination_for_test(Point::new(500, 500));
         let prepared = committer.prepare(outside_match).unwrap();
         assert!(matches!(
             committer.commit(
@@ -659,22 +730,14 @@ mod tests {
     }
 
     #[test]
-    fn observation_time_target_must_match_commit_target() {
+    fn observation_time_target_mismatch_is_rejected_before_prepare() {
         let input = Arc::new(RecordingInput::default());
         let committer = committer(vec![target()], input.clone());
         let mut request = request();
-        request.observation_target.as_mut().unwrap().window_id += 1;
-        let prepared = committer.prepare(request).unwrap();
+        request.alter_observation_target_for_test();
         assert!(matches!(
-            committer.commit(
-                prepared,
-                &Stop::default(),
-                CommitContext::new("run-1", 4, Some(token()))
-            ),
-            ActionOutcome::Blocked {
-                reason: BlockReason::StaleObservation,
-                ..
-            }
+            committer.prepare(request),
+            Err(BlockReason::ResumeRequired)
         ));
         assert!(input.calls.lock().unwrap().is_empty());
     }
@@ -793,10 +856,10 @@ mod tests {
         let input = Arc::new(RecordingInput::default());
         let committer = committer(vec![target()], input);
         let mut invalid = request();
-        invalid.expected_target.is_foreground = false;
+        invalid.set_expected_foreground_for_test(false);
         assert!(matches!(
             committer.prepare(invalid),
-            Err(BlockReason::TargetChanged)
+            Err(BlockReason::ResumeRequired)
         ));
         assert!(committer.prepare(request()).is_ok());
     }
@@ -807,7 +870,7 @@ mod tests {
         *input.movement_outcome.lock().unwrap() = Some(MovementOutcome::ManualTakeover);
         let committer = committer(vec![target()], input.clone());
         let mut stop_request = request();
-        stop_request.takeover_policy = TakeoverPolicy::Stop;
+        stop_request.set_takeover_policy_for_test(TakeoverPolicy::Stop);
         let prepared = committer.prepare(stop_request).unwrap();
 
         let result = committer.commit(
@@ -826,47 +889,322 @@ mod tests {
         assert_eq!(*input.calls.lock().unwrap(), vec!["move"]);
     }
 
-    struct FakeProbe {
-        cursor: Mutex<Point>,
-        button: AtomicBool,
+    #[test]
+    fn committed_attempt_ids_are_permanently_replay_protected() {
+        let input = Arc::new(RecordingInput::default());
+        let successful_committer = committer(vec![target()], input);
+        let mut original = request();
+        original.set_minimum_click_interval_for_test(0);
+        let replay = original.clone();
+        let prepared = successful_committer.prepare(original).unwrap();
+
+        assert!(matches!(
+            successful_committer.commit(
+                prepared,
+                &Stop::default(),
+                CommitContext::new("run-1", 4, Some(token()))
+            ),
+            ActionOutcome::Dispatched { .. }
+        ));
+        assert_eq!(successful_committer.committed_clicks(), 1);
+        assert!(matches!(
+            successful_committer.prepare(replay),
+            Err(BlockReason::AttemptReplay)
+        ));
+
+        let uncertain_input = Arc::new(RecordingInput::default());
+        uncertain_input.fail_dispatch.store(true, Ordering::Release);
+        let uncertain_committer = committer(vec![target()], uncertain_input);
+        let mut original = request();
+        original.set_minimum_click_interval_for_test(0);
+        let replay = original.clone();
+        let prepared = uncertain_committer.prepare(original).unwrap();
+        assert!(matches!(
+            uncertain_committer.commit(
+                prepared,
+                &Stop::default(),
+                CommitContext::new("run-1", 4, Some(token()))
+            ),
+            ActionOutcome::UncertainDispatch { .. }
+        ));
+        assert_eq!(uncertain_committer.committed_clicks(), 1);
+        assert!(matches!(
+            uncertain_committer.prepare(replay),
+            Err(BlockReason::AttemptReplay)
+        ));
     }
 
-    impl Default for FakeProbe {
-        fn default() -> Self {
-            Self {
-                cursor: Mutex::new(Point::new(0, 0)),
-                button: AtomicBool::new(false),
+    #[test]
+    fn click_budget_is_consumed_only_at_commit_boundary() {
+        let input = Arc::new(RecordingInput::default());
+        let committer = committer_with_limits(vec![target()], input.clone(), Limit::Finite(1), 8);
+        let mut first = request();
+        first.set_minimum_click_interval_for_test(0);
+        let prepared = committer.prepare(first).unwrap();
+        assert!(matches!(
+            committer.commit(
+                prepared,
+                &Stop::default(),
+                CommitContext::new("run-1", 4, Some(token()))
+            ),
+            ActionOutcome::Dispatched { .. }
+        ));
+
+        let mut second = request();
+        second.set_minimum_click_interval_for_test(0);
+        let prepared = committer.prepare(second).unwrap();
+        assert!(matches!(
+            committer.commit(
+                prepared,
+                &Stop::default(),
+                CommitContext::new("run-1", 4, Some(token()))
+            ),
+            ActionOutcome::Blocked {
+                reason: BlockReason::ClickBudgetExceeded,
+                ..
             }
-        }
+        ));
+        assert_eq!(committer.committed_clicks(), 1);
+        assert_eq!(
+            input
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| **call == "dispatch")
+                .count(),
+            1
+        );
     }
 
-    impl InputProbe for FakeProbe {
-        fn cursor_position(&self) -> Result<Point> {
-            Ok(*self.cursor.lock().unwrap())
-        }
-        fn any_mouse_button_down(&self) -> bool {
-            self.button.load(Ordering::Acquire)
+    #[test]
+    fn precommit_block_does_not_consume_click_budget() {
+        let input = Arc::new(RecordingInput::default());
+        let committer = committer_with_limits(vec![target()], input, Limit::Finite(1), 8);
+        let original = request();
+        let replay = original.clone();
+        let prepared = committer.prepare(original).unwrap();
+        let stop = Stop::default();
+        stop.0.store(true, Ordering::Release);
+        assert!(matches!(
+            committer.commit(
+                prepared,
+                &stop,
+                CommitContext::new("run-1", 4, Some(token()))
+            ),
+            ActionOutcome::Blocked {
+                reason: BlockReason::Stopped,
+                ..
+            }
+        ));
+        assert_eq!(committer.committed_clicks(), 0);
+        assert!(matches!(
+            committer.prepare(replay),
+            Err(BlockReason::AttemptReplay)
+        ));
+    }
+
+    #[test]
+    fn prepared_actions_cannot_cross_committer_ownership() {
+        let input_a = Arc::new(RecordingInput::default());
+        let committer_a = committer(vec![target()], input_a);
+        let prepared = committer_a.prepare(request()).unwrap();
+        let input_b = Arc::new(RecordingInput::default());
+        let committer_b = committer(vec![target()], input_b.clone());
+
+        assert!(matches!(
+            committer_b.commit(
+                prepared,
+                &Stop::default(),
+                CommitContext::new("run-1", 4, Some(token()))
+            ),
+            ActionOutcome::Blocked {
+                reason: BlockReason::CrossCommitter,
+                ..
+            }
+        ));
+        assert_eq!(committer_a.committed_clicks(), 0);
+        assert_eq!(committer_b.committed_clicks(), 0);
+        assert!(input_b.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn attempt_ledger_is_bounded_and_only_cleared_when_run_finishes() {
+        let input = Arc::new(RecordingInput::default());
+        let committer = committer_with_limits(vec![target()], input, Limit::Unlimited, 1);
+        let mut first = request();
+        first.set_minimum_click_interval_for_test(0);
+        let prepared = committer.prepare(first).unwrap();
+        assert!(matches!(
+            committer.finish_run(),
+            Err(BlockReason::ActionLockBusy)
+        ));
+        assert!(matches!(
+            committer.commit(
+                prepared,
+                &Stop::default(),
+                CommitContext::new("run-1", 4, Some(token()))
+            ),
+            ActionOutcome::Dispatched { .. }
+        ));
+        assert!(matches!(
+            committer.prepare(request()),
+            Err(BlockReason::AttemptLedgerFull)
+        ));
+        committer.finish_run().unwrap();
+        assert!(matches!(
+            committer.prepare(request()),
+            Err(BlockReason::RunFinished)
+        ));
+    }
+
+    #[test]
+    fn resume_revalidates_target_resets_baseline_and_invalidates_old_epoch() {
+        let input = Arc::new(RecordingInput::default());
+        let session = LiveActionSession::new(
+            Arc::new(ScriptedTarget(Mutex::new(vec![
+                target(),
+                target(),
+                target(),
+                target(),
+            ]))),
+            input.clone(),
+            Arc::new(RecordingControl::default()),
+        );
+        let old = session.resume().unwrap();
+        let current = session.resume().unwrap();
+        assert_eq!(input.baseline_resets.load(Ordering::Acquire), 2);
+        let committer = ActionCommitter::new(
+            session,
+            Arc::new(FixedClock(100)),
+            "run-1",
+            Limit::Finite(10),
+            8,
+        );
+        let mut stale = request();
+        stale.set_resume_for_test(old);
+        assert!(matches!(
+            committer.prepare(stale),
+            Err(BlockReason::ResumeRequired)
+        ));
+        let mut fresh = request();
+        fresh.set_resume_for_test(current);
+        assert!(committer.prepare(fresh).is_ok());
+    }
+
+    #[test]
+    fn resume_fails_if_target_changes_during_the_gate() {
+        let input = Arc::new(RecordingInput::default());
+        let mut changed = target();
+        changed.geometry_revision += 1;
+        let session = LiveActionSession::new(
+            Arc::new(ScriptedTarget(Mutex::new(vec![target(), changed]))),
+            input.clone(),
+            Arc::new(RecordingControl::default()),
+        );
+
+        assert!(session.resume().is_err());
+        assert_eq!(input.baseline_resets.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn takeover_applies_pause_policy_and_requires_explicit_resume() {
+        let input = Arc::new(RecordingInput::default());
+        input.takeover.store(true, Ordering::Release);
+        let control = Arc::new(RecordingControl::default());
+        let session = LiveActionSession::new(
+            Arc::new(ScriptedTarget(Mutex::new(vec![target()]))),
+            input,
+            control.clone(),
+        );
+        session.activate_for_test(target());
+        let committer = ActionCommitter::new(
+            session,
+            Arc::new(FixedClock(100)),
+            "run-1",
+            Limit::Finite(10),
+            8,
+        );
+        let prepared = committer.prepare(request()).unwrap();
+        assert!(matches!(
+            committer.commit(
+                prepared,
+                &Stop::default(),
+                CommitContext::new("run-1", 4, Some(token()))
+            ),
+            ActionOutcome::Blocked {
+                reason: BlockReason::ManualTakeover(TakeoverPolicy::Pause),
+                ..
+            }
+        ));
+        assert!(control.paused.load(Ordering::Acquire));
+        assert!(!control.stopped.load(Ordering::Acquire));
+        assert!(matches!(
+            committer.prepare(request()),
+            Err(BlockReason::ResumeRequired)
+        ));
+    }
+
+    struct FakeSendInputApi {
+        inserted: u32,
+        error_code: u32,
+    }
+
+    impl SendInputApi for FakeSendInputApi {
+        fn send(
+            &self,
+            _inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+        ) -> (u32, u32) {
+            (self.inserted, self.error_code)
         }
     }
 
     #[test]
-    fn manual_monitor_detects_physical_motion_and_buttons_but_owns_runtime_motion() {
-        let probe = Arc::new(FakeProbe::default());
-        let monitor = ManualInputMonitor::with_probe(probe.clone(), 4).unwrap();
-        *probe.cursor.lock().unwrap() = Point::new(5, 0);
-        assert!(monitor.manual_takeover_detected().unwrap());
-        monitor.reset_baseline().unwrap();
-        assert!(!monitor.manual_takeover_detected().unwrap());
-
-        probe.button.store(true, Ordering::Release);
-        assert!(monitor.manual_takeover_detected().unwrap());
-        probe.button.store(false, Ordering::Release);
-        {
-            let _owned = monitor.begin_runtime_input();
-            *probe.cursor.lock().unwrap() = Point::new(20, 20);
-            monitor.record_runtime_position(Point::new(20, 20));
-            assert!(!monitor.manual_takeover_detected().unwrap());
-        }
-        assert!(!monitor.manual_takeover_detected().unwrap());
+    fn send_input_adapter_distinguishes_full_zero_and_partial_results() {
+        let inputs = [
+            super::marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN,
+            ),
+            super::marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP,
+            ),
+        ];
+        assert_eq!(
+            dispatch_inputs(
+                &FakeSendInputApi {
+                    inserted: 2,
+                    error_code: 0
+                },
+                &inputs
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            dispatch_inputs(
+                &FakeSendInputApi {
+                    inserted: 0,
+                    error_code: 5
+                },
+                &inputs
+            ),
+            Err(SendInputFailure::ZeroInsertion {
+                expected: 2,
+                error_code: 5
+            })
+        );
+        assert_eq!(
+            dispatch_inputs(
+                &FakeSendInputApi {
+                    inserted: 1,
+                    error_code: 87
+                },
+                &inputs
+            ),
+            Err(SendInputFailure::PartialInsertion {
+                inserted: 1,
+                expected: 2,
+                error_code: 87
+            })
+        );
     }
 }

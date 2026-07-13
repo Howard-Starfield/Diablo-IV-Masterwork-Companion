@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -26,6 +26,8 @@ use super::{
 };
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_LIVE_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_COMMITTER_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_SYNCHRONOUS_EVENT_CAPACITY: usize = 4_096;
 const FINAL_EVENT_RESERVE: usize = 16;
 
@@ -86,12 +88,48 @@ pub enum MovementOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendInputFailure {
+    ZeroInsertion {
+        expected: u32,
+        error_code: u32,
+    },
+    PartialInsertion {
+        inserted: u32,
+        expected: u32,
+        error_code: u32,
+    },
+}
+
+impl std::fmt::Display for SendInputFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroInsertion {
+                expected,
+                error_code,
+            } => write!(
+                formatter,
+                "SendInput inserted 0/{expected} events (Win32 error {error_code})"
+            ),
+            Self::PartialInsertion {
+                inserted,
+                expected,
+                error_code,
+            } => write!(
+                formatter,
+                "SendInput inserted {inserted}/{expected} events (Win32 error {error_code})"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputDispatchOutcome {
     BlockedStopped,
     BlockedManualTakeover,
     BlockedInputFailure { message: String },
+    BlockedCommit { reason: BlockReason },
     Dispatched,
-    UncertainDispatch { message: String },
+    UncertainDispatch { failure: SendInputFailure },
 }
 
 /// Granular live-input boundary used only by `ActionCommitter`.
@@ -99,6 +137,7 @@ pub enum InputDispatchOutcome {
 /// `MacroRuntime` deliberately does not own this trait in v1's observation-only modes, so merely
 /// constructing the runtime cannot inject input.
 pub trait LiveActionInput: Send + Sync {
+    fn reset_manual_baseline(&self) -> Result<()>;
     fn manual_takeover_detected(&self) -> Result<bool>;
     fn move_to(
         &self,
@@ -113,25 +152,134 @@ pub trait LiveActionInput: Send + Sync {
         point: Point,
         button: MouseButton,
         stop: &dyn StopSource,
+        commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
     ) -> InputDispatchOutcome;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActionAttemptId {
+    run_id: String,
+    action_instance_id: u64,
+}
+
+impl ActionAttemptId {
+    #[cfg(test)]
+    pub(crate) fn for_test(run_id: impl Into<String>, action_instance_id: u64) -> Self {
+        Self {
+            run_id: run_id.into(),
+            action_instance_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionAuthorization {
+    attempt_id: ActionAttemptId,
+    block_id: String,
+    action: Action,
+    expected_target: TargetSnapshot,
+    destination: Point,
+    button: MouseButton,
+    observation: Option<ObservationToken>,
+    screen_authorized_rect: Option<crate::engine::types::Rect>,
+    generation: u64,
+    maximum_observation_age_ms: u64,
+}
+
+impl ActionAuthorization {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        attempt_id: ActionAttemptId,
+        expected_target: TargetSnapshot,
+        destination: Point,
+        button: MouseButton,
+        observation: Option<ObservationToken>,
+        generation: u64,
+        maximum_observation_age_ms: u64,
+    ) -> Self {
+        let screen_authorized_rect = observation.as_ref().and_then(|token| {
+            token
+                .match_rect
+                .and_then(|rect| local_rect_to_screen(expected_target.client_rect, rect).ok())
+        });
+        Self {
+            attempt_id,
+            block_id: "click".to_string(),
+            action: Action::ClickImageMatch {
+                source_block_id: "observe".to_string(),
+                button,
+            },
+            expected_target,
+            destination,
+            button,
+            observation,
+            screen_authorized_rect,
+            generation,
+            maximum_observation_age_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ActionPrepareRequest {
-    pub block_id: String,
-    pub expected_target: TargetSnapshot,
-    pub destination: Point,
-    pub button: MouseButton,
-    pub movement: Option<MouseMovementProfile>,
-    pub observation: Option<ObservationToken>,
-    /// Exact target snapshot sampled with the observation. This binds text tokens, which do not
-    /// yet carry image-specific frame metadata, to the same process/window geometry.
-    pub observation_target: Option<TargetSnapshot>,
-    pub run_id: String,
-    pub generation: u64,
-    pub maximum_observation_age_ms: u64,
-    pub minimum_click_interval_ms: u64,
-    pub takeover_policy: TakeoverPolicy,
+    authorization: ActionAuthorization,
+    movement: Option<MouseMovementProfile>,
+    minimum_click_interval_ms: u64,
+    takeover_policy: TakeoverPolicy,
+    resume: ResumeAuthorization,
+}
+
+impl ActionPrepareRequest {
+    pub fn new(
+        authorization: ActionAuthorization,
+        movement: Option<MouseMovementProfile>,
+        minimum_click_interval_ms: u64,
+        takeover_policy: TakeoverPolicy,
+        resume: ResumeAuthorization,
+    ) -> Self {
+        Self {
+            authorization,
+            movement,
+            minimum_click_interval_ms,
+            takeover_policy,
+            resume,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_destination_for_test(&mut self, destination: Point) {
+        self.authorization.destination = destination;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_maximum_observation_age_for_test(&mut self, maximum: u64) {
+        self.authorization.maximum_observation_age_ms = maximum;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alter_observation_target_for_test(&mut self) {
+        self.authorization.expected_target.window_id += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_expected_foreground_for_test(&mut self, foreground: bool) {
+        self.authorization.expected_target.is_foreground = foreground;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_takeover_policy_for_test(&mut self, policy: TakeoverPolicy) {
+        self.takeover_policy = policy;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_minimum_click_interval_for_test(&mut self, interval_ms: u64) {
+        self.minimum_click_interval_ms = interval_ms;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_resume_for_test(&mut self, resume: ResumeAuthorization) {
+        self.resume = resume;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +306,12 @@ impl CommitContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockReason {
     ActionLockBusy,
+    AttemptReplay,
+    CrossCommitter,
+    ResumeRequired,
+    AttemptLedgerFull,
+    ClickBudgetExceeded,
+    RunFinished,
     Stopped,
     TargetChanged,
     StaleObservation,
@@ -193,19 +347,142 @@ impl ActionOutcome {
     }
 }
 
-struct ActionLease {
-    held: Arc<AtomicBool>,
+pub trait LiveControlSink: Send + Sync {
+    fn pause_for_manual_takeover(&self);
+    fn stop_for_manual_takeover(&self);
 }
 
-impl Drop for ActionLease {
-    fn drop(&mut self) {
-        self.held.store(false, Ordering::Release);
+#[derive(Debug, Clone)]
+pub struct ResumeAuthorization {
+    session_id: u64,
+    epoch: u64,
+    target: TargetSnapshot,
+}
+
+impl ResumeAuthorization {
+    #[cfg(test)]
+    pub(crate) fn for_test(target: TargetSnapshot) -> Self {
+        Self {
+            session_id: 0,
+            epoch: 1,
+            target,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResumeState {
+    epoch: u64,
+    current: Option<TargetSnapshot>,
+}
+
+pub struct LiveActionSession {
+    id: u64,
+    target: Arc<dyn TargetGuard + Send + Sync>,
+    input: Arc<dyn LiveActionInput>,
+    control: Arc<dyn LiveControlSink>,
+    resume: Mutex<ResumeState>,
+}
+
+impl LiveActionSession {
+    pub fn new(
+        target: Arc<dyn TargetGuard + Send + Sync>,
+        input: Arc<dyn LiveActionInput>,
+        control: Arc<dyn LiveControlSink>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            id: NEXT_LIVE_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            target,
+            input,
+            control,
+            resume: Mutex::new(ResumeState::default()),
+        })
+    }
+
+    pub fn resume(&self) -> Result<ResumeAuthorization> {
+        let before = self.target.snapshot()?;
+        anyhow::ensure!(
+            target_is_actionable(&before),
+            "target is not actionable during resume"
+        );
+        self.input.reset_manual_baseline()?;
+        self.target.validate(&before)?;
+        let mut state = self.resume.lock().expect("live resume gate poisoned");
+        state.epoch = state.epoch.wrapping_add(1).max(1);
+        state.current = Some(before.clone());
+        Ok(ResumeAuthorization {
+            session_id: self.id,
+            epoch: state.epoch,
+            target: before,
+        })
+    }
+
+    fn validate_resume(&self, authorization: &ResumeAuthorization) -> bool {
+        let state = self.resume.lock().expect("live resume gate poisoned");
+        (authorization.session_id == self.id || cfg!(test) && authorization.session_id == 0)
+            && authorization.epoch == state.epoch
+            && state.current.as_ref() == Some(&authorization.target)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_for_test(&self, target: TargetSnapshot) {
+        let mut state = self.resume.lock().expect("live resume gate poisoned");
+        state.epoch = 1;
+        state.current = Some(target);
+    }
+
+    fn apply_takeover(&self, policy: TakeoverPolicy) {
+        {
+            let mut state = self.resume.lock().expect("live resume gate poisoned");
+            state.current = None;
+        }
+        match policy {
+            TakeoverPolicy::Pause => self.control.pause_for_manual_takeover(),
+            TakeoverPolicy::Stop => self.control.stop_for_manual_takeover(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptStatus {
+    Prepared,
+    Blocked,
+    Committed,
+    Dispatched,
+    Uncertain,
+}
+
+#[derive(Debug)]
+struct AttemptRecord {
+    owner_id: u64,
+    status: AttemptStatus,
+}
+
+#[derive(Debug)]
+struct CommitLedger {
+    run_id: String,
+    maximum_clicks: Limit<u64>,
+    maximum_attempts: usize,
+    committed_clicks: u64,
+    last_click_at_ms: Option<u64>,
+    active: Option<ActionAttemptId>,
+    attempts: HashMap<ActionAttemptId, AttemptRecord>,
+    finished: bool,
+}
+
+impl CommitLedger {
+    fn click_available(&self) -> bool {
+        !matches!(
+            self.maximum_clicks,
+            Limit::Finite(maximum) if self.committed_clicks >= maximum
+        )
     }
 }
 
 pub struct PreparedAction {
     request: ActionPrepareRequest,
-    _lease: ActionLease,
+    owner_id: u64,
+    ledger: Arc<Mutex<CommitLedger>>,
 }
 
 impl std::fmt::Debug for PreparedAction {
@@ -217,26 +494,57 @@ impl std::fmt::Debug for PreparedAction {
     }
 }
 
+impl Drop for PreparedAction {
+    fn drop(&mut self) {
+        let attempt_id = &self.request.authorization.attempt_id;
+        let mut ledger = self.ledger.lock().expect("action attempt ledger poisoned");
+        if let Some(record) = ledger.attempts.get_mut(attempt_id)
+            && record.owner_id == self.owner_id
+            && record.status == AttemptStatus::Prepared
+        {
+            // Admission to the run ledger is permanent. Even a cancelled/abandoned prepared
+            // action cannot reuse its once-only ID; bounded cleanup happens only at run finish.
+            record.status = AttemptStatus::Blocked;
+        }
+        if ledger.active.as_ref() == Some(attempt_id) {
+            ledger.active = None;
+        }
+    }
+}
+
 pub struct ActionCommitter {
-    target: Arc<dyn TargetGuard + Send + Sync>,
-    input: Arc<dyn LiveActionInput>,
+    owner_id: u64,
+    session: Arc<LiveActionSession>,
     clock: Arc<dyn Clock + Send + Sync>,
-    action_held: Arc<AtomicBool>,
-    last_click_at_ms: Mutex<Option<u64>>,
+    ledger: Arc<Mutex<CommitLedger>>,
 }
 
 impl ActionCommitter {
     pub fn new(
-        target: Arc<dyn TargetGuard + Send + Sync>,
-        input: Arc<dyn LiveActionInput>,
+        session: Arc<LiveActionSession>,
         clock: Arc<dyn Clock + Send + Sync>,
+        run_id: impl Into<String>,
+        maximum_clicks: Limit<u64>,
+        maximum_attempts: usize,
     ) -> Self {
+        assert!(
+            maximum_attempts > 0,
+            "action attempt ledger capacity must be positive"
+        );
         Self {
-            target,
-            input,
+            owner_id: NEXT_COMMITTER_OWNER_ID.fetch_add(1, Ordering::Relaxed),
+            session,
             clock,
-            action_held: Arc::new(AtomicBool::new(false)),
-            last_click_at_ms: Mutex::new(None),
+            ledger: Arc::new(Mutex::new(CommitLedger {
+                run_id: run_id.into(),
+                maximum_clicks,
+                maximum_attempts,
+                committed_clicks: 0,
+                last_click_at_ms: None,
+                active: None,
+                attempts: HashMap::new(),
+                finished: false,
+            })),
         }
     }
 
@@ -244,20 +552,50 @@ impl ActionCommitter {
         &self,
         request: ActionPrepareRequest,
     ) -> std::result::Result<PreparedAction, BlockReason> {
-        self.action_held
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| BlockReason::ActionLockBusy)?;
-        let lease = ActionLease {
-            held: Arc::clone(&self.action_held),
-        };
-        if !target_is_actionable(&request.expected_target)
-            || self.target.validate(&request.expected_target).is_err()
+        if !self.session.validate_resume(&request.resume)
+            || request.resume.target != request.authorization.expected_target
+        {
+            return Err(BlockReason::ResumeRequired);
+        }
+        if !target_is_actionable(&request.authorization.expected_target)
+            || self
+                .session
+                .target
+                .validate(&request.authorization.expected_target)
+                .is_err()
         {
             return Err(BlockReason::TargetChanged);
         }
+        let attempt_id = request.authorization.attempt_id.clone();
+        let mut ledger = self.ledger.lock().expect("action attempt ledger poisoned");
+        if ledger.finished {
+            return Err(BlockReason::RunFinished);
+        }
+        if attempt_id.run_id != ledger.run_id {
+            return Err(BlockReason::CrossCommitter);
+        }
+        if ledger.attempts.contains_key(&attempt_id) {
+            return Err(BlockReason::AttemptReplay);
+        }
+        if ledger.active.is_some() {
+            return Err(BlockReason::ActionLockBusy);
+        }
+        if ledger.attempts.len() >= ledger.maximum_attempts {
+            return Err(BlockReason::AttemptLedgerFull);
+        }
+        ledger.active = Some(attempt_id.clone());
+        ledger.attempts.insert(
+            attempt_id,
+            AttemptRecord {
+                owner_id: self.owner_id,
+                status: AttemptStatus::Prepared,
+            },
+        );
+        drop(ledger);
         Ok(PreparedAction {
             request,
-            _lease: lease,
+            owner_id: self.owner_id,
+            ledger: Arc::clone(&self.ledger),
         })
     }
 
@@ -267,7 +605,14 @@ impl ActionCommitter {
         stop: &dyn StopSource,
         context: CommitContext,
     ) -> ActionOutcome {
+        if prepared.owner_id != self.owner_id || !Arc::ptr_eq(&prepared.ledger, &self.ledger) {
+            return ActionOutcome::Blocked {
+                reason: BlockReason::CrossCommitter,
+                transitions: vec![ActionState::Prepared, ActionState::Blocked],
+            };
+        }
         let request = &prepared.request;
+        let authorization = &request.authorization;
         let blocked = |reason| ActionOutcome::Blocked {
             reason,
             transitions: vec![ActionState::Prepared, ActionState::Blocked],
@@ -276,8 +621,11 @@ impl ActionCommitter {
         if stop.is_stopped() {
             return blocked(BlockReason::Stopped);
         }
-        match self.input.manual_takeover_detected() {
-            Ok(true) => return blocked(BlockReason::ManualTakeover(request.takeover_policy)),
+        match self.session.input.manual_takeover_detected() {
+            Ok(true) => {
+                self.session.apply_takeover(request.takeover_policy);
+                return blocked(BlockReason::ManualTakeover(request.takeover_policy));
+            }
             Ok(false) => {}
             Err(error) => {
                 return blocked(BlockReason::InputFailure {
@@ -285,12 +633,19 @@ impl ActionCommitter {
                 });
             }
         }
-        if !target_is_actionable(&request.expected_target)
-            || self.target.validate(&request.expected_target).is_err()
+        if !target_is_actionable(&authorization.expected_target)
+            || self
+                .session
+                .target
+                .validate(&authorization.expected_target)
+                .is_err()
         {
             return blocked(BlockReason::TargetChanged);
         }
-        if !point_inside_rect(request.expected_target.client_rect, request.destination) {
+        if !point_inside_rect(
+            authorization.expected_target.client_rect,
+            authorization.destination,
+        ) {
             return blocked(BlockReason::DestinationOutOfBounds);
         }
         if !observation_is_current(request, &context, self.clock.now_ms()) {
@@ -301,21 +656,24 @@ impl ActionCommitter {
         }
         let now = self.clock.now_ms();
         if self
-            .last_click_at_ms
+            .ledger
             .lock()
-            .expect("action pacing lock poisoned")
+            .expect("action attempt ledger poisoned")
+            .last_click_at_ms
             .is_some_and(|last| now < last.saturating_add(request.minimum_click_interval_ms))
         {
             return blocked(BlockReason::ClickPacing);
         }
 
         match self
+            .session
             .input
-            .move_to(request.destination, request.movement.as_ref(), stop)
+            .move_to(authorization.destination, request.movement.as_ref(), stop)
         {
             Ok(MovementOutcome::Reached) => {}
             Ok(MovementOutcome::Cancelled) => return blocked(BlockReason::Stopped),
             Ok(MovementOutcome::ManualTakeover) => {
+                self.session.apply_takeover(request.takeover_policy);
                 return blocked(BlockReason::ManualTakeover(request.takeover_policy));
             }
             Err(error) => {
@@ -330,8 +688,11 @@ impl ActionCommitter {
         if stop.is_stopped() {
             return blocked(BlockReason::Stopped);
         }
-        match self.input.manual_takeover_detected() {
-            Ok(true) => return blocked(BlockReason::ManualTakeover(request.takeover_policy)),
+        match self.session.input.manual_takeover_detected() {
+            Ok(true) => {
+                self.session.apply_takeover(request.takeover_policy);
+                return blocked(BlockReason::ManualTakeover(request.takeover_policy));
+            }
             Ok(false) => {}
             Err(error) => {
                 return blocked(BlockReason::InputFailure {
@@ -339,7 +700,12 @@ impl ActionCommitter {
                 });
             }
         }
-        if self.target.validate(&request.expected_target).is_err() {
+        if self
+            .session
+            .target
+            .validate(&authorization.expected_target)
+            .is_err()
+        {
             return blocked(BlockReason::TargetChanged);
         }
         if !observation_is_current(request, &context, self.clock.now_ms()) {
@@ -348,38 +714,89 @@ impl ActionCommitter {
         if !observation_authorizes_destination(request) {
             return blocked(BlockReason::DestinationOutOfBounds);
         }
-        if !point_inside_rect(request.expected_target.client_rect, request.destination) {
+        if !point_inside_rect(
+            authorization.expected_target.client_rect,
+            authorization.destination,
+        ) {
             return blocked(BlockReason::DestinationOutOfBounds);
         }
-        let commit_time = self.clock.now_ms();
-        {
-            let last = self
-                .last_click_at_ms
-                .lock()
-                .expect("action pacing lock poisoned");
-            if last.is_some_and(|previous| {
+        let attempt_id = authorization.attempt_id.clone();
+        let mut commit_boundary = || {
+            if stop.is_stopped() {
+                return Err(BlockReason::Stopped);
+            }
+            if !self.session.validate_resume(&request.resume) {
+                return Err(BlockReason::ResumeRequired);
+            }
+            if self
+                .session
+                .target
+                .validate(&authorization.expected_target)
+                .is_err()
+            {
+                return Err(BlockReason::TargetChanged);
+            }
+            if !observation_is_current(request, &context, self.clock.now_ms()) {
+                return Err(BlockReason::StaleObservation);
+            }
+            if !observation_authorizes_destination(request)
+                || !point_inside_rect(
+                    authorization.expected_target.client_rect,
+                    authorization.destination,
+                )
+            {
+                return Err(BlockReason::DestinationOutOfBounds);
+            }
+            let commit_time = self.clock.now_ms();
+            let mut ledger = self.ledger.lock().expect("action attempt ledger poisoned");
+            if ledger.finished {
+                return Err(BlockReason::RunFinished);
+            }
+            if ledger.active.as_ref() != Some(&attempt_id) {
+                return Err(BlockReason::CrossCommitter);
+            }
+            let valid_prepared = ledger.attempts.get(&attempt_id).is_some_and(|record| {
+                record.owner_id == self.owner_id && record.status == AttemptStatus::Prepared
+            });
+            if !valid_prepared {
+                return Err(BlockReason::AttemptReplay);
+            }
+            if !ledger.click_available() {
+                return Err(BlockReason::ClickBudgetExceeded);
+            }
+            if ledger.last_click_at_ms.is_some_and(|previous| {
                 commit_time < previous.saturating_add(request.minimum_click_interval_ms)
             }) {
-                return blocked(BlockReason::ClickPacing);
+                return Err(BlockReason::ClickPacing);
             }
-        }
+            ledger.committed_clicks = ledger.committed_clicks.saturating_add(1);
+            ledger.last_click_at_ms = Some(commit_time);
+            ledger
+                .attempts
+                .get_mut(&attempt_id)
+                .expect("prepared attempt disappeared")
+                .status = AttemptStatus::Committed;
+            Ok(())
+        };
 
-        let dispatch = self
-            .input
-            .dispatch_click(request.destination, request.button, stop);
+        let dispatch = self.session.input.dispatch_click(
+            authorization.destination,
+            authorization.button,
+            stop,
+            &mut commit_boundary,
+        );
         match dispatch {
             InputDispatchOutcome::BlockedStopped => blocked(BlockReason::Stopped),
             InputDispatchOutcome::BlockedManualTakeover => {
+                self.session.apply_takeover(request.takeover_policy);
                 blocked(BlockReason::ManualTakeover(request.takeover_policy))
             }
             InputDispatchOutcome::BlockedInputFailure { message } => {
                 blocked(BlockReason::InputFailure { message })
             }
+            InputDispatchOutcome::BlockedCommit { reason } => blocked(reason),
             InputDispatchOutcome::Dispatched if !stop.is_stopped() => {
-                *self
-                    .last_click_at_ms
-                    .lock()
-                    .expect("action pacing lock poisoned") = Some(commit_time);
+                self.finish_attempt(&attempt_id, AttemptStatus::Dispatched);
                 ActionOutcome::Dispatched {
                     transitions: vec![
                         ActionState::Prepared,
@@ -389,10 +806,7 @@ impl ActionCommitter {
                 }
             }
             InputDispatchOutcome::Dispatched => {
-                *self
-                    .last_click_at_ms
-                    .lock()
-                    .expect("action pacing lock poisoned") = Some(commit_time);
+                self.finish_attempt(&attempt_id, AttemptStatus::Uncertain);
                 ActionOutcome::UncertainDispatch {
                     message: "stop observed after input commit".to_string(),
                     transitions: vec![
@@ -402,13 +816,10 @@ impl ActionCommitter {
                     ],
                 }
             }
-            InputDispatchOutcome::UncertainDispatch { message } => {
-                *self
-                    .last_click_at_ms
-                    .lock()
-                    .expect("action pacing lock poisoned") = Some(commit_time);
+            InputDispatchOutcome::UncertainDispatch { failure } => {
+                self.finish_attempt(&attempt_id, AttemptStatus::Uncertain);
                 ActionOutcome::UncertainDispatch {
-                    message,
+                    message: failure.to_string(),
                     transitions: vec![
                         ActionState::Prepared,
                         ActionState::Committed,
@@ -417,6 +828,36 @@ impl ActionCommitter {
                 }
             }
         }
+    }
+
+    fn finish_attempt(&self, attempt_id: &ActionAttemptId, status: AttemptStatus) {
+        let mut ledger = self.ledger.lock().expect("action attempt ledger poisoned");
+        if let Some(record) = ledger.attempts.get_mut(attempt_id)
+            && record.owner_id == self.owner_id
+            && record.status == AttemptStatus::Committed
+        {
+            record.status = status;
+        }
+        if ledger.active.as_ref() == Some(attempt_id) {
+            ledger.active = None;
+        }
+    }
+
+    pub fn finish_run(&self) -> std::result::Result<(), BlockReason> {
+        let mut ledger = self.ledger.lock().expect("action attempt ledger poisoned");
+        if ledger.active.is_some() {
+            return Err(BlockReason::ActionLockBusy);
+        }
+        ledger.attempts.clear();
+        ledger.finished = true;
+        Ok(())
+    }
+
+    pub fn committed_clicks(&self) -> u64 {
+        self.ledger
+            .lock()
+            .expect("action attempt ledger poisoned")
+            .committed_clicks
     }
 }
 
@@ -438,15 +879,15 @@ fn observation_is_current(
     context: &CommitContext,
     now_ms: u64,
 ) -> bool {
-    if context.run_id != request.run_id || context.generation != request.generation {
+    let authorization = &request.authorization;
+    if context.run_id != authorization.attempt_id.run_id
+        || context.generation != authorization.generation
+    {
         return false;
     }
-    let Some(expected) = request.observation.as_ref() else {
-        return context.current_observation.is_none() && request.observation_target.is_none();
+    let Some(expected) = authorization.observation.as_ref() else {
+        return context.current_observation.is_none();
     };
-    if request.observation_target.as_ref() != Some(&request.expected_target) {
-        return false;
-    }
     let Some(current) = context.current_observation.as_ref() else {
         return false;
     };
@@ -454,30 +895,33 @@ fn observation_is_current(
         return false;
     }
     if current.captured_at_ms > now_ms
-        || now_ms.saturating_sub(current.captured_at_ms) > request.maximum_observation_age_ms
+        || now_ms.saturating_sub(current.captured_at_ms) > authorization.maximum_observation_age_ms
     {
         return false;
     }
     let Some(frame) = current.frame_metadata else {
         return true;
     };
-    frame.window_id == request.expected_target.window_id
-        && frame.window_revision == request.expected_target.window_revision
-        && frame.client_width == request.expected_target.client_rect.width
-        && frame.client_height == request.expected_target.client_rect.height
-        && frame.geometry_revision == request.expected_target.geometry_revision
-        && frame.display_profile_revision == request.expected_target.display_profile_revision
-        && frame.dpi == request.expected_target.dpi
+    frame.frame_id == current.frame_id
+        && frame.captured_at_ms == current.captured_at_ms
+        && frame.window_id == authorization.expected_target.window_id
+        && frame.window_revision == authorization.expected_target.window_revision
+        && frame.client_x == authorization.expected_target.client_rect.x
+        && frame.client_y == authorization.expected_target.client_rect.y
+        && frame.client_width == authorization.expected_target.client_rect.width
+        && frame.client_height == authorization.expected_target.client_rect.height
+        && frame.geometry_revision == authorization.expected_target.geometry_revision
+        && frame.display_profile_revision == authorization.expected_target.display_profile_revision
+        && frame.dpi == authorization.expected_target.dpi
         && frame.region_revision == current.region_revision
         && frame.rule_revision == current.rule_revision
 }
 
 fn observation_authorizes_destination(request: &ActionPrepareRequest) -> bool {
-    request.observation.as_ref().is_none_or(|token| {
-        token
-            .match_rect
-            .is_some_and(|rect| point_inside_rect(rect, request.destination))
-    })
+    request
+        .authorization
+        .screen_authorized_rect
+        .is_none_or(|rect| point_inside_rect(rect, request.authorization.destination))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -994,6 +1438,237 @@ impl CompiledMacro {
     pub fn definition(&self) -> &MacroDefinition {
         &self.definition
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_action(
+        &self,
+        run_id: &str,
+        generation: u64,
+        action_instance_id: u64,
+        block_id: &str,
+        action: &Action,
+        token: Option<&ObservationToken>,
+        observation_target: TargetSnapshot,
+        destination: Point,
+        maximum_observation_age_ms: u64,
+    ) -> Result<ActionAuthorization> {
+        let compiled_block = find_block_by_id(&self.definition.blocks, block_id)
+            .ok_or_else(|| anyhow::anyhow!("action block '{block_id}' is not compiled"))?;
+        let BlockKind::Action {
+            action: compiled_action,
+        } = &compiled_block.kind
+        else {
+            bail!("compiled block '{block_id}' is not an action");
+        };
+        anyhow::ensure!(
+            compiled_action == action,
+            "action does not match compiled block"
+        );
+        let button = match action {
+            Action::ClickTextMatch { button, .. }
+            | Action::ClickImageMatch { button, .. }
+            | Action::ClickPoint { button, .. }
+            | Action::ClickRegion { button, .. } => *button,
+            Action::MoveOnly { .. } => bail!("MoveOnly does not authorize input dispatch"),
+        };
+
+        let screen_authorized_rect = match action {
+            Action::ClickTextMatch { .. } | Action::ClickImageMatch { .. } => {
+                let token = token.context("matched click requires an observation token")?;
+                anyhow::ensure!(
+                    token.is_current(run_id, generation),
+                    "observation token is stale"
+                );
+                validate_action_token(self, action, token)?;
+                validate_token_frame_consistency(token, &observation_target)?;
+                let local = token
+                    .match_rect
+                    .context("matched click token has no geometry")?;
+                Some(local_rect_to_screen(observation_target.client_rect, local)?)
+            }
+            Action::ClickPoint { point_id, .. } => {
+                anyhow::ensure!(
+                    token.is_none(),
+                    "point click cannot consume detector evidence"
+                );
+                let point = self
+                    .definition
+                    .points
+                    .iter()
+                    .find(|point| point.id == *point_id)
+                    .ok_or_else(|| anyhow::anyhow!("compiled point '{point_id}' is missing"))?;
+                anyhow::ensure!(
+                    observation_target.client_rect.point_from_ratio(point.point) == destination,
+                    "destination does not match compiled point"
+                );
+                None
+            }
+            Action::ClickRegion { region_id, .. } => {
+                anyhow::ensure!(
+                    token.is_none(),
+                    "region click cannot consume detector evidence"
+                );
+                let region = self
+                    .definition
+                    .regions
+                    .iter()
+                    .find(|region| region.id == *region_id)
+                    .ok_or_else(|| anyhow::anyhow!("compiled region '{region_id}' is missing"))?;
+                Some(observation_target.client_rect.rect_from_ratio(region.rect))
+            }
+            Action::MoveOnly { .. } => unreachable!(),
+        };
+        if let Some(rect) = screen_authorized_rect {
+            anyhow::ensure!(
+                point_inside_rect(rect, destination),
+                "destination is outside authorized geometry"
+            );
+        }
+        anyhow::ensure!(
+            point_inside_rect(observation_target.client_rect, destination),
+            "destination is outside observation-time client bounds"
+        );
+
+        Ok(ActionAuthorization {
+            attempt_id: ActionAttemptId {
+                run_id: run_id.to_string(),
+                action_instance_id,
+            },
+            block_id: block_id.to_string(),
+            action: action.clone(),
+            expected_target: observation_target,
+            destination,
+            button,
+            observation: token.cloned(),
+            screen_authorized_rect,
+            generation,
+            maximum_observation_age_ms,
+        })
+    }
+}
+
+fn find_block_by_id<'a>(blocks: &'a [Block], block_id: &str) -> Option<&'a Block> {
+    for block in blocks {
+        if block.id == block_id {
+            return Some(block);
+        }
+        let nested = match &block.kind {
+            BlockKind::If {
+                then_body,
+                else_body,
+                ..
+            } => find_block_by_id(then_body, block_id)
+                .or_else(|| find_block_by_id(else_body, block_id)),
+            BlockKind::RepeatN { body, .. }
+            | BlockKind::RepeatUntil { body, .. }
+            | BlockKind::Continuous { body } => find_block_by_id(body, block_id),
+            BlockKind::WatchGroup { group } => group
+                .lanes
+                .iter()
+                .find_map(|lane| find_block_by_id(&lane.then_body, block_id)),
+            _ => None,
+        };
+        if nested.is_some() {
+            return nested;
+        }
+    }
+    None
+}
+
+fn validate_token_frame_consistency(
+    token: &ObservationToken,
+    target: &TargetSnapshot,
+) -> Result<()> {
+    let Some(frame) = token.frame_metadata else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        frame.frame_id == token.frame_id,
+        "frame id is internally inconsistent"
+    );
+    anyhow::ensure!(
+        frame.captured_at_ms == token.captured_at_ms,
+        "frame capture time is internally inconsistent"
+    );
+    anyhow::ensure!(
+        frame.window_id == target.window_id,
+        "frame HWND does not match target"
+    );
+    anyhow::ensure!(
+        frame.window_revision == target.window_revision,
+        "frame window revision changed"
+    );
+    anyhow::ensure!(
+        (
+            frame.client_x,
+            frame.client_y,
+            frame.client_width,
+            frame.client_height
+        ) == (
+            target.client_rect.x,
+            target.client_rect.y,
+            target.client_rect.width,
+            target.client_rect.height
+        ),
+        "frame client geometry does not match observation target"
+    );
+    anyhow::ensure!(
+        frame.geometry_revision == target.geometry_revision,
+        "frame geometry revision changed"
+    );
+    anyhow::ensure!(
+        frame.display_profile_revision == target.display_profile_revision,
+        "frame display profile changed"
+    );
+    anyhow::ensure!(frame.dpi == target.dpi, "frame DPI changed");
+    anyhow::ensure!(
+        frame.region_revision == token.region_revision,
+        "frame region revision is inconsistent"
+    );
+    anyhow::ensure!(
+        frame.rule_revision == token.rule_revision,
+        "frame rule revision is inconsistent"
+    );
+    Ok(())
+}
+
+fn local_rect_to_screen(
+    client: crate::engine::types::Rect,
+    local: crate::engine::types::Rect,
+) -> Result<crate::engine::types::Rect> {
+    let local_bounds = crate::engine::types::Rect::new(0, 0, client.width, client.height);
+    anyhow::ensure!(
+        rect_contains_checked(local_bounds, local),
+        "local match geometry is outside client bounds"
+    );
+    let x = i64::from(client.x)
+        .checked_add(i64::from(local.x))
+        .and_then(|value| i32::try_from(value).ok())
+        .context("screen match x overflowed")?;
+    let y = i64::from(client.y)
+        .checked_add(i64::from(local.y))
+        .and_then(|value| i32::try_from(value).ok())
+        .context("screen match y overflowed")?;
+    Ok(crate::engine::types::Rect::new(
+        x,
+        y,
+        local.width,
+        local.height,
+    ))
+}
+
+fn rect_contains_checked(
+    container: crate::engine::types::Rect,
+    nested: crate::engine::types::Rect,
+) -> bool {
+    let right = i64::from(container.x) + i64::from(container.width);
+    let bottom = i64::from(container.y) + i64::from(container.height);
+    let nested_right = i64::from(nested.x) + i64::from(nested.width);
+    let nested_bottom = i64::from(nested.y) + i64::from(nested.height);
+    i64::from(nested.x) >= i64::from(container.x)
+        && i64::from(nested.y) >= i64::from(container.y)
+        && nested_right <= right
+        && nested_bottom <= bottom
 }
 
 fn decode_pinned_image_asset(
@@ -1174,7 +1849,6 @@ impl MacroRuntime {
             emitter: &mut emitter,
             observations: HashMap::new(),
             last_observation_at_ms: None,
-            action_count: 0,
             paused_event_emitted: false,
             detector_generations: HashSet::new(),
         };
@@ -1287,7 +1961,6 @@ struct RunExecution<'a, 'clock> {
     emitter: &'a mut EventEmitter<'clock>,
     observations: HashMap<String, ObservationToken>,
     last_observation_at_ms: Option<u64>,
-    action_count: u64,
     paused_event_emitted: bool,
     detector_generations: HashSet<u64>,
 }
@@ -1687,17 +2360,8 @@ impl RunExecution<'_, '_> {
             }
             None => None,
         };
-        if is_click_action(action) {
-            self.action_count = self.action_count.saturating_add(1);
-            if exceeds_limit(
-                self.action_count,
-                &self.compiled.definition().safety.max_clicks,
-            ) {
-                return Some(StopReason::SafetyLimit {
-                    message: "maximum click count exceeded".to_string(),
-                });
-            }
-        }
+        // Planning is observation-only. The live `ActionCommitter` owns and consumes the
+        // authoritative click budget exactly at the pre-SendInput linearization boundary.
         self.emitter.action_planned(block_id, action.clone(), token);
         self.cooperative_wait(self.compiled.definition().safety.minimum_click_interval_ms)
     }
@@ -2039,16 +2703,6 @@ fn timeout_body(condition: &Condition) -> Option<&[Block]> {
     }
 }
 
-fn is_click_action(action: &Action) -> bool {
-    matches!(
-        action,
-        Action::ClickTextMatch { .. }
-            | Action::ClickImageMatch { .. }
-            | Action::ClickPoint { .. }
-            | Action::ClickRegion { .. }
-    )
-}
-
 struct EventEmitter<'a> {
     clock: &'a dyn Clock,
     started_at: u64,
@@ -2342,6 +2996,8 @@ mod tests {
                     captured_at_ms: request.observed_at_ms,
                     window_id: 9,
                     window_revision: 2,
+                    client_x: 0,
+                    client_y: 0,
                     client_width: 64,
                     client_height: 48,
                     geometry_revision: 3,
@@ -3222,6 +3878,173 @@ mod tests {
         ] {
             assert!(validate_action_token(&compiled, &action, &mismatched).is_err());
         }
+    }
+
+    #[test]
+    fn action_authorization_binds_compiled_action_token_target_and_screen_geometry() {
+        let action = Action::ClickTextMatch {
+            source_block_id: "observe".to_string(),
+            button: super::super::MouseButton::Left,
+        };
+        let revision = saved(fixture_definition(vec![
+            block(
+                "observe",
+                BlockKind::Observe {
+                    condition: text_condition("observe", ObserveMode::CheckNow),
+                },
+            ),
+            block(
+                "click-match",
+                BlockKind::Action {
+                    action: action.clone(),
+                },
+            ),
+        ]));
+        let compiled = CompiledMacro::compile(revision).unwrap();
+        let target = TargetSnapshot {
+            window_id: 91,
+            process_id: 7,
+            process_started_at_100ns: 100,
+            process_path: "game.exe".to_string(),
+            client_rect: Rect::new(100, 200, 800, 600),
+            window_revision: 1,
+            geometry_revision: 2,
+            dpi: 144,
+            display_profile: "display-a".to_string(),
+            display_profile_revision: 3,
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
+        };
+        let token = ObservationToken {
+            run_id: "run-1".to_string(),
+            generation: 4,
+            source_block_id: "observe".to_string(),
+            detector: DetectorKind::Text,
+            region_id: "region".to_string(),
+            region_revision: 1,
+            rule_id: "text".to_string(),
+            rule_revision: 1,
+            frame_id: 8,
+            captured_at_ms: 10,
+            match_rect: Some(Rect::new(10, 20, 30, 40)),
+            score: Some(0.99),
+            match_count: 1,
+            stable_frames: 2,
+            frame_metadata: Some(super::super::ImageFrameMetadata {
+                frame_id: 8,
+                captured_at_ms: 10,
+                window_id: 91,
+                window_revision: 1,
+                client_x: 100,
+                client_y: 200,
+                client_width: 800,
+                client_height: 600,
+                geometry_revision: 2,
+                display_profile_revision: 3,
+                dpi: 144,
+                region_revision: 1,
+                rule_revision: 1,
+            }),
+            evidence: serde_json::Value::Null,
+        };
+
+        let authorization = compiled
+            .authorize_action(
+                "run-1",
+                4,
+                12,
+                "click-match",
+                &action,
+                Some(&token),
+                target.clone(),
+                Point::new(115, 225),
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(authorization.action, action);
+        assert_eq!(authorization.block_id, "click-match");
+        assert_eq!(authorization.expected_target, target);
+        assert_eq!(
+            authorization.screen_authorized_rect,
+            Some(Rect::new(110, 220, 30, 40))
+        );
+
+        let mut wrong_source = token.clone();
+        wrong_source.source_block_id = "other".to_string();
+        assert!(
+            compiled
+                .authorize_action(
+                    "run-1",
+                    4,
+                    13,
+                    "click-match",
+                    &action,
+                    Some(&wrong_source),
+                    target.clone(),
+                    Point::new(115, 225),
+                    1_000,
+                )
+                .is_err()
+        );
+
+        let mut wrong_frame = token.clone();
+        wrong_frame.frame_metadata.as_mut().unwrap().frame_id += 1;
+        assert!(
+            compiled
+                .authorize_action(
+                    "run-1",
+                    4,
+                    14,
+                    "click-match",
+                    &action,
+                    Some(&wrong_frame),
+                    target.clone(),
+                    Point::new(115, 225),
+                    1_000,
+                )
+                .is_err()
+        );
+
+        let wrong_action = Action::ClickTextMatch {
+            source_block_id: "observe".to_string(),
+            button: super::super::MouseButton::Right,
+        };
+        assert!(
+            compiled
+                .authorize_action(
+                    "run-1",
+                    4,
+                    15,
+                    "click-match",
+                    &wrong_action,
+                    Some(&token),
+                    target,
+                    Point::new(115, 225),
+                    1_000,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_match_geometry_conversion_is_checked_and_cannot_overflow() {
+        assert_eq!(
+            local_rect_to_screen(Rect::new(-500, 300, 800, 600), Rect::new(10, 20, 30, 40))
+                .unwrap(),
+            Rect::new(-490, 320, 30, 40)
+        );
+        assert!(
+            local_rect_to_screen(
+                Rect::new(i32::MAX - 5, 0, 100, 100),
+                Rect::new(10, 10, 20, 20),
+            )
+            .is_err()
+        );
+        assert!(
+            local_rect_to_screen(Rect::new(100, 200, 800, 600), Rect::new(790, 10, 20, 20),)
+                .is_err()
+        );
     }
 
     #[test]

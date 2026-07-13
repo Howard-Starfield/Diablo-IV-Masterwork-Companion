@@ -19,6 +19,10 @@ pub struct CaptureFrameMetadata {
     pub window_revision: u64,
     /// Physical client-area dimensions used to validate and translate the captured crop.
     #[serde(default)]
+    pub client_x: i32,
+    #[serde(default)]
+    pub client_y: i32,
+    #[serde(default)]
     pub client_width: u32,
     #[serde(default)]
     pub client_height: u32,
@@ -109,6 +113,8 @@ where
                 captured_at_ms: self.clock.now_ms(),
                 window_id: before.window_id,
                 window_revision: before.window_revision,
+                client_x: before.client_rect.x,
+                client_y: before.client_rect.y,
                 client_width: before.client_rect.width,
                 client_height: before.client_rect.height,
                 geometry_revision: before.geometry_revision,
@@ -316,6 +322,7 @@ mod tests {
         assert_eq!(frame.metadata.frame_id, 1);
         assert_eq!(frame.metadata.captured_at_ms, 123);
         assert_eq!(frame.metadata.window_id, 91);
+        assert_eq!((frame.metadata.client_x, frame.metadata.client_y), (10, 20));
         assert_eq!(frame.metadata.client_width, 800);
         assert_eq!(frame.metadata.client_height, 600);
         assert_eq!(frame.metadata.geometry_revision, 8);

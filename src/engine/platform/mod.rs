@@ -3,6 +3,9 @@ mod windows_impl;
 #[cfg(windows)]
 #[allow(dead_code)]
 mod windows_input;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod windows_mouse_hook;
 #[cfg(target_os = "windows")]
 #[allow(dead_code)]
 mod windows_ocr;

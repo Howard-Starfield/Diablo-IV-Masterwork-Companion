@@ -317,6 +317,10 @@ pub struct ImageFrameMetadata {
     pub window_id: u64,
     pub window_revision: u64,
     #[serde(default)]
+    pub client_x: i32,
+    #[serde(default)]
+    pub client_y: i32,
+    #[serde(default)]
     pub client_width: u32,
     #[serde(default)]
     pub client_height: u32,
@@ -443,6 +447,8 @@ impl ImageDetector {
             captured_at_ms: captured.metadata.captured_at_ms,
             window_id: captured.metadata.window_id,
             window_revision: captured.metadata.window_revision,
+            client_x: captured.metadata.client_x,
+            client_y: captured.metadata.client_y,
             client_width: captured.metadata.client_width,
             client_height: captured.metadata.client_height,
             geometry_revision: captured.metadata.geometry_revision,
@@ -1766,6 +1772,8 @@ mod tests {
                 captured_at_ms,
                 window_id: 11,
                 window_revision: 3,
+                client_x: 0,
+                client_y: 0,
                 client_width: 64,
                 client_height: 48,
                 geometry_revision: 5,
@@ -1784,6 +1792,8 @@ mod tests {
             captured_at_ms: frame.captured_at_ms,
             window_id: frame.window_id,
             window_revision: frame.window_revision,
+            client_x: frame.client_x,
+            client_y: frame.client_y,
             client_width: frame.client_width,
             client_height: frame.client_height,
             geometry_revision: frame.geometry_revision,

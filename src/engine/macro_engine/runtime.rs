@@ -12,7 +12,11 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::engine::automation::{CaptureSource, Clock};
+use crate::engine::{
+    automation::{CaptureSource, Clock, MouseButton, StopSource, TargetGuard, TargetSnapshot},
+    config::MouseMovementProfile,
+    types::Point,
+};
 
 use super::{
     Action, Block, BlockKind, Condition, ConditionDetector, DetectorEvidence, DetectorKind,
@@ -65,6 +69,415 @@ pub enum ActionState {
     Dispatched,
     Blocked,
     UncertainDispatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakeoverPolicy {
+    Pause,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MovementOutcome {
+    Reached,
+    Cancelled,
+    ManualTakeover,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputDispatchOutcome {
+    BlockedStopped,
+    BlockedManualTakeover,
+    BlockedInputFailure { message: String },
+    Dispatched,
+    UncertainDispatch { message: String },
+}
+
+/// Granular live-input boundary used only by `ActionCommitter`.
+///
+/// `MacroRuntime` deliberately does not own this trait in v1's observation-only modes, so merely
+/// constructing the runtime cannot inject input.
+pub trait LiveActionInput: Send + Sync {
+    fn manual_takeover_detected(&self) -> Result<bool>;
+    fn move_to(
+        &self,
+        point: Point,
+        movement: Option<&MouseMovementProfile>,
+        stop: &dyn StopSource,
+    ) -> Result<MovementOutcome>;
+    /// Performs the final stop/takeover check and the first `SendInput` as one input-owned
+    /// boundary. `UncertainDispatch` is returned only after dispatch was attempted.
+    fn dispatch_click(
+        &self,
+        point: Point,
+        button: MouseButton,
+        stop: &dyn StopSource,
+    ) -> InputDispatchOutcome;
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionPrepareRequest {
+    pub block_id: String,
+    pub expected_target: TargetSnapshot,
+    pub destination: Point,
+    pub button: MouseButton,
+    pub movement: Option<MouseMovementProfile>,
+    pub observation: Option<ObservationToken>,
+    /// Exact target snapshot sampled with the observation. This binds text tokens, which do not
+    /// yet carry image-specific frame metadata, to the same process/window geometry.
+    pub observation_target: Option<TargetSnapshot>,
+    pub run_id: String,
+    pub generation: u64,
+    pub maximum_observation_age_ms: u64,
+    pub minimum_click_interval_ms: u64,
+    pub takeover_policy: TakeoverPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitContext {
+    pub run_id: String,
+    pub generation: u64,
+    pub current_observation: Option<ObservationToken>,
+}
+
+impl CommitContext {
+    pub fn new(
+        run_id: impl Into<String>,
+        generation: u64,
+        current_observation: Option<ObservationToken>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            generation,
+            current_observation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockReason {
+    ActionLockBusy,
+    Stopped,
+    TargetChanged,
+    StaleObservation,
+    DestinationOutOfBounds,
+    ClickPacing,
+    ManualTakeover(TakeoverPolicy),
+    MovementFailed { message: String },
+    InputFailure { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionOutcome {
+    Blocked {
+        reason: BlockReason,
+        transitions: Vec<ActionState>,
+    },
+    Dispatched {
+        transitions: Vec<ActionState>,
+    },
+    UncertainDispatch {
+        message: String,
+        transitions: Vec<ActionState>,
+    },
+}
+
+impl ActionOutcome {
+    pub fn transitions(&self) -> &[ActionState] {
+        match self {
+            Self::Blocked { transitions, .. }
+            | Self::Dispatched { transitions }
+            | Self::UncertainDispatch { transitions, .. } => transitions,
+        }
+    }
+}
+
+struct ActionLease {
+    held: Arc<AtomicBool>,
+}
+
+impl Drop for ActionLease {
+    fn drop(&mut self) {
+        self.held.store(false, Ordering::Release);
+    }
+}
+
+pub struct PreparedAction {
+    request: ActionPrepareRequest,
+    _lease: ActionLease,
+}
+
+impl std::fmt::Debug for PreparedAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedAction")
+            .field("request", &self.request)
+            .finish_non_exhaustive()
+    }
+}
+
+pub struct ActionCommitter {
+    target: Arc<dyn TargetGuard + Send + Sync>,
+    input: Arc<dyn LiveActionInput>,
+    clock: Arc<dyn Clock + Send + Sync>,
+    action_held: Arc<AtomicBool>,
+    last_click_at_ms: Mutex<Option<u64>>,
+}
+
+impl ActionCommitter {
+    pub fn new(
+        target: Arc<dyn TargetGuard + Send + Sync>,
+        input: Arc<dyn LiveActionInput>,
+        clock: Arc<dyn Clock + Send + Sync>,
+    ) -> Self {
+        Self {
+            target,
+            input,
+            clock,
+            action_held: Arc::new(AtomicBool::new(false)),
+            last_click_at_ms: Mutex::new(None),
+        }
+    }
+
+    pub fn prepare(
+        &self,
+        request: ActionPrepareRequest,
+    ) -> std::result::Result<PreparedAction, BlockReason> {
+        self.action_held
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| BlockReason::ActionLockBusy)?;
+        let lease = ActionLease {
+            held: Arc::clone(&self.action_held),
+        };
+        if !target_is_actionable(&request.expected_target)
+            || self.target.validate(&request.expected_target).is_err()
+        {
+            return Err(BlockReason::TargetChanged);
+        }
+        Ok(PreparedAction {
+            request,
+            _lease: lease,
+        })
+    }
+
+    pub fn commit(
+        &self,
+        prepared: PreparedAction,
+        stop: &dyn StopSource,
+        context: CommitContext,
+    ) -> ActionOutcome {
+        let request = &prepared.request;
+        let blocked = |reason| ActionOutcome::Blocked {
+            reason,
+            transitions: vec![ActionState::Prepared, ActionState::Blocked],
+        };
+
+        if stop.is_stopped() {
+            return blocked(BlockReason::Stopped);
+        }
+        match self.input.manual_takeover_detected() {
+            Ok(true) => return blocked(BlockReason::ManualTakeover(request.takeover_policy)),
+            Ok(false) => {}
+            Err(error) => {
+                return blocked(BlockReason::InputFailure {
+                    message: error.to_string(),
+                });
+            }
+        }
+        if !target_is_actionable(&request.expected_target)
+            || self.target.validate(&request.expected_target).is_err()
+        {
+            return blocked(BlockReason::TargetChanged);
+        }
+        if !point_inside_rect(request.expected_target.client_rect, request.destination) {
+            return blocked(BlockReason::DestinationOutOfBounds);
+        }
+        if !observation_is_current(request, &context, self.clock.now_ms()) {
+            return blocked(BlockReason::StaleObservation);
+        }
+        if !observation_authorizes_destination(request) {
+            return blocked(BlockReason::DestinationOutOfBounds);
+        }
+        let now = self.clock.now_ms();
+        if self
+            .last_click_at_ms
+            .lock()
+            .expect("action pacing lock poisoned")
+            .is_some_and(|last| now < last.saturating_add(request.minimum_click_interval_ms))
+        {
+            return blocked(BlockReason::ClickPacing);
+        }
+
+        match self
+            .input
+            .move_to(request.destination, request.movement.as_ref(), stop)
+        {
+            Ok(MovementOutcome::Reached) => {}
+            Ok(MovementOutcome::Cancelled) => return blocked(BlockReason::Stopped),
+            Ok(MovementOutcome::ManualTakeover) => {
+                return blocked(BlockReason::ManualTakeover(request.takeover_policy));
+            }
+            Err(error) => {
+                return blocked(BlockReason::MovementFailed {
+                    message: error.to_string(),
+                });
+            }
+        }
+
+        // This is the linearization barrier: every cancellable check is repeated immediately
+        // before the first operating-system input call.
+        if stop.is_stopped() {
+            return blocked(BlockReason::Stopped);
+        }
+        match self.input.manual_takeover_detected() {
+            Ok(true) => return blocked(BlockReason::ManualTakeover(request.takeover_policy)),
+            Ok(false) => {}
+            Err(error) => {
+                return blocked(BlockReason::InputFailure {
+                    message: error.to_string(),
+                });
+            }
+        }
+        if self.target.validate(&request.expected_target).is_err() {
+            return blocked(BlockReason::TargetChanged);
+        }
+        if !observation_is_current(request, &context, self.clock.now_ms()) {
+            return blocked(BlockReason::StaleObservation);
+        }
+        if !observation_authorizes_destination(request) {
+            return blocked(BlockReason::DestinationOutOfBounds);
+        }
+        if !point_inside_rect(request.expected_target.client_rect, request.destination) {
+            return blocked(BlockReason::DestinationOutOfBounds);
+        }
+        let commit_time = self.clock.now_ms();
+        {
+            let last = self
+                .last_click_at_ms
+                .lock()
+                .expect("action pacing lock poisoned");
+            if last.is_some_and(|previous| {
+                commit_time < previous.saturating_add(request.minimum_click_interval_ms)
+            }) {
+                return blocked(BlockReason::ClickPacing);
+            }
+        }
+
+        let dispatch = self
+            .input
+            .dispatch_click(request.destination, request.button, stop);
+        match dispatch {
+            InputDispatchOutcome::BlockedStopped => blocked(BlockReason::Stopped),
+            InputDispatchOutcome::BlockedManualTakeover => {
+                blocked(BlockReason::ManualTakeover(request.takeover_policy))
+            }
+            InputDispatchOutcome::BlockedInputFailure { message } => {
+                blocked(BlockReason::InputFailure { message })
+            }
+            InputDispatchOutcome::Dispatched if !stop.is_stopped() => {
+                *self
+                    .last_click_at_ms
+                    .lock()
+                    .expect("action pacing lock poisoned") = Some(commit_time);
+                ActionOutcome::Dispatched {
+                    transitions: vec![
+                        ActionState::Prepared,
+                        ActionState::Committed,
+                        ActionState::Dispatched,
+                    ],
+                }
+            }
+            InputDispatchOutcome::Dispatched => {
+                *self
+                    .last_click_at_ms
+                    .lock()
+                    .expect("action pacing lock poisoned") = Some(commit_time);
+                ActionOutcome::UncertainDispatch {
+                    message: "stop observed after input commit".to_string(),
+                    transitions: vec![
+                        ActionState::Prepared,
+                        ActionState::Committed,
+                        ActionState::UncertainDispatch,
+                    ],
+                }
+            }
+            InputDispatchOutcome::UncertainDispatch { message } => {
+                *self
+                    .last_click_at_ms
+                    .lock()
+                    .expect("action pacing lock poisoned") = Some(commit_time);
+                ActionOutcome::UncertainDispatch {
+                    message,
+                    transitions: vec![
+                        ActionState::Prepared,
+                        ActionState::Committed,
+                        ActionState::UncertainDispatch,
+                    ],
+                }
+            }
+        }
+    }
+}
+
+fn target_is_actionable(target: &TargetSnapshot) -> bool {
+    target.is_visible && !target.is_minimized && target.is_foreground
+}
+
+fn point_inside_rect(rect: crate::engine::types::Rect, point: Point) -> bool {
+    let right = i64::from(rect.x) + i64::from(rect.width);
+    let bottom = i64::from(rect.y) + i64::from(rect.height);
+    i64::from(point.x) >= i64::from(rect.x)
+        && i64::from(point.y) >= i64::from(rect.y)
+        && i64::from(point.x) < right
+        && i64::from(point.y) < bottom
+}
+
+fn observation_is_current(
+    request: &ActionPrepareRequest,
+    context: &CommitContext,
+    now_ms: u64,
+) -> bool {
+    if context.run_id != request.run_id || context.generation != request.generation {
+        return false;
+    }
+    let Some(expected) = request.observation.as_ref() else {
+        return context.current_observation.is_none() && request.observation_target.is_none();
+    };
+    if request.observation_target.as_ref() != Some(&request.expected_target) {
+        return false;
+    }
+    let Some(current) = context.current_observation.as_ref() else {
+        return false;
+    };
+    if current != expected || !current.is_current(&context.run_id, context.generation) {
+        return false;
+    }
+    if current.captured_at_ms > now_ms
+        || now_ms.saturating_sub(current.captured_at_ms) > request.maximum_observation_age_ms
+    {
+        return false;
+    }
+    let Some(frame) = current.frame_metadata else {
+        return true;
+    };
+    frame.window_id == request.expected_target.window_id
+        && frame.window_revision == request.expected_target.window_revision
+        && frame.client_width == request.expected_target.client_rect.width
+        && frame.client_height == request.expected_target.client_rect.height
+        && frame.geometry_revision == request.expected_target.geometry_revision
+        && frame.display_profile_revision == request.expected_target.display_profile_revision
+        && frame.dpi == request.expected_target.dpi
+        && frame.region_revision == current.region_revision
+        && frame.rule_revision == current.rule_revision
+}
+
+fn observation_authorizes_destination(request: &ActionPrepareRequest) -> bool {
+    request.observation.as_ref().is_none_or(|token| {
+        token
+            .match_rect
+            .is_some_and(|rect| point_inside_rect(rect, request.destination))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]

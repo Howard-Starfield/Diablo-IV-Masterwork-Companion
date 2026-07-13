@@ -68,6 +68,14 @@ use super::super::{
     enchant_loop::OcrReader,
     types::{Point, Rect, ScreenImage},
 };
+use super::windows_target::{DurableTargetHints, WindowsTargetGuard};
+
+/// Creates a run-local target guard from the same xcap window identity used by atomic capture.
+/// The live HWND is never copied into the durable hints.
+#[allow(dead_code)]
+pub fn xcap_window_target_guard(window_id: u32, hints: DurableTargetHints) -> WindowsTargetGuard {
+    WindowsTargetGuard::from_xcap_window_id(window_id, hints)
+}
 
 pub fn enable_per_monitor_dpi_awareness() {
     unsafe {

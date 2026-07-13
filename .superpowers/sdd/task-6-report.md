@@ -81,3 +81,62 @@ The repository Context7 rule was followed for the Windows API seam.
 - `TextDetector` rejects image conditions. Task 7 may compose explicit text and image detector ownership; there is no silent detector-family fallback.
 - No live action commit, mouse input, target focus control, Watch Group runtime, image candidate clustering, screenshot storage, or frontend code was added.
 - The requested model/effort setting was not exposed as a verifiable runtime control in this subagent session, so no model-selection claim is made.
+
+## Review Remediation
+
+All four Task 6 review findings were fixed in `ffd0d301876ea8a452da0ec5f7d28128acb10329` (`fix: harden positioned OCR geometry and reuse`).
+
+### Geometry containment and f32 edge correctness
+
+- WinRT word conversion now receives the processed frame dimensions. Each finite positive-size word box is converted by casting every f32 operand to f64 before edge addition, flooring left/top, ceiling right/bottom, range-checking the raw edges, and clamping to `[0, frame_width] x [0, frame_height]`.
+- Negative and beyond-right/bottom partial boxes are clipped; wholly outside, zero-sized, nonfinite, and unrepresentable boxes are rejected.
+- The concrete represented-f32 regression uses bit-exact values `64.5000991821289f32` and `64.49990844726562f32`; their separately widened sum encloses through right edge 130 in a sufficiently wide frame.
+- Inverse profile scaling now intersects the enclosing mapped box with the actual capture rectangle after offset. Empty intersections are rejected. Therefore neither Original/Grayscale/High Contrast nor odd-sized Small Text 2x geometry can escape the captured region.
+
+### Unbiased offline profile benchmark
+
+- The benchmark performs one untimed OCR call before measurements to warm the selected language/engine.
+- It executes five measurement rounds with rotated/interleaved profile order, records one corpus duration per profile per round, and reports the median.
+- Recommendation chooses the lowest median among profiles meeting the aggregate accuracy gate. Exact median ties resolve by the declared stable profile order: Original, Grayscale, High Contrast, Small Text.
+- A fake recognizer and fake monotonic clock make the first OCR call artificially slow while steady-state Original is fastest. The regression recommends Original and proves the cold first call is outside measurements.
+- The benchmark remains offline over supplied saved samples and never calls `CaptureSource`.
+
+### Reusable preprocessing worker
+
+- `TextDetector` now owns one mutex-protected `TextPreprocessWorker`. The worker retains one `OcrFrame` pixel vector and one grayscale scratch vector used only by Small Text.
+- Original BGRA, Grayscale, High Contrast/Otsu, and Small Text 2x pixels are written directly into retained buffers. The live path no longer creates `DynamicImage`/`GrayImage` intermediates or clones grayscale bytes into a new `OcrFrame` per poll.
+- The worker lock and frame borrow remain alive through the recognizer call, preserving Windows OCR input-buffer lifetime. There is no global pool.
+- Same-size regressions assert stable frame pointer, capacity, and growth count. Small Text regressions assert stable scratch pointer/growth on repetition and correct resizing across Grayscale 3x2, Small Text 6x4, and Original BGRA 4x3.
+- The direct reusable Small Text path uses deterministic 2x pixel replication instead of the earlier allocation-producing Triangle resize; the persisted profile contract remains grayscale plus exactly 2x enlargement.
+- The new platform adapter re-exports were narrowed to `pub(crate)` because they are internal engine seams rather than application API.
+
+### Review-remediation TDD evidence
+
+1. Bounded geometry RED
+   - Command: `cargo test windows_ocr -- --nocapture`
+   - Result: compilation failed because `enclosing_integer_rect` did not accept frame dimensions and inverse mapping did not accept a capture rectangle.
+   - GREEN: 10 Windows OCR tests and 22 text tests passed after clamping and capture intersection.
+2. Cold-start benchmark RED
+   - Command: `cargo test benchmark_warms_ocr_and_uses_interleaved_medians_not_first_call_order -- --nocapture`
+   - Result: compilation failed because `TextBenchmarkClock` and `benchmark_text_profiles_with_clock` did not exist.
+   - GREEN command: `cargo test benchmark_ -- --nocapture`
+   - GREEN result: 2 passed, 0 failed after warm-up, interleaving, repeated measurements, median aggregation, and stable tie-breaking.
+3. Reusable worker RED
+   - Command: `cargo test preprocess_worker_ -- --nocapture`
+   - Result: compilation failed because `TextPreprocessWorker` did not exist.
+   - GREEN result: 2 passed, 0 failed after detector-owned reusable frame/scratch buffers were introduced.
+4. Empty fractional geometry RED
+   - Command: `cargo test zero_sized_fractional_word_bounds_are_rejected -- --nocapture`
+   - Result: 0 passed, 1 failed because a fractional zero-width box rounded into one pixel.
+   - GREEN result: 1 passed, 0 failed after requiring strictly positive raw width and height.
+
+### Review-remediation final verification
+
+- `cargo test macro_engine::text` - 25 passed, 0 failed, 134 filtered out.
+- `cargo test windows_ocr` - 11 passed, 0 failed, 148 filtered out.
+- `cargo test` - 159 passed, 0 failed, 0 ignored.
+- `rustfmt --edition 2024 --check --config skip_children=true src/engine/macro_engine/text.rs src/engine/platform/windows_ocr.rs src/engine/platform/mod.rs` - exit 0, no output.
+- `git diff --check 3bfd9fb2e43df3fe8b7f6d266b643b9390903e18` - exit 0, no output.
+- `cargo clippy --all-targets -- -D warnings -A dead_code -A clippy::collapsible-if -A clippy::too-many-arguments -A clippy::default-constructed-unit-structs -A clippy::ptr-arg` - exit 0.
+
+The live-language-pack/corpus, saved-sample persistence/UI, image detector, input, Watch Group, and frontend limitations above remain unchanged.

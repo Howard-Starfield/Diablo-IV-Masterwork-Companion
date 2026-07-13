@@ -19,11 +19,11 @@ mod windows_target;
 #[cfg(windows)]
 #[allow(unused_imports)]
 pub use windows_impl::{
-    CaptureRequestId, CapturedTargetProfile, EscStopSignal, MacroCaptureKind, MacroCaptureRequest,
-    MacroCaptureResponse, MacroCaptureSelection, SendInputController, WindowsOcrReader,
-    XcapRegionCapture, enable_per_monitor_dpi_awareness, record_mouse_movement_profile,
-    resolve_target_from_selection, select_macro_capture, select_screen_rect,
-    xcap_window_target_guard,
+    CaptureRequestId, CapturedTargetBinding, CapturedTargetProfile, EscStopSignal,
+    MacroCaptureKind, MacroCaptureRequest, MacroCaptureResponse, MacroCaptureSelection,
+    SendInputController, WindowsOcrReader, XcapRegionCapture, enable_per_monitor_dpi_awareness,
+    record_mouse_movement_profile, resolve_target_from_selection, select_macro_capture,
+    select_screen_rect, xcap_window_target_guard,
 };
 #[cfg(windows)]
 #[allow(unused_imports)]

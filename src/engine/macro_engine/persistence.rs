@@ -191,13 +191,16 @@ pub struct AssetStore {
 
 impl AssetStore {
     pub fn put_png(&self, bytes: &[u8]) -> Result<AssetRef> {
+        let _guard = lock_store(&self.lock)?;
         let content_hash = sha256_hex(bytes);
+        let index = self.load_index_locked()?;
+        let id = next_captured_asset_id(&index.bindings, &content_hash)?;
         let asset = AssetRef {
-            id: content_hash.clone(),
+            id,
             revision: 1,
             content_hash,
         };
-        self.put_png_revision(asset.clone(), bytes)?;
+        self.install_locked(asset.clone(), bytes)?;
         Ok(asset)
     }
 
@@ -209,6 +212,27 @@ impl AssetStore {
     /// Stores a recaptured template under the same logical identity at a new immutable revision.
     /// The previous binding and bytes remain readable for saved or running snapshots.
     pub fn put_next_png_revision(&self, previous: &AssetRef, bytes: &[u8]) -> Result<AssetRef> {
+        let _guard = lock_store(&self.lock)?;
+        let index = self.load_index_locked()?;
+        validate_identity_binding(&index.bindings, previous)
+            .context("previous template binding is unavailable or stale")?;
+        self.verify_hash_file_locked(&previous.content_hash)
+            .context("previous template bytes are unavailable or corrupt")?;
+        let latest = index
+            .bindings
+            .iter()
+            .filter(|binding| binding.id == previous.id)
+            .map(|binding| binding.revision)
+            .max()
+            .context("previous template identity has no revisions")?;
+        if latest != previous.revision {
+            bail!(
+                "stale template revision {} revision {}; latest is {}",
+                previous.id,
+                previous.revision,
+                latest
+            );
+        }
         let revision = previous
             .revision
             .checked_add(1)
@@ -218,7 +242,6 @@ impl AssetStore {
             revision,
             content_hash: sha256_hex(bytes),
         };
-        let _guard = lock_store(&self.lock)?;
         self.install_locked(asset.clone(), bytes)?;
         Ok(asset)
     }
@@ -352,6 +375,19 @@ impl AssetStore {
         }
         Ok(self.root.join(format!("{hash}.png")))
     }
+}
+
+fn next_captured_asset_id(bindings: &[AssetRef], content_hash: &str) -> Result<String> {
+    let prefix = content_hash
+        .get(..16)
+        .context("captured asset content hash is invalid")?;
+    for ordinal in 1_u64.. {
+        let id = format!("captured-{prefix}-{ordinal}");
+        if !bindings.iter().any(|binding| binding.id == id) {
+            return Ok(id);
+        }
+    }
+    unreachable!("u64 asset identity space exhausted")
 }
 
 #[derive(Debug, Clone)]
@@ -1956,6 +1992,108 @@ mod tests {
         assert_ne!(recaptured.content_hash, original.content_hash);
         assert_eq!(store.assets().read(&original).unwrap(), b"old png");
         assert_eq!(store.assets().read(&recaptured).unwrap(), b"new png");
+    }
+
+    #[test]
+    fn identical_captured_templates_get_independent_logical_identities() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+
+        let first = store.assets().put_png(b"same png").unwrap();
+        let second = store.assets().put_png(b"same png").unwrap();
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.revision, 1);
+        assert_eq!(second.revision, 1);
+        assert_eq!(first.content_hash, second.content_hash);
+        assert_eq!(
+            fs::read_dir(temp.path().join("macro_data/assets"))
+                .unwrap()
+                .count(),
+            1,
+            "content-addressed bytes remain deduplicated"
+        );
+    }
+
+    #[test]
+    fn stale_recap_fails_without_blocking_independent_template() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let first = store.assets().put_png(b"first").unwrap();
+        let independent = store.assets().put_png(b"independent").unwrap();
+        let next = store
+            .assets()
+            .put_next_png_revision(&first, b"first next")
+            .unwrap();
+
+        let stale = store
+            .assets()
+            .put_next_png_revision(&first, b"stale")
+            .unwrap_err();
+        assert!(stale.to_string().contains("stale template revision"));
+        let independent_next = store
+            .assets()
+            .put_next_png_revision(&independent, b"independent next")
+            .unwrap();
+
+        assert_eq!(next.revision, 2);
+        assert_eq!(independent_next.revision, 2);
+        assert_eq!(store.assets().read(&next).unwrap(), b"first next");
+    }
+
+    #[test]
+    fn recap_rejects_a_binding_whose_previous_bytes_are_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let missing = store.assets().put_png(b"will disappear").unwrap();
+        fs::remove_file(store.assets().path_for_hash(&missing.content_hash).unwrap()).unwrap();
+
+        let error = store
+            .assets()
+            .put_next_png_revision(&missing, b"must not publish")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("previous template bytes"));
+        let index = store.assets().load_index_locked().unwrap();
+        assert!(
+            !index
+                .bindings
+                .iter()
+                .any(|binding| binding.id == missing.id && binding.revision == 2)
+        );
+    }
+
+    #[test]
+    fn concurrent_recap_from_same_revision_publishes_exactly_one_successor() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let original = store.assets().put_png(b"original").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for bytes in [b"winner one".as_slice(), b"winner two".as_slice()] {
+            let store = store.clone();
+            let original = original.clone();
+            let barrier = Arc::clone(&barrier);
+            let bytes = bytes.to_vec();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.assets().put_next_png_revision(&original, &bytes)
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .any(|error| error.to_string().contains("stale template revision"))
+        );
     }
 
     #[test]

@@ -55,7 +55,7 @@ use xcap::Monitor;
 use super::super::{
     automation::{
         AtomicCaptureSnapshot, AtomicFrameCapture, AtomicFrameSnapshotSource, CaptureSource,
-        InputSink, MouseButton, StopSource, SystemClock,
+        InputSink, MouseButton, StopSource, SystemClock, TargetGuard, TargetSnapshot,
     },
     config::{MouseMovementModel, MouseMovementProfile, MouseMovementSample, MouseMovementStep},
     enchant_loop::OcrReader,
@@ -783,7 +783,34 @@ pub struct CapturedTargetProfile {
     pub dpi: u32,
 }
 
-pub fn resolve_target_from_selection(selection: Rect) -> Result<CapturedTargetProfile> {
+#[derive(Debug, Clone)]
+pub struct CapturedTargetBinding {
+    profile: CapturedTargetProfile,
+    expected: TargetSnapshot,
+    guard: WindowsTargetGuard,
+}
+
+impl CapturedTargetBinding {
+    pub fn profile(&self) -> &CapturedTargetProfile {
+        &self.profile
+    }
+
+    /// Brings the selected target forward, then revalidates its concrete HWND,
+    /// process instance and capture geometry. Only absolute movement is refreshed.
+    pub fn refresh_client_rect(&self) -> Result<Rect> {
+        let identity = CanonicalWindowIdentity::from_window_id(self.expected.window_id)?;
+        anyhow::ensure!(
+            unsafe { SetForegroundWindow(identity.hwnd()) }.as_bool(),
+            "failed to bring the selected target window to the foreground"
+        );
+        Ok(self
+            .guard
+            .refresh_authoring_snapshot(&self.expected)?
+            .client_rect)
+    }
+}
+
+pub fn resolve_target_from_selection(selection: Rect) -> Result<CapturedTargetBinding> {
     let center = POINT {
         x: selection.x + i32::try_from(selection.width / 2).unwrap_or(i32::MAX),
         y: selection.y + i32::try_from(selection.height / 2).unwrap_or(i32::MAX),
@@ -798,14 +825,35 @@ pub fn resolve_target_from_selection(selection: Rect) -> Result<CapturedTargetPr
         !root.is_invalid(),
         "failed to resolve the selected top-level window"
     );
+    anyhow::ensure!(
+        unsafe { SetForegroundWindow(root) }.as_bool(),
+        "failed to bring the selected target window to the foreground"
+    );
     let identity = CanonicalWindowIdentity::from_raw_hwnd(root.0 as isize)?;
     let snapshot = Win32WindowsSnapshotSource.snapshot(identity)?;
-    Ok(CapturedTargetProfile {
-        process_path: snapshot.process_path,
-        window_class: window_class(identity)?,
-        title: window_title(identity)?,
+    let window_class = window_class(identity)?;
+    let title = window_title(identity)?;
+    let profile = CapturedTargetProfile {
+        process_path: snapshot.process_path.clone(),
+        window_class: window_class.clone(),
+        title: title.clone(),
         client_rect: snapshot.client_rect,
         dpi: snapshot.dpi,
+    };
+    let guard = WindowsTargetGuard::from_window_id(
+        identity.window_id(),
+        DurableTargetHints {
+            process_path: snapshot.process_path.clone(),
+            window_class,
+            title_contains: title,
+        },
+    )?;
+    let expected = guard.snapshot()?;
+    guard.refresh_authoring_snapshot(&expected)?;
+    Ok(CapturedTargetBinding {
+        profile,
+        expected,
+        guard,
     })
 }
 

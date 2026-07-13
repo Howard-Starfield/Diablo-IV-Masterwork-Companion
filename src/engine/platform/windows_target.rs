@@ -105,6 +105,23 @@ impl WindowsTargetGuard {
         }
         Ok(())
     }
+
+    /// Revalidates a target selected for an authoring session while allowing only
+    /// a change in absolute client origin. Size, DPI, process instance, display,
+    /// visibility and foreground state remain fail-closed.
+    pub fn refresh_authoring_snapshot(&self, expected: &TargetSnapshot) -> Result<TargetSnapshot> {
+        let before = self.snapshot()?;
+        self.validate_hints(&before)?;
+        validate_authoring_target(expected, &before)?;
+        let after = self.snapshot()?;
+        self.validate_hints(&after)?;
+        validate_authoring_target(expected, &after)?;
+        anyhow::ensure!(
+            before == after,
+            "target changed while authoring request started"
+        );
+        Ok(after)
+    }
 }
 
 impl TargetGuard for WindowsTargetGuard {
@@ -124,6 +141,43 @@ impl TargetGuard for WindowsTargetGuard {
 
 pub fn validate_exact_target(expected: &TargetSnapshot, current: &TargetSnapshot) -> Result<()> {
     anyhow::ensure!(current == expected, "target identity or geometry changed");
+    anyhow::ensure!(current.is_visible, "target is not visible");
+    anyhow::ensure!(!current.is_minimized, "target is minimized");
+    anyhow::ensure!(current.is_foreground, "target is not foreground");
+    Ok(())
+}
+
+pub fn validate_authoring_target(
+    expected: &TargetSnapshot,
+    current: &TargetSnapshot,
+) -> Result<()> {
+    anyhow::ensure!(
+        current.window_id == expected.window_id,
+        "target HWND changed"
+    );
+    anyhow::ensure!(
+        current.process_id == expected.process_id
+            && current.process_started_at_100ns == expected.process_started_at_100ns
+            && current
+                .process_path
+                .eq_ignore_ascii_case(&expected.process_path),
+        "target process instance changed"
+    );
+    anyhow::ensure!(
+        current.window_revision == expected.window_revision,
+        "target window identity changed"
+    );
+    anyhow::ensure!(
+        current.client_rect.width == expected.client_rect.width
+            && current.client_rect.height == expected.client_rect.height,
+        "target client size changed"
+    );
+    anyhow::ensure!(current.dpi == expected.dpi, "target DPI changed");
+    anyhow::ensure!(
+        current.display_profile == expected.display_profile
+            && current.display_profile_revision == expected.display_profile_revision,
+        "target display profile changed"
+    );
     anyhow::ensure!(current.is_visible, "target is not visible");
     anyhow::ensure!(!current.is_minimized, "target is minimized");
     anyhow::ensure!(current.is_foreground, "target is not foreground");
@@ -192,5 +246,54 @@ mod tests {
         assert_eq!(guard.raw_hwnd_for_test(), 91);
         let json = serde_json::to_string(&hints).unwrap();
         assert!(!json.contains("91"));
+    }
+
+    #[test]
+    fn authoring_target_refresh_allows_only_absolute_window_movement() {
+        let expected = TargetSnapshot {
+            window_id: 91,
+            process_id: 7,
+            process_started_at_100ns: 100,
+            process_path: r#"C:\games\Diablo IV.exe"#.to_string(),
+            client_rect: Rect::new(10, 20, 800, 600),
+            window_revision: 1,
+            geometry_revision: 2,
+            dpi: 144,
+            display_profile: "display-a".to_string(),
+            display_profile_revision: 3,
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
+        };
+        let mut moved = expected.clone();
+        moved.client_rect.x = 210;
+        moved.client_rect.y = -40;
+        moved.geometry_revision = 4;
+        validate_authoring_target(&expected, &moved).unwrap();
+
+        for changed in [
+            {
+                let mut value = moved.clone();
+                value.process_started_at_100ns += 1;
+                value
+            },
+            {
+                let mut value = moved.clone();
+                value.client_rect.width += 1;
+                value
+            },
+            {
+                let mut value = moved.clone();
+                value.dpi += 1;
+                value
+            },
+            {
+                let mut value = moved.clone();
+                value.is_foreground = false;
+                value
+            },
+        ] {
+            assert!(validate_authoring_target(&expected, &changed).is_err());
+        }
     }
 }

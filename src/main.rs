@@ -23,25 +23,24 @@ use crate::engine::{
     config::{EnchantConfig, MouseMovementProfile, default_mouse_movement_profile},
     enchant_loop::{EnchantEvent, EnchantRunner, OcrReader, RegionCapture},
     macro_engine::{
-        AssetStore, ClusterPolicy, DEFAULT_MAX_SCORE_CELLS, ImageMatchConfig, ImageMatcher,
-        ImageRule, ImageRuleVerification, ImageRuleVerificationInput, Limit, MacroStore,
-        MatchSelectionPolicy, NegativeCorpusSample, NegativeSampleEvaluationInputs,
-        authoring_test_text_rule, cluster_peaks,
+        AssetStore, ClusterPolicy, DEFAULT_MAX_SCORE_CELLS, ImageMatchCandidate, ImageMatchConfig,
+        ImageMatchResult, ImageMatcher, ImageRule, ImageRuleVerification,
+        ImageRuleVerificationInput, MacroStore, NegativeCorpusSample,
+        NegativeSampleEvaluationInputs, authoring_test_text_rule, cluster_peaks,
     },
     matcher::{MatchResult, match_affix},
     platform::{
-        CaptureRequestId, EscStopSignal, MacroCaptureKind, MacroCaptureRequest,
-        MacroCaptureSelection, SendInputController, WindowsOcrReader, XcapRegionCapture,
-        enable_per_monitor_dpi_awareness, record_mouse_movement_profile,
+        CaptureRequestId, CapturedTargetBinding, EscStopSignal, MacroCaptureKind,
+        MacroCaptureRequest, MacroCaptureSelection, SendInputController, WindowsOcrReader,
+        XcapRegionCapture, enable_per_monitor_dpi_awareness, record_mouse_movement_profile,
         resolve_target_from_selection, select_macro_capture, select_screen_rect,
     },
     types::{PointRatio, Rect, RectRatio},
 };
-use crate::macro_ui::WIZARD_IMAGE_THRESHOLD;
 use crate::macro_ui::{
-    EditorAuthoringKind, EditorAuthoringOutcome, EditorAuthoringRequest, EditorAuthoringResult,
-    EditorDraft, MacroPage, MacroPageState, WizardAuthoringKind, WizardAuthoringOutcome,
-    WizardAuthoringRequest, WizardAuthoringResult, WizardDetector,
+    AuthoringSessionId, EditorAuthoringKind, EditorAuthoringOutcome, EditorAuthoringRequest,
+    EditorAuthoringResult, EditorDraft, MacroPage, MacroPageState, WizardAuthoringKind,
+    WizardAuthoringOutcome, WizardAuthoringRequest, WizardAuthoringResult, WizardDetector,
 };
 use eframe::{
     App, CreationContext,
@@ -224,7 +223,7 @@ enum UiEvent {
     BotFinished(anyhow::Result<()>),
     MacroAuthoringFinished {
         result: WizardAuthoringResult,
-        target_client: Option<Rect>,
+        target_binding: Option<CapturedTargetBinding>,
     },
     EditorAuthoringFinished(EditorAuthoringResult),
 }
@@ -305,8 +304,14 @@ struct NativeApp {
     stop_watcher_done: Option<Arc<AtomicBool>>,
     active_ocr_rect: Option<Rect>,
     dirty: bool,
-    macro_target_client: Option<Rect>,
+    macro_authoring_target: Option<NativeAuthoringTarget>,
     macro_store: Option<MacroStore>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeAuthoringTarget {
+    session: AuthoringSessionId,
+    binding: CapturedTargetBinding,
 }
 
 impl NativeApp {
@@ -340,7 +345,7 @@ impl NativeApp {
             stop_watcher_done: None,
             active_ocr_rect: None,
             dirty: migrated_config,
-            macro_target_client: None,
+            macro_authoring_target: None,
             macro_store,
         }
     }
@@ -404,7 +409,11 @@ impl NativeApp {
         let Some(wizard) = self.macro_state.wizard.clone() else {
             return;
         };
-        let target_client = self.macro_target_client;
+        let target_binding = self
+            .macro_authoring_target
+            .as_ref()
+            .filter(|target| target.session == request.session)
+            .map(|target| target.binding.clone());
         let assets = self
             .macro_store
             .as_ref()
@@ -414,8 +423,9 @@ impl NativeApp {
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
             let (outcome, captured_target) =
-                run_macro_authoring_request(&request, &wizard, target_client, assets);
+                run_macro_authoring_request(&request, &wizard, target_binding, assets);
             let result = WizardAuthoringResult {
+                session: request.session,
                 id: request.id,
                 fingerprint: request.fingerprint,
                 outcome,
@@ -425,7 +435,7 @@ impl NativeApp {
                 &repaint,
                 UiEvent::MacroAuthoringFinished {
                     result,
-                    target_client: captured_target,
+                    target_binding: captured_target,
                 },
             );
         });
@@ -435,7 +445,11 @@ impl NativeApp {
         let Some(draft) = self.macro_state.draft.clone() else {
             return;
         };
-        let target_client = self.macro_target_client;
+        let target_binding = self
+            .macro_authoring_target
+            .as_ref()
+            .filter(|target| target.session == request.session)
+            .map(|target| target.binding.clone());
         let assets = self
             .macro_store
             .as_ref()
@@ -444,11 +458,12 @@ impl NativeApp {
         let repaint = self.egui_ctx.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
-            let outcome = run_editor_authoring_request(&request, &draft, target_client, assets);
+            let outcome = run_editor_authoring_request(&request, &draft, target_binding, assets);
             send_ui_event(
                 &tx,
                 &repaint,
                 UiEvent::EditorAuthoringFinished(EditorAuthoringResult {
+                    session: request.session,
                     id: request.id,
                     fingerprint: request.fingerprint,
                     outcome,
@@ -596,13 +611,15 @@ impl NativeApp {
                 }
                 UiEvent::MacroAuthoringFinished {
                     result,
-                    target_client,
+                    target_binding,
                 } => {
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    let session = result.session;
                     match self.macro_state.apply_wizard_result(result) {
                         Ok(()) => {
-                            if let Some(target_client) = target_client {
-                                self.macro_target_client = Some(target_client);
+                            if let Some(binding) = target_binding {
+                                self.macro_authoring_target =
+                                    Some(NativeAuthoringTarget { session, binding });
                             }
                         }
                         Err(error) => {
@@ -1471,30 +1488,84 @@ fn test_ocr(config: EnchantConfig) -> anyhow::Result<TestOcrResult> {
     })
 }
 
+fn select_authoring_image_match(
+    candidates: Vec<ImageMatchCandidate>,
+    rule: &ImageRule,
+) -> anyhow::Result<ImageMatchResult> {
+    Ok(ImageMatchResult::select(
+        cluster_peaks(candidates, ClusterPolicy::default())?,
+        rule,
+    ))
+}
+
+fn match_authoring_image(
+    image: &crate::engine::types::ScreenImage,
+    capture_rect: Rect,
+    template: &image::GrayImage,
+    mask: Option<&image::GrayImage>,
+    rule: &ImageRule,
+) -> anyhow::Result<(crate::engine::macro_engine::RawImageMatch, ImageMatchResult)> {
+    let raw = ImageMatcher.match_screen_image_masked(
+        image,
+        capture_rect,
+        template,
+        mask,
+        &ImageMatchConfig {
+            threshold: rule.threshold,
+            scales_percent: rule.scales_percent.clone(),
+        },
+    )?;
+    let selected = select_authoring_image_match(raw.candidates.clone(), rule)?;
+    Ok((raw, selected))
+}
+
+fn require_stable_authoring_client(before: Rect, after: Rect) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        before == after,
+        "target client moved while the authoring capture was in progress; retry the capture"
+    );
+    Ok(())
+}
+
+fn native_wizard_image_rule(wizard: &crate::macro_ui::WizardState) -> anyhow::Result<ImageRule> {
+    let mut rule = wizard
+        .image_rule_for_authoring()
+        .ok_or_else(|| anyhow::anyhow!("wizard image rule is unavailable"))?;
+    rule.verification = None;
+    Ok(rule)
+}
+
 fn run_macro_authoring_request(
     request: &WizardAuthoringRequest,
     wizard: &crate::macro_ui::WizardState,
-    target_client: Option<Rect>,
+    target_binding: Option<CapturedTargetBinding>,
     assets: Option<AssetStore>,
-) -> (WizardAuthoringOutcome, Option<Rect>) {
-    let run = || -> anyhow::Result<(WizardAuthoringOutcome, Option<Rect>)> {
+) -> (WizardAuthoringOutcome, Option<CapturedTargetBinding>) {
+    let run = || -> anyhow::Result<(WizardAuthoringOutcome, Option<CapturedTargetBinding>)> {
         if request.kind == WizardAuthoringKind::CaptureTarget {
             let selection = select_screen_rect(40)?;
-            let target = resolve_target_from_selection(selection)?;
+            let binding = resolve_target_from_selection(selection)?;
+            let target = binding.profile();
             return Ok((
                 WizardAuthoringOutcome::TargetGeometry {
-                    process_path: target.process_path,
-                    window_class: target.window_class,
-                    title: target.title,
+                    process_path: target.process_path.clone(),
+                    window_class: target.window_class.clone(),
+                    title: target.title.clone(),
                     width: target.client_rect.width,
                     height: target.client_rect.height,
                     dpi: target.dpi,
                 },
-                Some(target.client_rect),
+                Some(binding),
             ));
         }
-        let target = target_client
-            .ok_or_else(|| anyhow::anyhow!("capture the concrete target window region first"))?;
+        let target = target_binding
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "capture the concrete target window first for this authoring session"
+                )
+            })?
+            .refresh_client_rect()?;
         if matches!(
             request.kind,
             WizardAuthoringKind::TestDetector | WizardAuthoringKind::CaptureImageNegative
@@ -1503,6 +1574,13 @@ fn run_macro_authoring_request(
             let started = Instant::now();
             let capture = XcapRegionCapture;
             let image = RegionCapture::capture_region(&capture, capture_rect)?;
+            require_stable_authoring_client(
+                target,
+                target_binding
+                    .as_ref()
+                    .expect("target binding checked above")
+                    .refresh_client_rect()?,
+            )?;
             return match &wizard.detector {
                 WizardDetector::Text => {
                     anyhow::ensure!(
@@ -1536,32 +1614,13 @@ fn run_macro_authoring_request(
                     let template_bytes = store.read(template)?;
                     let template_image =
                         ImageRuleVerification::decode_template_png(&template_bytes)?;
-                    let config = ImageMatchConfig {
-                        threshold: WIZARD_IMAGE_THRESHOLD,
-                        scales_percent: vec![95, 100, 105],
-                    };
-                    let result = ImageMatcher.match_screen_image(
-                        &image,
-                        capture_rect,
-                        &template_image,
-                        &config,
-                    )?;
-                    let rule = ImageRule {
-                        id: "image-rule".into(),
-                        revision: 1,
-                        region_id: "detect-region".into(),
-                        template: template.clone(),
-                        transparent_mask: None,
-                        threshold: WIZARD_IMAGE_THRESHOLD,
-                        scales_percent: vec![95, 100, 105],
-                        stable_frames: 2,
-                        maximum_center_drift_px: 5,
-                        minimum_runner_up_margin: 0.05,
-                        verification: None,
-                        match_policy: MatchSelectionPolicy::ExactlyOne,
-                        poll_interval_ms: 100,
-                        timeout_ms: Limit::Unlimited,
-                    };
+                    let rule = native_wizard_image_rule(wizard)?;
+                    anyhow::ensure!(
+                        rule.template == *template,
+                        "wizard image template changed before the authoring request"
+                    );
+                    let (result, selected) =
+                        match_authoring_image(&image, capture_rect, &template_image, None, &rule)?;
                     if request.kind == WizardAuthoringKind::CaptureImageNegative {
                         anyhow::ensure!(
                             result.candidates.is_empty(),
@@ -1583,37 +1642,38 @@ fn run_macro_authoring_request(
                         };
                         return Ok((WizardAuthoringOutcome::ImageNegativeSample(sample), None));
                     }
-                    let passed = !result.candidates.is_empty();
-                    let verification = if passed && !wizard.image_negative_samples.is_empty() {
-                        let clusters =
-                            cluster_peaks(result.candidates.clone(), ClusterPolicy::default())?;
-                        Some(
-                            ImageRuleVerification::verify(ImageRuleVerificationInput {
-                                rule: &rule,
-                                template: &template_image,
-                                mask: None,
-                                captured_dpi: wizard.target.captured_dpi,
-                                current_dpi: wizard.target.captured_dpi,
-                                region_revision: 1,
-                                search_dimensions: (capture_rect.width, capture_rect.height),
-                                negative_samples: &wizard.image_negative_samples,
-                                observed_clusters: &clusters,
-                                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
-                            })?
-                            .into_artifact(),
-                        )
-                    } else {
-                        None
-                    };
+                    let verification =
+                        if selected.matched && !wizard.image_negative_samples.is_empty() {
+                            Some(
+                                ImageRuleVerification::verify(ImageRuleVerificationInput {
+                                    rule: &rule,
+                                    template: &template_image,
+                                    mask: None,
+                                    captured_dpi: wizard.target.captured_dpi,
+                                    current_dpi: wizard.target.captured_dpi,
+                                    region_revision: 1,
+                                    search_dimensions: (capture_rect.width, capture_rect.height),
+                                    negative_samples: &wizard.image_negative_samples,
+                                    observed_clusters: &selected.clusters,
+                                    maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+                                })?
+                                .into_artifact(),
+                            )
+                        } else {
+                            None
+                        };
                     Ok((
                         WizardAuthoringOutcome::DetectorTest {
-                            passed: passed && verification.is_some(),
+                            passed: selected.matched && verification.is_some(),
                             evidence: format!(
-                                "best {:.3}; {} candidate(s); {}",
+                                "best {:.3}; {} candidate(s), {} cluster(s); {}",
                                 result.best.score,
                                 result.candidates.len(),
+                                selected.clusters.len(),
                                 if verification.is_some() {
                                     "local verification passed"
+                                } else if !selected.matched {
+                                    "configured image selection policy did not select a match"
                                 } else {
                                     "capture at least one explicit negative sample"
                                 }
@@ -1647,6 +1707,13 @@ fn run_macro_authoring_request(
                 4
             },
         })?;
+        require_stable_authoring_client(
+            target,
+            target_binding
+                .as_ref()
+                .expect("target binding checked above")
+                .refresh_client_rect()?,
+        )?;
         let outcome = match response.selection {
             MacroCaptureSelection::Region(rect) => WizardAuthoringOutcome::Region(rect),
             MacroCaptureSelection::Point(point) => WizardAuthoringOutcome::Point(point),
@@ -1659,6 +1726,13 @@ fn run_macro_authoring_request(
                     .ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
                 let capture = XcapRegionCapture;
                 let captured = RegionCapture::capture_region(&capture, screen_rect)?;
+                require_stable_authoring_client(
+                    target,
+                    target_binding
+                        .as_ref()
+                        .expect("target binding checked above")
+                        .refresh_client_rect()?,
+                )?;
                 let mut bytes = Vec::new();
                 DynamicImage::ImageRgba8(captured.rgba)
                     .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
@@ -1686,12 +1760,16 @@ fn run_macro_authoring_request(
 fn run_editor_authoring_request(
     request: &EditorAuthoringRequest,
     draft: &EditorDraft,
-    target_client: Option<Rect>,
+    target_binding: Option<CapturedTargetBinding>,
     assets: Option<AssetStore>,
 ) -> EditorAuthoringOutcome {
     let run = || -> anyhow::Result<EditorAuthoringOutcome> {
-        let target = target_client
-            .ok_or_else(|| anyhow::anyhow!("capture a concrete wizard target first"))?;
+        let target = target_binding
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("capture a concrete target for this authoring session first")
+            })?
+            .refresh_client_rect()?;
         match &request.kind {
             EditorAuthoringKind::RecaptureRegion { region_id } => {
                 let kind = if draft
@@ -1709,6 +1787,13 @@ fn run_editor_authoring_request(
                     target_client: target,
                     min_size: 4,
                 })?;
+                require_stable_authoring_client(
+                    target,
+                    target_binding
+                        .as_ref()
+                        .expect("target binding checked above")
+                        .refresh_client_rect()?,
+                )?;
                 let MacroCaptureSelection::Region(rect) = response.selection else {
                     anyhow::bail!("region capture returned the wrong result type")
                 };
@@ -1726,11 +1811,25 @@ fn run_editor_authoring_request(
                     target_client: target,
                     min_size: 4,
                 })?;
+                require_stable_authoring_client(
+                    target,
+                    target_binding
+                        .as_ref()
+                        .expect("target binding checked above")
+                        .refresh_client_rect()?,
+                )?;
                 let MacroCaptureSelection::TemplateCrop { screen_rect, .. } = response.selection
                 else {
                     anyhow::bail!("template capture returned the wrong result type")
                 };
                 let captured = RegionCapture::capture_region(&XcapRegionCapture, screen_rect)?;
+                require_stable_authoring_client(
+                    target,
+                    target_binding
+                        .as_ref()
+                        .expect("target binding checked above")
+                        .refresh_client_rect()?,
+                )?;
                 let mut bytes = Vec::new();
                 DynamicImage::ImageRgba8(captured.rgba)
                     .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
@@ -1759,6 +1858,13 @@ fn run_editor_authoring_request(
                 let started = Instant::now();
                 let capture_rect = target.rect_from_ratio(region.rect);
                 let image = RegionCapture::capture_region(&XcapRegionCapture, capture_rect)?;
+                require_stable_authoring_client(
+                    target,
+                    target_binding
+                        .as_ref()
+                        .expect("target binding checked above")
+                        .refresh_client_rect()?,
+                )?;
                 let tested = authoring_test_text_rule(&image, capture_rect, rule)?;
                 let evidence = tested
                     .words
@@ -1797,18 +1903,27 @@ fn run_editor_authoring_request(
                     .ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
                 let template =
                     ImageRuleVerification::decode_template_png(&store.read(&rule.template)?)?;
+                let mask = rule
+                    .transparent_mask
+                    .as_ref()
+                    .map(|asset| {
+                        store
+                            .read(asset)
+                            .and_then(|bytes| ImageRuleVerification::decode_mask_png(&bytes))
+                    })
+                    .transpose()?;
                 let started = Instant::now();
                 let capture_rect = target.rect_from_ratio(region.rect);
                 let image = RegionCapture::capture_region(&XcapRegionCapture, capture_rect)?;
-                let result = ImageMatcher.match_screen_image(
-                    &image,
-                    capture_rect,
-                    &template,
-                    &ImageMatchConfig {
-                        threshold: rule.threshold,
-                        scales_percent: rule.scales_percent.clone(),
-                    },
+                require_stable_authoring_client(
+                    target,
+                    target_binding
+                        .as_ref()
+                        .expect("target binding checked above")
+                        .refresh_client_rect()?,
                 )?;
+                let (result, selected) =
+                    match_authoring_image(&image, capture_rect, &template, mask.as_ref(), rule)?;
                 if matches!(
                     &request.kind,
                     EditorAuthoringKind::CaptureImageNegative { .. }
@@ -1835,35 +1950,37 @@ fn run_editor_authoring_request(
                         },
                     });
                 }
-                let clusters = cluster_peaks(result.candidates.clone(), ClusterPolicy::default())?;
-                let verification =
-                    if !clusters.is_empty() && !request.image_negative_samples.is_empty() {
-                        Some(
-                            ImageRuleVerification::verify(ImageRuleVerificationInput {
-                                rule,
-                                template: &template,
-                                mask: None,
-                                captured_dpi: draft.target.captured_dpi,
-                                current_dpi: draft.target.captured_dpi,
-                                region_revision: region.revision,
-                                search_dimensions: (capture_rect.width, capture_rect.height),
-                                negative_samples: &request.image_negative_samples,
-                                observed_clusters: &clusters,
-                                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
-                            })?
-                            .into_artifact(),
-                        )
-                    } else {
-                        None
-                    };
+                let verification = if selected.matched && !request.image_negative_samples.is_empty()
+                {
+                    Some(
+                        ImageRuleVerification::verify(ImageRuleVerificationInput {
+                            rule,
+                            template: &template,
+                            mask: mask.as_ref(),
+                            captured_dpi: draft.target.captured_dpi,
+                            current_dpi: draft.target.captured_dpi,
+                            region_revision: region.revision,
+                            search_dimensions: (capture_rect.width, capture_rect.height),
+                            negative_samples: &request.image_negative_samples,
+                            observed_clusters: &selected.clusters,
+                            maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+                        })?
+                        .into_artifact(),
+                    )
+                } else {
+                    None
+                };
                 Ok(EditorAuthoringOutcome::DetectorTest {
-                    passed: verification.is_some(),
+                    passed: selected.matched && verification.is_some(),
                     evidence: format!(
-                        "best {:.3}; {} candidate(s); {}",
+                        "best {:.3}; {} candidate(s), {} cluster(s); {}",
                         result.best.score,
                         result.candidates.len(),
+                        selected.clusters.len(),
                         if verification.is_some() {
                             "local verification passed"
+                        } else if !selected.matched {
+                            "configured image selection policy did not select a match"
                         } else {
                             "capture a negative frame"
                         }
@@ -2015,6 +2132,30 @@ fn save_native_config(path: &PathBuf, config: &NativeConfig) -> anyhow::Result<(
 #[cfg(test)]
 mod routing_tests {
     use super::*;
+    use crate::engine::macro_engine::{Limit, MatchSelectionPolicy};
+
+    fn authoring_image_rule() -> ImageRule {
+        ImageRule {
+            id: "image-rule".into(),
+            revision: 1,
+            region_id: "region".into(),
+            template: crate::engine::macro_engine::AssetRef {
+                id: "template".into(),
+                revision: 1,
+                content_hash: "0".repeat(64),
+            },
+            transparent_mask: None,
+            threshold: 0.95,
+            scales_percent: vec![100],
+            stable_frames: 1,
+            maximum_center_drift_px: 5,
+            minimum_runner_up_margin: 0.0,
+            verification: None,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 100,
+            timeout_ms: Limit::Unlimited,
+        }
+    }
 
     #[test]
     fn each_page_owns_one_distinct_fixed_bottom_surface() {
@@ -2024,5 +2165,78 @@ mod routing_tests {
         );
         assert_eq!(bottom_surface(AppPage::Macro), BottomSurface::MacroMonitor);
         assert!(MacroPage::MONITOR_HEIGHT < APP_HEIGHT / 3.0);
+    }
+
+    #[test]
+    fn authoring_exactly_one_rejects_multiple_visual_clusters() {
+        let candidates = vec![
+            ImageMatchCandidate {
+                rect: Rect::new(10, 10, 8, 8),
+                score: 0.99,
+                scale_percent: 100,
+            },
+            ImageMatchCandidate {
+                rect: Rect::new(80, 10, 8, 8),
+                score: 0.98,
+                scale_percent: 100,
+            },
+        ];
+
+        let selected = select_authoring_image_match(candidates, &authoring_image_rule()).unwrap();
+
+        assert_eq!(selected.clusters.len(), 2);
+        assert!(!selected.matched);
+        assert!(selected.selected.is_none());
+    }
+
+    #[test]
+    fn authoring_capture_bracket_rejects_a_window_move() {
+        let before = Rect::new(10, 20, 800, 600);
+        require_stable_authoring_client(before, before).unwrap();
+        let error =
+            require_stable_authoring_client(before, Rect::new(11, 20, 800, 600)).unwrap_err();
+        assert!(error.to_string().contains("moved while"));
+    }
+
+    #[test]
+    fn native_wizard_matching_uses_the_canonical_emitted_image_rule() {
+        let mut wizard = crate::macro_ui::WizardState::default();
+        wizard.detector = WizardDetector::Image {
+            template: authoring_image_rule().template,
+        };
+        let mut canonical = wizard.image_rule_for_authoring().unwrap();
+        canonical.verification = None;
+
+        assert_eq!(native_wizard_image_rule(&wizard).unwrap(), canonical);
+        assert_eq!(canonical.maximum_center_drift_px, 3);
+    }
+
+    #[test]
+    fn editor_authoring_match_uses_the_pinned_transparent_mask() {
+        use image::{GrayImage, Luma, Rgba, RgbaImage};
+
+        let template = GrayImage::from_fn(4, 4, |x, y| Luma([(x * 40 + y * 11) as u8]));
+        let mask = GrayImage::from_fn(4, 4, |x, _| Luma([if x == 0 { 0 } else { 255 }]));
+        let rgba = RgbaImage::from_fn(4, 4, |x, y| {
+            let value = if x == 0 {
+                255_u8.saturating_sub(template.get_pixel(x, y)[0])
+            } else {
+                template.get_pixel(x, y)[0]
+            };
+            Rgba([value, value, value, 255])
+        });
+        let image = crate::engine::types::ScreenImage::new(rgba);
+
+        let (_, selected) = match_authoring_image(
+            &image,
+            Rect::new(0, 0, 4, 4),
+            &template,
+            Some(&mask),
+            &authoring_image_rule(),
+        )
+        .unwrap();
+
+        assert!(selected.matched);
+        assert_eq!(selected.clusters.len(), 1);
     }
 }

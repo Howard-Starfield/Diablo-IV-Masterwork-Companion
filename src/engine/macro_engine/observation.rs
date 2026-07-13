@@ -134,6 +134,10 @@ pub trait ConditionDetector: Send + Sync {
         request: &ObservationRequest<'_>,
         capture: &(dyn CaptureSource + Send + Sync),
     ) -> Result<DetectorEvidence>;
+
+    /// Releases detector state owned by every generation actually observed by one completed run.
+    /// Implementations must not affect other runs or generations absent from this slice.
+    fn run_finished(&self, _run_id: &str, _generations: &[u64]) {}
 }
 
 #[derive(Debug, Default)]

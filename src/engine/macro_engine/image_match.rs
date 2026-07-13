@@ -10,9 +10,9 @@ use sha2::{Digest, Sha256};
 use crate::engine::automation::CaptureSource;
 
 use super::{
-    Condition, ConditionDetector, DetectorEvidence, IMAGE_RULE_VERIFICATION_VERSION, ImageRule,
-    ImageRuleVerificationArtifact, ImageVerificationPreprocess, MacroDefinition,
-    MatchSelectionPolicy, ObservationRequest,
+    Condition, ConditionDetector, DetectorEvidence, ImageRule, ImageRuleVerificationArtifact,
+    ImageVerificationPreprocess, MacroDefinition, MatchSelectionPolicy, ObservationRequest,
+    image_verification as verification,
 };
 
 /// Authoring starts here, but every rule must retain its own verified threshold.
@@ -21,177 +21,8 @@ pub const INITIAL_SIMILARITY_THRESHOLD: f32 = 0.95;
 /// Task 14 may lower this score-cell budget after named-hardware release benchmarks.
 pub const DEFAULT_MAX_SCORE_CELLS: u64 = 750_000;
 /// Grayscale intensity variance below this value is too flat for safe correlation.
-const MIN_TEMPLATE_VARIANCE: f32 = 16.0;
+pub(super) const MIN_TEMPLATE_VARIANCE: f32 = 16.0;
 const DEFAULT_MAX_STABILITY_STATES: usize = 256;
-
-pub(crate) mod verification {
-    use super::*;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum BindingProblem {
-        Missing,
-        InvalidMargin,
-        InvalidScore,
-        InvalidProvenance,
-        Stale,
-    }
-
-    #[derive(Serialize)]
-    struct FingerprintBinding<'a> {
-        version: u32,
-        preprocess: ImageVerificationPreprocess,
-        rule_id: &'a str,
-        rule_revision: u64,
-        template: &'a super::super::AssetRef,
-        transparent_mask: &'a Option<super::super::AssetRef>,
-        captured_dpi: u32,
-        region_id: &'a str,
-        region_revision: u64,
-        search_width: u32,
-        search_height: u32,
-        scales_percent: &'a [u16],
-        threshold: f32,
-        minimum_runner_up_margin: f32,
-        negative_corpus_sha256: &'a str,
-        negative_sample_count: u64,
-        best_negative_score: f32,
-        active_mask_variance: f32,
-    }
-
-    pub(crate) fn normalized_score(value: f32) -> bool {
-        value.is_finite() && (0.0..=1.0).contains(&value)
-    }
-
-    pub(crate) fn valid_sha256(value: &str) -> bool {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }
-
-    pub(crate) fn fingerprint(artifact: &ImageRuleVerificationArtifact) -> String {
-        let binding = FingerprintBinding {
-            version: artifact.version,
-            preprocess: artifact.preprocess,
-            rule_id: &artifact.rule_id,
-            rule_revision: artifact.rule_revision,
-            template: &artifact.template,
-            transparent_mask: &artifact.transparent_mask,
-            captured_dpi: artifact.captured_dpi,
-            region_id: &artifact.region_id,
-            region_revision: artifact.region_revision,
-            search_width: artifact.search_width,
-            search_height: artifact.search_height,
-            scales_percent: &artifact.scales_percent,
-            threshold: artifact.threshold,
-            minimum_runner_up_margin: artifact.minimum_runner_up_margin,
-            negative_corpus_sha256: &artifact.negative_corpus_sha256,
-            negative_sample_count: artifact.negative_sample_count,
-            best_negative_score: artifact.best_negative_score,
-            active_mask_variance: artifact.active_mask_variance,
-        };
-        let bytes = serde_json::to_vec(&binding)
-            .expect("verification fingerprint binding contains only serializable values");
-        format!("{:x}", Sha256::digest(bytes))
-    }
-
-    pub(crate) fn validate_binding<'a>(
-        definition: &MacroDefinition,
-        rule: &'a ImageRule,
-    ) -> std::result::Result<&'a ImageRuleVerificationArtifact, BindingProblem> {
-        if !normalized_score(rule.minimum_runner_up_margin) {
-            return Err(BindingProblem::InvalidMargin);
-        }
-        if !normalized_score(rule.threshold) {
-            return Err(BindingProblem::InvalidScore);
-        }
-        let artifact = rule.verification.as_ref().ok_or(BindingProblem::Missing)?;
-        if !normalized_score(artifact.threshold)
-            || !normalized_score(artifact.minimum_runner_up_margin)
-            || !normalized_score(artifact.best_negative_score)
-            || !artifact.active_mask_variance.is_finite()
-            || artifact.active_mask_variance < MIN_TEMPLATE_VARIANCE
-        {
-            return Err(BindingProblem::InvalidScore);
-        }
-        if !valid_sha256(&artifact.negative_corpus_sha256)
-            || artifact.negative_sample_count == 0
-            || !valid_sha256(&artifact.verification_fingerprint_sha256)
-        {
-            return Err(BindingProblem::InvalidProvenance);
-        }
-        if artifact.threshold - artifact.best_negative_score < artifact.minimum_runner_up_margin {
-            return Err(BindingProblem::InvalidScore);
-        }
-        if fingerprint(artifact) != artifact.verification_fingerprint_sha256 {
-            return Err(BindingProblem::Stale);
-        }
-        let Some(region) = definition
-            .regions
-            .iter()
-            .find(|region| region.id == rule.region_id)
-        else {
-            return Err(BindingProblem::Stale);
-        };
-        let client = Rect::new(
-            0,
-            0,
-            definition.target.captured_client_width,
-            definition.target.captured_client_height,
-        );
-        let search = client.rect_from_ratio(region.rect);
-        let current = artifact.version == IMAGE_RULE_VERIFICATION_VERSION
-            && artifact.preprocess
-                == ImageVerificationPreprocess::GrayscaleNormalizedCrossCorrelation
-            && artifact.rule_id == rule.id
-            && artifact.rule_revision == rule.revision
-            && artifact.template == rule.template
-            && artifact.transparent_mask == rule.transparent_mask
-            && artifact.captured_dpi == definition.target.captured_dpi
-            && artifact.region_id == region.id
-            && artifact.region_revision == region.revision
-            && artifact.search_width == search.width
-            && artifact.search_height == search.height
-            && artifact.scales_percent == rule.scales_percent
-            && artifact.threshold == rule.threshold
-            && artifact.minimum_runner_up_margin == rule.minimum_runner_up_margin;
-        current.then_some(artifact).ok_or(BindingProblem::Stale)
-    }
-
-    pub(crate) fn validate_decoded_rule(
-        definition: &MacroDefinition,
-        rule: &ImageRule,
-        template: &GrayImage,
-        mask: Option<&GrayImage>,
-    ) -> Result<()> {
-        let artifact = validate_binding(definition, rule).map_err(|problem| {
-            anyhow::anyhow!("image verification binding is invalid: {problem:?}")
-        })?;
-        let mask = validate_mask_reference(rule, template, mask).map_err(anyhow::Error::new)?;
-        let variance = template_variance(template, mask);
-        if !variance.is_finite() || variance < MIN_TEMPLATE_VARIANCE {
-            bail!(
-                "template variance {variance} is below {}",
-                MIN_TEMPLATE_VARIANCE
-            );
-        }
-        if variance != artifact.active_mask_variance {
-            bail!(
-                "template variance {variance} does not match verified variance {}",
-                artifact.active_mask_variance
-            );
-        }
-        let score_cells = estimate_score_cells(
-            (artifact.search_width, artifact.search_height),
-            template.dimensions(),
-            &rule.scales_percent,
-        );
-        if score_cells > DEFAULT_MAX_SCORE_CELLS {
-            bail!("image score-map work {score_cells} exceeds maximum {DEFAULT_MAX_SCORE_CELLS}");
-        }
-        Ok(())
-    }
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageMatchConfig {
@@ -408,13 +239,13 @@ impl ImageDetector {
         }
     }
 
-    pub fn clear_run(&self, run_id: &str) -> Result<usize> {
+    fn clear_run_generations(&self, run_id: &str, generations: &[u64]) -> Result<usize> {
         let mut stability = self
             .stability
             .lock()
             .map_err(|_| anyhow::anyhow!("image detector stability lock is poisoned"))?;
         let before = stability.len();
-        stability.retain(|key, _| key.run_id != run_id);
+        stability.retain(|key, _| key.run_id != run_id || !generations.contains(&key.generation));
         Ok(before - stability.len())
     }
 
@@ -568,6 +399,10 @@ impl ConditionDetector for ImageDetector {
             Condition::Text { .. } => bail!("image detector cannot observe a text condition"),
         }
     }
+
+    fn run_finished(&self, run_id: &str, generations: &[u64]) {
+        let _ = self.clear_run_generations(run_id, generations);
+    }
 }
 
 fn decode_gray_asset(
@@ -696,21 +531,108 @@ pub struct ImageRuleVerificationInput<'a> {
     pub current_dpi: u32,
     pub region_revision: u64,
     pub search_dimensions: (u32, u32),
-    pub negative_corpus_sha256: &'a str,
-    pub negative_sample_count: u64,
-    pub best_negative_score: f32,
+    pub negative_samples: &'a [NegativeCorpusSample],
     pub observed_clusters: &'a [CandidateCluster],
     pub maximum_score_cells: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NegativeSampleEvaluationInputs {
+    pub preprocess: ImageVerificationPreprocess,
+    pub template: super::AssetRef,
+    pub transparent_mask: Option<super::AssetRef>,
+    pub captured_dpi: u32,
+    pub region_id: String,
+    pub region_revision: u64,
+    pub search_width: u32,
+    pub search_height: u32,
+    pub scales_percent: Vec<u16>,
+    pub threshold: f32,
+    pub minimum_runner_up_margin: f32,
+}
+
+impl NegativeSampleEvaluationInputs {
+    pub fn for_rule(
+        rule: &ImageRule,
+        captured_dpi: u32,
+        region_revision: u64,
+        search_dimensions: (u32, u32),
+    ) -> Self {
+        Self {
+            preprocess: ImageVerificationPreprocess::GrayscaleNormalizedCrossCorrelation,
+            template: rule.template.clone(),
+            transparent_mask: rule.transparent_mask.clone(),
+            captured_dpi,
+            region_id: rule.region_id.clone(),
+            region_revision,
+            search_width: search_dimensions.0,
+            search_height: search_dimensions.1,
+            scales_percent: rule.scales_percent.clone(),
+            threshold: rule.threshold,
+            minimum_runner_up_margin: rule.minimum_runner_up_margin,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NegativeCorpusSample {
+    pub stable_id: String,
+    pub content_sha256: String,
+    pub measured_score: f32,
+    pub evaluation: NegativeSampleEvaluationInputs,
+}
+
+#[derive(Serialize)]
+struct CanonicalNegativeCorpus<'a> {
+    version: u32,
+    samples: &'a [NegativeCorpusSample],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct VerifiedNegativeCorpus {
+    sha256: String,
+    sample_count: u64,
+    best_score: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageRuleVerification {
-    pub threshold: f32,
-    pub template_variance: f32,
-    pub negative_margin: f32,
-    pub ambiguity_margin: Option<f32>,
-    pub score_cells: u64,
-    pub artifact: ImageRuleVerificationArtifact,
+    threshold: f32,
+    template_variance: f32,
+    negative_margin: f32,
+    ambiguity_margin: Option<f32>,
+    score_cells: u64,
+    artifact: ImageRuleVerificationArtifact,
+}
+
+impl ImageRuleVerification {
+    pub fn threshold(&self) -> f32 {
+        self.threshold
+    }
+
+    pub fn template_variance(&self) -> f32 {
+        self.template_variance
+    }
+
+    pub fn negative_margin(&self) -> f32 {
+        self.negative_margin
+    }
+
+    pub fn ambiguity_margin(&self) -> Option<f32> {
+        self.ambiguity_margin
+    }
+
+    pub fn score_cells(&self) -> u64 {
+        self.score_cells
+    }
+
+    pub fn artifact(&self) -> &ImageRuleVerificationArtifact {
+        &self.artifact
+    }
+
+    pub fn into_artifact(self) -> ImageRuleVerificationArtifact {
+        self.artifact
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -723,6 +645,14 @@ pub enum ImageRuleVerificationError {
     InvalidNegativeScore,
     #[error("negative corpus must have a canonical lowercase SHA-256 and at least one sample")]
     InvalidNegativeCorpus,
+    #[error("negative sample stable ID is invalid: {stable_id}")]
+    InvalidNegativeSampleId { stable_id: String },
+    #[error("negative sample {stable_id} has an invalid content SHA-256")]
+    InvalidNegativeSampleHash { stable_id: String },
+    #[error("negative sample stable ID is duplicated: {stable_id}")]
+    DuplicateNegativeSample { stable_id: String },
+    #[error("negative sample {stable_id} was evaluated with different inputs")]
+    NegativeSampleEvaluationMismatch { stable_id: String },
     #[error("configured transparent mask asset is missing")]
     MissingMask,
     #[error("transparent mask is invalid: {reason}")]
@@ -749,14 +679,13 @@ impl ImageRuleVerification {
         if !verification::normalized_score(input.rule.minimum_runner_up_margin) {
             return Err(ImageRuleVerificationError::InvalidRunnerUpMargin);
         }
-        if !verification::normalized_score(input.best_negative_score) {
-            return Err(ImageRuleVerificationError::InvalidNegativeScore);
-        }
-        if !verification::valid_sha256(input.negative_corpus_sha256)
-            || input.negative_sample_count == 0
-        {
-            return Err(ImageRuleVerificationError::InvalidNegativeCorpus);
-        }
+        let negative_corpus = verify_negative_corpus(
+            input.rule,
+            input.captured_dpi,
+            input.region_revision,
+            input.search_dimensions,
+            input.negative_samples,
+        )?;
         let mask = validate_mask_reference(input.rule, input.template, input.mask)?;
         let variance = template_variance(input.template, mask);
         if variance < MIN_TEMPLATE_VARIANCE {
@@ -782,7 +711,7 @@ impl ImageRuleVerification {
                 maximum: input.maximum_score_cells,
             });
         }
-        let negative_margin = input.rule.threshold - input.best_negative_score;
+        let negative_margin = input.rule.threshold - negative_corpus.best_score;
         if negative_margin < input.rule.minimum_runner_up_margin {
             return Err(ImageRuleVerificationError::InsufficientNegativeMargin {
                 margin: negative_margin,
@@ -801,28 +730,16 @@ impl ImageRuleVerification {
                 minimum: input.rule.minimum_runner_up_margin,
             });
         }
-        let mut artifact = ImageRuleVerificationArtifact {
-            version: IMAGE_RULE_VERIFICATION_VERSION,
-            preprocess: ImageVerificationPreprocess::GrayscaleNormalizedCrossCorrelation,
-            rule_id: input.rule.id.clone(),
-            rule_revision: input.rule.revision,
-            template: input.rule.template.clone(),
-            transparent_mask: input.rule.transparent_mask.clone(),
-            captured_dpi: input.captured_dpi,
-            region_id: input.rule.region_id.clone(),
-            region_revision: input.region_revision,
-            search_width: input.search_dimensions.0,
-            search_height: input.search_dimensions.1,
-            scales_percent: input.rule.scales_percent.clone(),
-            threshold: input.rule.threshold,
-            minimum_runner_up_margin: input.rule.minimum_runner_up_margin,
-            negative_corpus_sha256: input.negative_corpus_sha256.to_string(),
-            negative_sample_count: input.negative_sample_count,
-            best_negative_score: input.best_negative_score,
-            active_mask_variance: variance,
-            verification_fingerprint_sha256: String::new(),
-        };
-        artifact.verification_fingerprint_sha256 = verification::fingerprint(&artifact);
+        let artifact = verification::build_artifact(
+            input.rule,
+            input.captured_dpi,
+            input.region_revision,
+            input.search_dimensions,
+            negative_corpus.sha256,
+            negative_corpus.sample_count,
+            negative_corpus.best_score,
+            variance,
+        );
         Ok(Self {
             threshold: input.rule.threshold,
             template_variance: variance,
@@ -832,6 +749,89 @@ impl ImageRuleVerification {
             artifact,
         })
     }
+}
+
+fn verify_negative_corpus(
+    rule: &ImageRule,
+    captured_dpi: u32,
+    region_revision: u64,
+    search_dimensions: (u32, u32),
+    samples: &[NegativeCorpusSample],
+) -> std::result::Result<VerifiedNegativeCorpus, ImageRuleVerificationError> {
+    if samples.is_empty() {
+        return Err(ImageRuleVerificationError::InvalidNegativeCorpus);
+    }
+    let expected = NegativeSampleEvaluationInputs::for_rule(
+        rule,
+        captured_dpi,
+        region_revision,
+        search_dimensions,
+    );
+    let mut canonical = samples.to_vec();
+    canonical.sort_by(|left, right| {
+        left.stable_id
+            .cmp(&right.stable_id)
+            .then_with(|| left.content_sha256.cmp(&right.content_sha256))
+            .then_with(|| left.measured_score.total_cmp(&right.measured_score))
+    });
+    let mut previous_id: Option<&str> = None;
+    for sample in &canonical {
+        if sample.stable_id.is_empty()
+            || sample.stable_id.len() > 256
+            || sample.stable_id.trim() != sample.stable_id
+            || sample.stable_id.chars().any(char::is_control)
+        {
+            return Err(ImageRuleVerificationError::InvalidNegativeSampleId {
+                stable_id: sample.stable_id.clone(),
+            });
+        }
+        if previous_id == Some(sample.stable_id.as_str()) {
+            return Err(ImageRuleVerificationError::DuplicateNegativeSample {
+                stable_id: sample.stable_id.clone(),
+            });
+        }
+        previous_id = Some(&sample.stable_id);
+        if !verification::valid_sha256(&sample.content_sha256) {
+            return Err(ImageRuleVerificationError::InvalidNegativeSampleHash {
+                stable_id: sample.stable_id.clone(),
+            });
+        }
+        if !verification::normalized_score(sample.measured_score) {
+            return Err(ImageRuleVerificationError::InvalidNegativeScore);
+        }
+        if sample.evaluation != expected {
+            return Err(
+                ImageRuleVerificationError::NegativeSampleEvaluationMismatch {
+                    stable_id: sample.stable_id.clone(),
+                },
+            );
+        }
+    }
+    let best_score = canonical
+        .iter()
+        .map(|sample| sample.measured_score)
+        .max_by(f32::total_cmp)
+        .expect("non-empty corpus was checked above");
+    let sample_count = u64::try_from(canonical.len())
+        .map_err(|_| ImageRuleVerificationError::InvalidNegativeCorpus)?;
+    let bytes = serde_json::to_vec(&CanonicalNegativeCorpus {
+        version: 1,
+        samples: &canonical,
+    })
+    .expect("negative-corpus inputs contain only serializable values");
+    Ok(VerifiedNegativeCorpus {
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+        sample_count,
+        best_score,
+    })
+}
+
+#[cfg(test)]
+fn verify_negative_corpus_for_test(
+    rule: &ImageRule,
+    samples: &[NegativeCorpusSample],
+) -> std::result::Result<(), ImageRuleVerificationError> {
+    verify_negative_corpus(rule, 96, 13, (640, 360), samples).map(|_| ())
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1018,7 +1018,7 @@ fn masked_match_template(
     })
 }
 
-fn validate_mask_reference<'a>(
+pub(super) fn validate_mask_reference<'a>(
     rule: &ImageRule,
     template: &GrayImage,
     mask: Option<&'a GrayImage>,
@@ -1042,7 +1042,7 @@ fn validate_mask_reference<'a>(
     }
 }
 
-fn template_variance(template: &GrayImage, mask: Option<&GrayImage>) -> f32 {
+pub(super) fn template_variance(template: &GrayImage, mask: Option<&GrayImage>) -> f32 {
     let values = template
         .enumerate_pixels()
         .filter(|(x, y, _)| mask.is_none_or(|mask| mask.get_pixel(*x, *y)[0] != 0))
@@ -1056,7 +1056,7 @@ fn template_variance(template: &GrayImage, mask: Option<&GrayImage>) -> f32 {
         / values.len() as f64) as f32
 }
 
-fn estimate_score_cells(
+pub(super) fn estimate_score_cells(
     search_dimensions: (u32, u32),
     template_dimensions: (u32, u32),
     scales_percent: &[u16],
@@ -1214,9 +1214,9 @@ mod tests {
     use super::*;
     use crate::engine::macro_engine::{
         AssetRef, Block, BlockKind, CompiledMacro, Condition, ConditionDetector, FocusLossPolicy,
-        ImageRule, Limit, MACRO_SCHEMA_VERSION, MacroDefinition, MatchSelectionPolicy,
-        ObservationRequest, ObserveMode, PinnedAsset, RegionDefinition, SafetyPolicy,
-        SavedRevision, TargetProfile,
+        IMAGE_RULE_VERIFICATION_VERSION, ImageRule, Limit, MACRO_SCHEMA_VERSION, MacroDefinition,
+        MatchSelectionPolicy, ObservationRequest, ObserveMode, PinnedAsset, RegionDefinition,
+        SafetyPolicy, SavedRevision, TargetProfile,
     };
     use crate::engine::{
         automation::{CaptureFrameMetadata, CaptureSource, CapturedScreenFrame},
@@ -1369,6 +1369,15 @@ mod tests {
             artifact.verification_fingerprint_sha256 = verification::fingerprint(&artifact);
             artifact
         } else {
+            let negative_samples = vec![corpus_sample_for(
+                &rule,
+                "negative/a",
+                NEGATIVE_CORPUS_SHA256,
+                0.80,
+                96,
+                13,
+                (64, 48),
+            )];
             ImageRuleVerification::verify(ImageRuleVerificationInput {
                 rule: &rule,
                 template: &template,
@@ -1377,14 +1386,12 @@ mod tests {
                 current_dpi: 96,
                 region_revision: 13,
                 search_dimensions: (64, 48),
-                negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
-                negative_sample_count: 100_000,
-                best_negative_score: 0.80,
+                negative_samples: &negative_samples,
                 observed_clusters: &[],
                 maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
             })
             .unwrap()
-            .artifact
+            .into_artifact()
         });
         let definition = MacroDefinition {
             schema_version: MACRO_SCHEMA_VERSION,
@@ -1768,11 +1775,136 @@ mod tests {
         assert!((unmasked.best.score - masked.best.score).abs() < 0.000_001);
     }
 
+    fn corpus_sample(
+        rule: &ImageRule,
+        stable_id: &str,
+        content_sha256: &str,
+        measured_score: f32,
+    ) -> NegativeCorpusSample {
+        corpus_sample_for(
+            rule,
+            stable_id,
+            content_sha256,
+            measured_score,
+            96,
+            13,
+            (640, 360),
+        )
+    }
+
+    fn corpus_sample_for(
+        rule: &ImageRule,
+        stable_id: &str,
+        content_sha256: &str,
+        measured_score: f32,
+        captured_dpi: u32,
+        region_revision: u64,
+        search_dimensions: (u32, u32),
+    ) -> NegativeCorpusSample {
+        NegativeCorpusSample {
+            stable_id: stable_id.to_string(),
+            content_sha256: content_sha256.to_string(),
+            measured_score,
+            evaluation: NegativeSampleEvaluationInputs::for_rule(
+                rule,
+                captured_dpi,
+                region_revision,
+                search_dimensions,
+            ),
+        }
+    }
+
+    #[test]
+    fn verification_derives_order_independent_negative_corpus_provenance() {
+        let rule = fixture_rule(0.91);
+        let template = fixture_icon();
+        let a = corpus_sample(
+            &rule,
+            "negative/a",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            0.72,
+        );
+        let b = corpus_sample(
+            &rule,
+            "negative/b",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            0.80,
+        );
+        let verify = |samples: &[NegativeCorpusSample]| {
+            ImageRuleVerification::verify(ImageRuleVerificationInput {
+                rule: &rule,
+                template: &template,
+                mask: None,
+                captured_dpi: 96,
+                current_dpi: 96,
+                region_revision: 13,
+                search_dimensions: (640, 360),
+                negative_samples: samples,
+                observed_clusters: &[],
+                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+            })
+            .unwrap()
+        };
+
+        let forward = verify(&[a.clone(), b.clone()]);
+        let reverse = verify(&[b.clone(), a.clone()]);
+        assert_eq!(
+            forward.artifact().negative_corpus_sha256(),
+            reverse.artifact().negative_corpus_sha256()
+        );
+        assert_eq!(forward.artifact().negative_sample_count(), 2);
+        assert_eq!(forward.artifact().best_negative_score(), 0.80);
+
+        let mut changed_content = b;
+        changed_content.content_sha256 =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
+        let changed = verify(&[a.clone(), changed_content]);
+        assert_ne!(
+            forward.artifact().negative_corpus_sha256(),
+            changed.artifact().negative_corpus_sha256()
+        );
+
+        let duplicate = verify_negative_corpus_for_test(&rule, &[a.clone(), a.clone()]);
+        assert_eq!(
+            duplicate.unwrap_err(),
+            ImageRuleVerificationError::DuplicateNegativeSample {
+                stable_id: "negative/a".to_string()
+            }
+        );
+
+        let mut malformed_hash = a.clone();
+        malformed_hash.content_sha256 = "not-a-sha".to_string();
+        assert!(matches!(
+            verify_negative_corpus_for_test(&rule, &[malformed_hash]).unwrap_err(),
+            ImageRuleVerificationError::InvalidNegativeSampleHash { .. }
+        ));
+        let mut invalid_score = a.clone();
+        invalid_score.measured_score = f32::NAN;
+        assert!(matches!(
+            verify_negative_corpus_for_test(&rule, &[invalid_score]).unwrap_err(),
+            ImageRuleVerificationError::InvalidNegativeScore
+        ));
+        let mut changed_input = a;
+        changed_input.evaluation.search_width += 1;
+        assert_eq!(
+            verify_negative_corpus_for_test(&rule, &[changed_input]).unwrap_err(),
+            ImageRuleVerificationError::NegativeSampleEvaluationMismatch {
+                stable_id: "negative/a".to_string()
+            }
+        );
+    }
+
     #[test]
     fn verification_rejects_low_variance_stale_dpi_and_oversized_work() {
         let rule = fixture_rule(0.91);
         let flat = GrayImage::from_pixel(8, 8, Luma([128]));
         let clusters = vec![CandidateCluster::from_peak(peak(20, 20, 0.96, 100))];
+        let samples = vec![corpus_sample(
+            &rule,
+            "negative/a",
+            NEGATIVE_CORPUS_SHA256,
+            0.80,
+        )];
         let base = ImageRuleVerificationInput {
             rule: &rule,
             template: &flat,
@@ -1781,9 +1913,7 @@ mod tests {
             current_dpi: 96,
             region_revision: 13,
             search_dimensions: (640, 360),
-            negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
-            negative_sample_count: 100_000,
-            best_negative_score: 0.80,
+            negative_samples: &samples,
             observed_clusters: &clusters,
             maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
         };
@@ -1805,9 +1935,27 @@ mod tests {
             }
         );
 
-        let mut oversized = base;
-        oversized.template = &varied;
-        oversized.search_dimensions = (4_000, 4_000);
+        let oversized_samples = vec![corpus_sample_for(
+            &rule,
+            "negative/a",
+            NEGATIVE_CORPUS_SHA256,
+            0.80,
+            96,
+            13,
+            (4_000, 4_000),
+        )];
+        let oversized = ImageRuleVerificationInput {
+            rule: &rule,
+            template: &varied,
+            mask: None,
+            captured_dpi: 96,
+            current_dpi: 96,
+            region_revision: 13,
+            search_dimensions: (4_000, 4_000),
+            negative_samples: &oversized_samples,
+            observed_clusters: &clusters,
+            maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+        };
         assert!(matches!(
             ImageRuleVerification::verify(oversized).unwrap_err(),
             ImageRuleVerificationError::WorkLimitExceeded { .. }
@@ -1820,6 +1968,12 @@ mod tests {
         for value in [f32::NAN, f32::INFINITY, -0.01, 1.01] {
             let mut rule = fixture_rule(0.91);
             rule.minimum_runner_up_margin = value;
+            let samples = vec![corpus_sample(
+                &rule,
+                "negative/a",
+                NEGATIVE_CORPUS_SHA256,
+                0.80,
+            )];
             let input = ImageRuleVerificationInput {
                 rule: &rule,
                 template: &template,
@@ -1828,9 +1982,7 @@ mod tests {
                 current_dpi: 96,
                 region_revision: 13,
                 search_dimensions: (640, 360),
-                negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
-                negative_sample_count: 100_000,
-                best_negative_score: 0.80,
+                negative_samples: &samples,
                 observed_clusters: &[],
                 maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
             };
@@ -1840,6 +1992,12 @@ mod tests {
             );
 
             let rule = fixture_rule(0.91);
+            let samples = vec![corpus_sample(
+                &rule,
+                "negative/a",
+                NEGATIVE_CORPUS_SHA256,
+                value,
+            )];
             let input = ImageRuleVerificationInput {
                 rule: &rule,
                 template: &template,
@@ -1848,9 +2006,7 @@ mod tests {
                 current_dpi: 96,
                 region_revision: 13,
                 search_dimensions: (640, 360),
-                negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
-                negative_sample_count: 100_000,
-                best_negative_score: value,
+                negative_samples: &samples,
                 observed_clusters: &[],
                 maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
             };
@@ -1862,36 +2018,32 @@ mod tests {
     }
 
     #[test]
-    fn verification_rejects_invalid_negative_corpus_provenance() {
+    fn verification_rejects_empty_or_invalid_negative_corpus_provenance() {
         let rule = fixture_rule(0.91);
         let template = fixture_icon();
-        for (digest, sample_count) in [
-            ("", 100_000),
-            (
-                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                100_000,
-            ),
-            (NEGATIVE_CORPUS_SHA256, 0),
-        ] {
-            let input = ImageRuleVerificationInput {
-                rule: &rule,
-                template: &template,
-                mask: None,
-                captured_dpi: 96,
-                current_dpi: 96,
-                region_revision: 13,
-                search_dimensions: (640, 360),
-                negative_corpus_sha256: digest,
-                negative_sample_count: sample_count,
-                best_negative_score: 0.80,
-                observed_clusters: &[],
-                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
-            };
-            assert_eq!(
-                ImageRuleVerification::verify(input).unwrap_err(),
-                ImageRuleVerificationError::InvalidNegativeCorpus
-            );
-        }
+        let input = ImageRuleVerificationInput {
+            rule: &rule,
+            template: &template,
+            mask: None,
+            captured_dpi: 96,
+            current_dpi: 96,
+            region_revision: 13,
+            search_dimensions: (640, 360),
+            negative_samples: &[],
+            observed_clusters: &[],
+            maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+        };
+        assert_eq!(
+            ImageRuleVerification::verify(input).unwrap_err(),
+            ImageRuleVerificationError::InvalidNegativeCorpus
+        );
+
+        let mut invalid_id = corpus_sample(&rule, " negative/a", NEGATIVE_CORPUS_SHA256, 0.80);
+        invalid_id.stable_id.push(' ');
+        assert!(matches!(
+            verify_negative_corpus_for_test(&rule, &[invalid_id]).unwrap_err(),
+            ImageRuleVerificationError::InvalidNegativeSampleId { .. }
+        ));
     }
 
     #[test]
@@ -1907,6 +2059,12 @@ mod tests {
             CandidateCluster::from_peak(peak(20, 20, 0.96, 100)),
             CandidateCluster::from_peak(peak(80, 20, 0.945, 100)),
         ];
+        let high_negative_samples = vec![corpus_sample(
+            &rule,
+            "negative/a",
+            NEGATIVE_CORPUS_SHA256,
+            0.90,
+        )];
         let input = ImageRuleVerificationInput {
             rule: &rule,
             template: &template,
@@ -1915,9 +2073,7 @@ mod tests {
             current_dpi: 96,
             region_revision: 13,
             search_dimensions: (640, 360),
-            negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
-            negative_sample_count: 100_000,
-            best_negative_score: 0.90,
+            negative_samples: &high_negative_samples,
             observed_clusters: &clusters,
             maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
         };
@@ -1943,9 +2099,24 @@ mod tests {
             ImageRuleVerificationError::InsufficientNegativeMargin { .. }
         ));
 
-        let mut ambiguous = input;
-        ambiguous.mask = Some(&valid_mask);
-        ambiguous.best_negative_score = 0.80;
+        let lower_negative_samples = vec![corpus_sample(
+            &rule,
+            "negative/a",
+            NEGATIVE_CORPUS_SHA256,
+            0.80,
+        )];
+        let ambiguous = ImageRuleVerificationInput {
+            rule: &rule,
+            template: &template,
+            mask: Some(&valid_mask),
+            captured_dpi: 96,
+            current_dpi: 96,
+            region_revision: 13,
+            search_dimensions: (640, 360),
+            negative_samples: &lower_negative_samples,
+            observed_clusters: &clusters,
+            maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+        };
         assert!(matches!(
             ImageRuleVerification::verify(ambiguous).unwrap_err(),
             ImageRuleVerificationError::AmbiguousCandidates { .. }
@@ -1958,6 +2129,12 @@ mod tests {
         rule.scales_percent = vec![100];
         let template = fixture_icon();
         let clusters = vec![CandidateCluster::from_peak(peak(20, 20, 0.96, 100))];
+        let samples = vec![corpus_sample(
+            &rule,
+            "negative/a",
+            NEGATIVE_CORPUS_SHA256,
+            0.80,
+        )];
 
         let verified = ImageRuleVerification::verify(ImageRuleVerificationInput {
             rule: &rule,
@@ -1967,22 +2144,24 @@ mod tests {
             current_dpi: 96,
             region_revision: 13,
             search_dimensions: (640, 360),
-            negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
-            negative_sample_count: 100_000,
-            best_negative_score: 0.80,
+            negative_samples: &samples,
             observed_clusters: &clusters,
             maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
         })
         .unwrap();
 
         assert_eq!(INITIAL_SIMILARITY_THRESHOLD, 0.95);
-        assert_eq!(verified.threshold, 0.91);
-        assert_eq!(verified.artifact.rule_id, rule.id);
-        assert_eq!(verified.artifact.rule_revision, rule.revision);
-        assert_eq!(verified.artifact.template, rule.template);
-        assert_eq!(verified.artifact.region_revision, 13);
-        assert_eq!(verified.artifact.scales_percent, vec![100]);
-        assert_eq!(verified.artifact.best_negative_score, 0.80);
+        assert_eq!(verified.threshold(), 0.91);
+        assert!(verified.template_variance() >= MIN_TEMPLATE_VARIANCE);
+        assert!((verified.negative_margin() - 0.11).abs() < 0.000_001);
+        assert_eq!(verified.ambiguity_margin(), None);
+        assert!(verified.score_cells() > 0);
+        assert_eq!(verified.artifact().rule_id, rule.id);
+        assert_eq!(verified.artifact().rule_revision, rule.revision);
+        assert_eq!(verified.artifact().template, rule.template);
+        assert_eq!(verified.artifact().region_revision, 13);
+        assert_eq!(verified.artifact().scales_percent, vec![100]);
+        assert_eq!(verified.artifact().best_negative_score(), 0.80);
     }
 
     #[test]
@@ -2139,7 +2318,7 @@ mod tests {
     }
 
     #[test]
-    fn stability_capacity_requires_explicit_run_cleanup() {
+    fn stability_capacity_is_released_by_completed_run_generation_only() {
         let compiled = compiled_image_macro(fixture_icon());
         let BlockKind::Observe { condition } = &compiled.definition().blocks[0].kind else {
             unreachable!()
@@ -2156,7 +2335,7 @@ mod tests {
                 ),
                 captured_frame(
                     fixture_search_with_icon_at(23, 17),
-                    frame(3, 120, 23, 100).frame,
+                    frame(3, 210, 23, 100).frame,
                 ),
             ]),
         };
@@ -2177,7 +2356,88 @@ mod tests {
         assert!(observe("run-a", 100).is_ok());
         let error = observe("run-b", 110).unwrap_err();
         assert!(error.to_string().contains("capacity 1 is exhausted"));
-        assert_eq!(detector.clear_run("run-a").unwrap(), 1);
+        detector.run_finished("run-a", &[1]);
         assert!(observe("run-b", 120).is_ok());
+    }
+
+    #[test]
+    fn more_than_default_capacity_completed_image_runs_do_not_exhaust_state() {
+        let compiled = compiled_image_macro(fixture_icon());
+        let BlockKind::Observe { condition } = &compiled.definition().blocks[0].kind else {
+            unreachable!()
+        };
+        let frames = (0..300)
+            .map(|index| {
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(index + 1, 100 + index, 23, 100).frame,
+                )
+            })
+            .collect();
+        let capture = FixtureCapture {
+            frames: Mutex::new(frames),
+        };
+        let detector = ImageDetector::new();
+
+        for index in 0..300 {
+            let run_id = format!("completed-{index}");
+            detector
+                .observe(
+                    &ObservationRequest {
+                        run_id: &run_id,
+                        generation: 1,
+                        condition,
+                        compiled: &compiled,
+                        observed_at_ms: index,
+                    },
+                    &capture,
+                )
+                .unwrap();
+            detector.run_finished(&run_id, &[1]);
+        }
+    }
+
+    #[test]
+    fn finishing_one_generation_keeps_same_run_other_generation_active() {
+        let compiled = compiled_image_macro(fixture_icon());
+        let BlockKind::Observe { condition } = &compiled.definition().blocks[0].kind else {
+            unreachable!()
+        };
+        let capture = FixtureCapture {
+            frames: Mutex::new(vec![
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(1, 100, 23, 100).frame,
+                ),
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(2, 110, 23, 100).frame,
+                ),
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(3, 210, 23, 100).frame,
+                ),
+            ]),
+        };
+        let detector = ImageDetector::with_stability_capacity(2);
+        let observe = |generation, observed_at_ms| {
+            detector
+                .observe(
+                    &ObservationRequest {
+                        run_id: "same-run",
+                        generation,
+                        condition,
+                        compiled: &compiled,
+                        observed_at_ms,
+                    },
+                    &capture,
+                )
+                .unwrap()
+        };
+
+        assert!(!observe(1, 100).matched);
+        assert!(!observe(2, 110).matched);
+        detector.run_finished("same-run", &[1]);
+        assert!(observe(2, 210).matched);
     }
 }

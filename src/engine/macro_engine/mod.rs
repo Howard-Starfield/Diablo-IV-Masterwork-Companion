@@ -1,4 +1,5 @@
 mod image_match;
+mod image_verification;
 mod model;
 #[allow(dead_code)]
 mod observation;

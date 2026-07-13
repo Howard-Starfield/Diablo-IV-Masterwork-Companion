@@ -95,31 +95,31 @@ pub fn validate_macro(definition: &MacroDefinition) -> Vec<ValidationProblem> {
                 None,
             );
         }
-        if let Err(problem) = super::image_match::verification::validate_binding(definition, rule) {
+        if let Err(problem) = super::image_verification::validate_binding(definition, rule) {
             let (code, message) = match problem {
-                super::image_match::verification::BindingProblem::Missing => (
+                super::image_verification::BindingProblem::Missing => (
                     "image_rule.missing_verification",
                     format!("image rule '{}' has no verification artifact", rule.id),
                 ),
-                super::image_match::verification::BindingProblem::InvalidMargin => (
+                super::image_verification::BindingProblem::InvalidMargin => (
                     "image_rule.invalid_margin",
                     format!(
                         "image rule '{}' runner-up margin must be finite and between zero and one",
                         rule.id
                     ),
                 ),
-                super::image_match::verification::BindingProblem::InvalidScore => (
+                super::image_verification::BindingProblem::InvalidScore => (
                     "image_rule.invalid_verification_score",
                     format!("image rule '{}' has invalid verification scores", rule.id),
                 ),
-                super::image_match::verification::BindingProblem::InvalidProvenance => (
+                super::image_verification::BindingProblem::InvalidProvenance => (
                     "image_rule.invalid_verification_provenance",
                     format!(
                         "image rule '{}' has invalid negative-corpus provenance",
                         rule.id
                     ),
                 ),
-                super::image_match::verification::BindingProblem::Stale => (
+                super::image_verification::BindingProblem::Stale => (
                     "image_rule.stale_verification",
                     format!(
                         "image rule '{}' verification does not match its immutable inputs",
@@ -995,7 +995,7 @@ mod tests {
             verification_fingerprint_sha256: String::new(),
         };
         artifact.verification_fingerprint_sha256 =
-            super::image_match::verification::fingerprint(&artifact);
+            super::image_verification::fingerprint(&artifact);
         rule.verification = Some(artifact);
         rule
     }

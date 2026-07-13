@@ -1,5 +1,7 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     future::IntoFuture,
+    hash::{Hash, Hasher},
     path::PathBuf,
     sync::{
         Arc,
@@ -50,10 +52,13 @@ use windows::{
     },
     core::{HSTRING, PCWSTR, w},
 };
-use xcap::Monitor;
+use xcap::{Monitor, Window};
 
 use super::super::{
-    automation::{CaptureSource, InputSink, MouseButton, StopSource},
+    automation::{
+        AtomicCaptureSnapshot, AtomicFrameCapture, AtomicFrameSnapshotSource, CaptureSource,
+        InputSink, MouseButton, StopSource, SystemClock,
+    },
     config::{MouseMovementModel, MouseMovementProfile, MouseMovementSample, MouseMovementStep},
     enchant_loop::OcrReader,
     types::{Point, Rect, ScreenImage},
@@ -86,6 +91,154 @@ impl CaptureSource for XcapRegionCapture {
 
         Ok(ScreenImage::new(image))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XcapWindowRegionCapture {
+    window_id: u32,
+}
+
+impl XcapWindowRegionCapture {
+    pub const fn new(window_id: u32) -> Self {
+        Self { window_id }
+    }
+}
+
+impl CaptureSource for XcapWindowRegionCapture {
+    fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+        let window = WindowsXcapWindowSnapshotSource::new(self.window_id).target_window()?;
+        let window_rect = Rect::new(window.x()?, window.y()?, window.width()?, window.height()?);
+        XcapRegionCapture.capture(window_local_to_screen(window_rect, rect)?)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsXcapWindowSnapshotSource {
+    window_id: u32,
+}
+
+impl WindowsXcapWindowSnapshotSource {
+    pub const fn new(window_id: u32) -> Self {
+        Self { window_id }
+    }
+
+    fn target_window(&self) -> Result<Window> {
+        Window::all()?
+            .into_iter()
+            .find(|window| window.id().is_ok_and(|id| id == self.window_id))
+            .with_context(|| format!("xcap window {} is no longer available", self.window_id))
+    }
+}
+
+impl AtomicFrameSnapshotSource for WindowsXcapWindowSnapshotSource {
+    fn snapshot(&self, requested_region: Rect) -> Result<AtomicCaptureSnapshot> {
+        let window = self.target_window()?;
+        let window_id = window.id()?;
+        let process_id = window.pid()?;
+        let window_rect = Rect::new(window.x()?, window.y()?, window.width()?, window.height()?);
+        window_local_to_screen(window_rect, requested_region).with_context(|| {
+            format!("requested macro capture region is outside xcap window {window_id}")
+        })?;
+
+        let monitor = window.current_monitor()?;
+        let monitor_id = monitor.id()?;
+        let monitor_name = monitor.name()?;
+        let monitor_friendly_name = monitor.friendly_name()?;
+        let monitor_rect = Rect::new(
+            monitor.x()?,
+            monitor.y()?,
+            monitor.width()?,
+            monitor.height()?,
+        );
+        let scale_factor = monitor.scale_factor()?;
+        let rotation = monitor.rotation()?;
+        let dpi = (scale_factor * 96.0).round().clamp(1.0, u32::MAX as f32) as u32;
+        let display_id = format!("{monitor_id}:{monitor_name}:{monitor_friendly_name}");
+
+        Ok(AtomicCaptureSnapshot {
+            requested_region,
+            window_id: u64::from(window_id),
+            window_revision: stable_revision(&(window_id, process_id)),
+            process_id,
+            window_rect,
+            geometry_revision: stable_revision(&(
+                window_rect.x,
+                window_rect.y,
+                window_rect.width,
+                window_rect.height,
+            )),
+            display_id,
+            display_profile_revision: stable_revision(&(
+                monitor_id,
+                monitor_name,
+                monitor_friendly_name,
+                monitor_rect.x,
+                monitor_rect.y,
+                monitor_rect.width,
+                monitor_rect.height,
+                scale_factor.to_bits(),
+                rotation.to_bits(),
+            )),
+            dpi,
+        })
+    }
+}
+
+pub type XcapAtomicWindowCapture =
+    AtomicFrameCapture<WindowsXcapWindowSnapshotSource, XcapWindowRegionCapture, SystemClock>;
+
+/// Builds the production image-detection capture path for one concrete xcap window identity.
+/// The returned source retains raw `capture` for OCR/Enchant and adds atomic `capture_frame`.
+pub fn xcap_atomic_window_capture(window_id: u32) -> XcapAtomicWindowCapture {
+    AtomicFrameCapture::new(
+        WindowsXcapWindowSnapshotSource::new(window_id),
+        XcapWindowRegionCapture::new(window_id),
+        SystemClock::default(),
+    )
+}
+
+fn stable_revision(value: &impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn rect_contains(container: Rect, nested: Rect) -> bool {
+    let Some(container_right) = i64::from(container.x).checked_add(i64::from(container.width))
+    else {
+        return false;
+    };
+    let Some(container_bottom) = i64::from(container.y).checked_add(i64::from(container.height))
+    else {
+        return false;
+    };
+    let Some(nested_right) = i64::from(nested.x).checked_add(i64::from(nested.width)) else {
+        return false;
+    };
+    let Some(nested_bottom) = i64::from(nested.y).checked_add(i64::from(nested.height)) else {
+        return false;
+    };
+    i64::from(nested.x) >= i64::from(container.x)
+        && i64::from(nested.y) >= i64::from(container.y)
+        && nested_right <= container_right
+        && nested_bottom <= container_bottom
+}
+
+fn window_local_to_screen(window: Rect, local: Rect) -> Result<Rect> {
+    let local_bounds = Rect::new(0, 0, window.width, window.height);
+    anyhow::ensure!(
+        rect_contains(local_bounds, local),
+        "capture region is outside the concrete xcap window"
+    );
+    let x = i64::from(window.x)
+        .checked_add(i64::from(local.x))
+        .and_then(|value| i32::try_from(value).ok())
+        .context("window-local capture x coordinate overflowed")?;
+    let y = i64::from(window.y)
+        .checked_add(i64::from(local.y))
+        .and_then(|value| i32::try_from(value).ok())
+        .context("window-local capture y coordinate overflowed")?;
+    Ok(Rect::new(x, y, local.width, local.height))
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1101,5 +1254,21 @@ mod tests {
             mouse_button_flags(MouseButton::Right),
             (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
         );
+    }
+
+    #[test]
+    fn production_atomic_capture_constructor_is_available_for_macro_runtime_wiring() {
+        let _capture = xcap_atomic_window_capture(42);
+    }
+
+    #[test]
+    fn concrete_window_capture_translates_local_region_to_screen_coordinates() {
+        let window = Rect::new(1_200, -300, 800, 600);
+
+        assert_eq!(
+            window_local_to_screen(window, Rect::new(25, 40, 100, 80)).unwrap(),
+            Rect::new(1_225, -260, 100, 80)
+        );
+        assert!(window_local_to_screen(window, Rect::new(750, 40, 100, 80)).is_err());
     }
 }

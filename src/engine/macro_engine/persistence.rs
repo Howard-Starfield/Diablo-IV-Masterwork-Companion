@@ -603,11 +603,10 @@ impl MacroStore {
                 remaps.insert(key, remapped);
             }
         }
-        for asset in referenced_assets_mut(&mut package.definition) {
-            if let Some(id) = remaps.get(&(asset.id.clone(), asset.revision)) {
-                asset.id = id.clone();
-            }
-        }
+        super::image_verification::trusted_remap_definition_assets(
+            &mut package.definition,
+            &remaps,
+        )?;
         let mut installed = Vec::new();
         for package_asset in &mut package.assets {
             if let Some(id) =
@@ -617,6 +616,7 @@ impl MacroStore {
             }
         }
         validate_package_memory(&package)?;
+        validate_verified_package_compiles(&package)?;
         for package_asset in &mut package.assets {
             match self
                 .assets
@@ -874,13 +874,6 @@ fn referenced_assets(definition: &MacroDefinition) -> impl Iterator<Item = &Asse
         .flat_map(|rule| std::iter::once(&rule.template).chain(rule.transparent_mask.as_ref()))
 }
 
-fn referenced_assets_mut(definition: &mut MacroDefinition) -> impl Iterator<Item = &mut AssetRef> {
-    definition
-        .image_rules
-        .iter_mut()
-        .flat_map(|rule| std::iter::once(&mut rule.template).chain(rule.transparent_mask.as_mut()))
-}
-
 fn validate_asset_ref(asset: &AssetRef) -> Result<()> {
     validate_component("asset ID", &asset.id)?;
     if asset.content_hash.len() != 64
@@ -962,6 +955,34 @@ fn validate_package_memory(package: &MacroPackage) -> Result<()> {
     let definition_refs: HashSet<_> = referenced_assets(&package.definition).cloned().collect();
     if definition_refs != package_refs {
         bail!("package asset references do not match definition");
+    }
+    Ok(())
+}
+
+fn validate_verified_package_compiles(package: &MacroPackage) -> Result<()> {
+    if !package
+        .definition
+        .image_rules
+        .iter()
+        .any(|rule| rule.verification.is_some())
+    {
+        return Ok(());
+    }
+    let definition_hash = sha256_hex(&serde_json::to_vec_pretty(&package.definition)?);
+    let saved = SavedRevision {
+        definition: package.definition.clone(),
+        definition_hash,
+        pinned_assets: package
+            .assets
+            .iter()
+            .map(|asset| PinnedAsset {
+                asset: asset.asset.clone(),
+                bytes: asset.bytes.clone(),
+            })
+            .collect(),
+    };
+    if let Err(error) = super::runtime::CompiledMacro::compile(saved) {
+        bail!("verified package is not compilable: {error:#}");
     }
     Ok(())
 }
@@ -1114,9 +1135,17 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::engine::macro_engine::{
-        FocusLossPolicy, ImageRule, Limit, MatchSelectionPolicy, SafetyPolicy, TargetProfile,
+        Block, BlockKind, CompiledMacro, Condition, DEFAULT_MAX_SCORE_CELLS, FocusLossPolicy,
+        ImageRule, ImageRuleVerification, ImageRuleVerificationInput, Limit, MatchSelectionPolicy,
+        NegativeCorpusSample, NegativeSampleEvaluationInputs, ObserveMode, RegionDefinition,
+        SafetyPolicy, TargetProfile, validate_macro,
     };
-    use std::sync::{Arc, Barrier};
+    use crate::engine::types::RectRatio;
+    use image::{DynamicImage, GrayImage, ImageFormat, Luma};
+    use std::{
+        io::Cursor,
+        sync::{Arc, Barrier},
+    };
 
     fn fixture_definition(asset: AssetRef) -> MacroDefinition {
         MacroDefinition {
@@ -1161,6 +1190,74 @@ mod tests {
                 focus_loss: FocusLossPolicy::Stop,
             },
         }
+    }
+
+    fn fixture_png(seed: u8) -> (GrayImage, Vec<u8>) {
+        let image = GrayImage::from_fn(7, 5, |x, y| {
+            Luma([seed.wrapping_add((x * 31 + y * 47) as u8)])
+        });
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageLuma8(image.clone())
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        (image, bytes.into_inner())
+    }
+
+    fn compilable_image_definition(
+        asset: AssetRef,
+        template: &GrayImage,
+        mask: Option<(AssetRef, &GrayImage)>,
+    ) -> MacroDefinition {
+        let mut definition = fixture_definition(asset);
+        definition.target.captured_client_width = 64;
+        definition.target.captured_client_height = 48;
+        definition.regions = vec![RegionDefinition {
+            id: "region-one".to_string(),
+            revision: 13,
+            rect: RectRatio {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        }];
+        definition.blocks = vec![Block {
+            id: "observe".to_string(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Image {
+                    source_block_id: "observe".to_string(),
+                    rule_id: "image-one".to_string(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        }];
+        definition.image_rules[0].transparent_mask = mask.as_ref().map(|(asset, _)| asset.clone());
+        let rule = &definition.image_rules[0];
+        let samples = vec![NegativeCorpusSample {
+            stable_id: "negative/a".to_string(),
+            content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            measured_score: 0.80,
+            evaluation: NegativeSampleEvaluationInputs::for_rule(rule, 96, 13, (64, 48)),
+        }];
+        definition.image_rules[0].verification = Some(
+            ImageRuleVerification::verify(ImageRuleVerificationInput {
+                rule,
+                template,
+                mask: mask.map(|(_, image)| image),
+                captured_dpi: 96,
+                current_dpi: 96,
+                region_revision: 13,
+                search_dimensions: (64, 48),
+                negative_samples: &samples,
+                observed_clusters: &[],
+                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+            })
+            .unwrap()
+            .into_artifact(),
+        );
+        definition
     }
 
     fn ready_journal(outcome: JournalOpenOutcome) -> RunJournal {
@@ -1339,6 +1436,204 @@ mod tests {
             destination.assets().read(imported_asset).unwrap(),
             source_bytes
         );
+    }
+
+    #[test]
+    fn verified_image_package_collision_remap_stays_valid_and_compilable() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let (source_template, source_bytes) = fixture_png(7);
+        let source_asset = AssetRef {
+            id: "shared-template".to_string(),
+            revision: 1,
+            content_hash: sha256_hex(&source_bytes),
+        };
+        source
+            .assets()
+            .put_png_revision(source_asset.clone(), &source_bytes)
+            .unwrap();
+        let (source_mask, source_mask_bytes) = fixture_png(211);
+        let source_mask_asset = AssetRef {
+            id: "shared-mask".to_string(),
+            revision: 1,
+            content_hash: sha256_hex(&source_mask_bytes),
+        };
+        source
+            .assets()
+            .put_png_revision(source_mask_asset.clone(), &source_mask_bytes)
+            .unwrap();
+        let source_saved = source
+            .save(compilable_image_definition(
+                source_asset.clone(),
+                &source_template,
+                Some((source_mask_asset.clone(), &source_mask)),
+            ))
+            .unwrap();
+        let source_fingerprint = source_saved.definition.image_rules[0]
+            .verification
+            .as_ref()
+            .unwrap()
+            .verification_fingerprint_sha256()
+            .to_string();
+        let package_folder = source_temp.path().join("verified-package");
+        source
+            .export_package(&source_saved, &package_folder)
+            .unwrap();
+
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+        let (_, existing_bytes) = fixture_png(119);
+        destination
+            .assets()
+            .put_png_revision(
+                AssetRef {
+                    id: source_asset.id.clone(),
+                    revision: source_asset.revision,
+                    content_hash: sha256_hex(&existing_bytes),
+                },
+                &existing_bytes,
+            )
+            .unwrap();
+        let (_, existing_mask_bytes) = fixture_png(31);
+        destination
+            .assets()
+            .put_png_revision(
+                AssetRef {
+                    id: source_mask_asset.id.clone(),
+                    revision: source_mask_asset.revision,
+                    content_hash: sha256_hex(&existing_mask_bytes),
+                },
+                &existing_mask_bytes,
+            )
+            .unwrap();
+
+        let imported = destination.import_package(&package_folder).unwrap();
+
+        assert!(validate_macro(&imported.definition).is_empty());
+        let artifact = imported.definition.image_rules[0]
+            .verification
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            artifact.template,
+            imported.definition.image_rules[0].template
+        );
+        assert_eq!(
+            artifact.transparent_mask,
+            imported.definition.image_rules[0].transparent_mask
+        );
+        assert_eq!(
+            imported.definition.image_rules[0]
+                .transparent_mask
+                .as_ref()
+                .unwrap()
+                .id,
+            "shared-mask-imported-1"
+        );
+        assert_ne!(
+            artifact.verification_fingerprint_sha256(),
+            source_fingerprint
+        );
+        assert!(CompiledMacro::compile(imported).is_ok());
+    }
+
+    #[test]
+    fn collision_remap_rejects_stale_verification_before_installing_assets() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let (source_template, source_bytes) = fixture_png(7);
+        let source_asset = AssetRef {
+            id: "shared-template".to_string(),
+            revision: 1,
+            content_hash: sha256_hex(&source_bytes),
+        };
+        source
+            .assets()
+            .put_png_revision(source_asset.clone(), &source_bytes)
+            .unwrap();
+        let source_saved = source
+            .save(compilable_image_definition(
+                source_asset.clone(),
+                &source_template,
+                None,
+            ))
+            .unwrap();
+        let package_folder = source_temp.path().join("stale-package");
+        source
+            .export_package(&source_saved, &package_folder)
+            .unwrap();
+        let definition_path = package_folder.join("macro.json");
+        let mut stale: MacroDefinition =
+            serde_json::from_slice(&fs::read(&definition_path).unwrap()).unwrap();
+        stale.image_rules[0]
+            .verification
+            .as_mut()
+            .unwrap()
+            .verification_fingerprint_sha256 =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        fs::write(&definition_path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+        let (_, existing_bytes) = fixture_png(119);
+        destination
+            .assets()
+            .put_png_revision(
+                AssetRef {
+                    id: source_asset.id.clone(),
+                    revision: source_asset.revision,
+                    content_hash: sha256_hex(&existing_bytes),
+                },
+                &existing_bytes,
+            )
+            .unwrap();
+
+        let error = destination.import_package(&package_folder).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot remap invalid image verification")
+        );
+        let would_be_remap = AssetRef {
+            id: "shared-template-imported-1".to_string(),
+            ..source_asset
+        };
+        assert!(destination.assets().read(&would_be_remap).is_err());
+    }
+
+    #[test]
+    fn verified_package_compile_failure_installs_nothing() {
+        let (varied_template, _) = fixture_png(7);
+        let flat = GrayImage::from_pixel(7, 5, Luma([80]));
+        let mut flat_bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageLuma8(flat)
+            .write_to(&mut flat_bytes, ImageFormat::Png)
+            .unwrap();
+        let flat_bytes = flat_bytes.into_inner();
+        let flat_asset = AssetRef {
+            id: "flat-template".to_string(),
+            revision: 1,
+            content_hash: sha256_hex(&flat_bytes),
+        };
+        let definition = compilable_image_definition(flat_asset.clone(), &varied_template, None);
+        let package = MacroPackage {
+            schema_version: PACKAGE_SCHEMA_VERSION,
+            definition,
+            assets: vec![PackageAsset {
+                asset: flat_asset.clone(),
+                relative_path: PathBuf::from("assets/flat.png"),
+                bytes: flat_bytes,
+            }],
+        };
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+
+        let error = destination.import_validated_package(package).unwrap_err();
+
+        assert!(error.to_string().contains("template variance"));
+        assert!(destination.assets().read(&flat_asset).is_err());
+        assert!(!destination.root.join("definitions/macro-one").exists());
     }
 
     #[test]

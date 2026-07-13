@@ -103,27 +103,45 @@ pub enum ImageVerificationPreprocess {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageRuleVerificationArtifact {
-    pub version: u32,
-    pub preprocess: ImageVerificationPreprocess,
-    pub rule_id: String,
-    pub rule_revision: u64,
-    pub template: AssetRef,
-    pub transparent_mask: Option<AssetRef>,
-    pub captured_dpi: u32,
-    pub region_id: String,
-    pub region_revision: u64,
-    pub search_width: u32,
-    pub search_height: u32,
-    pub scales_percent: Vec<u16>,
-    pub threshold: f32,
-    pub minimum_runner_up_margin: f32,
+    pub(crate) version: u32,
+    pub(crate) preprocess: ImageVerificationPreprocess,
+    pub(crate) rule_id: String,
+    pub(crate) rule_revision: u64,
+    pub(crate) template: AssetRef,
+    pub(crate) transparent_mask: Option<AssetRef>,
+    pub(crate) captured_dpi: u32,
+    pub(crate) region_id: String,
+    pub(crate) region_revision: u64,
+    pub(crate) search_width: u32,
+    pub(crate) search_height: u32,
+    pub(crate) scales_percent: Vec<u16>,
+    pub(crate) threshold: f32,
+    pub(crate) minimum_runner_up_margin: f32,
     /// SHA-256 of canonical ordered negative sample identities/content hashes and evaluation inputs.
-    pub negative_corpus_sha256: String,
-    pub negative_sample_count: u64,
-    pub best_negative_score: f32,
-    pub active_mask_variance: f32,
+    pub(crate) negative_corpus_sha256: String,
+    pub(crate) negative_sample_count: u64,
+    pub(crate) best_negative_score: f32,
+    pub(crate) active_mask_variance: f32,
     /// SHA-256 over every persisted binding and result field above.
-    pub verification_fingerprint_sha256: String,
+    pub(crate) verification_fingerprint_sha256: String,
+}
+
+impl ImageRuleVerificationArtifact {
+    pub fn negative_corpus_sha256(&self) -> &str {
+        &self.negative_corpus_sha256
+    }
+
+    pub fn negative_sample_count(&self) -> u64 {
+        self.negative_sample_count
+    }
+
+    pub fn best_negative_score(&self) -> f32 {
+        self.best_negative_score
+    }
+
+    pub fn verification_fingerprint_sha256(&self) -> &str {
+        &self.verification_fingerprint_sha256
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

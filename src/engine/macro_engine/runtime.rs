@@ -563,7 +563,7 @@ impl CompiledMacro {
                 .as_ref()
                 .map(|asset| decode_pinned_image_asset(&saved.pinned_assets, asset, "mask"))
                 .transpose()?;
-            super::image_match::verification::validate_decoded_rule(
+            super::image_verification::validate_decoded_rule(
                 &saved.definition,
                 rule,
                 &template,
@@ -761,10 +761,18 @@ impl MacroRuntime {
             last_observation_at_ms: None,
             action_count: 0,
             paused_event_emitted: false,
+            detector_generations: HashSet::new(),
         };
         let reason = execution
             .execute_blocks(&blocks)
             .unwrap_or(StopReason::Completed);
+        let mut detector_generations = execution
+            .detector_generations
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        detector_generations.sort_unstable();
+        drop(execution);
         if matches!(
             reason,
             StopReason::TechnicalFailure { .. } | StopReason::SafetyLimit { .. }
@@ -779,6 +787,8 @@ impl MacroRuntime {
         }
         emitter.status(RunStatus::Stopping);
         emitter.run_stopped(reason);
+        self.detector
+            .run_finished(emitter.run_id(), &detector_generations);
         Ok(emitter.events)
     }
 
@@ -864,6 +874,7 @@ struct RunExecution<'a, 'clock> {
     last_observation_at_ms: Option<u64>,
     action_count: u64,
     paused_event_emitted: bool,
+    detector_generations: HashSet<u64>,
 }
 
 impl RunExecution<'_, '_> {
@@ -1018,6 +1029,7 @@ impl RunExecution<'_, '_> {
                 return self.resolve_condition_timeout(mode, last_matched);
             }
             let generation = self.runtime.control_handle().generation();
+            self.detector_generations.insert(generation);
             let observed_at_ms = self.runtime.clock.now_ms();
             self.last_observation_at_ms = Some(observed_at_ms);
             let request = ObservationRequest {
@@ -1842,8 +1854,9 @@ mod tests {
             AssetRef, DEFAULT_MAX_SCORE_CELLS, FocusLossPolicy, IMAGE_RULE_VERIFICATION_VERSION,
             ImageRule, ImageRuleVerification, ImageRuleVerificationArtifact,
             ImageRuleVerificationInput, ImageVerificationPreprocess, Limit, MACRO_SCHEMA_VERSION,
-            MatchSelectionPolicy, ObserveMode, PointDefinition, PreprocessProfile,
-            RegionDefinition, SafetyPolicy, TargetProfile, TextMatchMode, TextRule, TimeoutOutcome,
+            MatchSelectionPolicy, NegativeCorpusSample, NegativeSampleEvaluationInputs,
+            ObserveMode, PointDefinition, PreprocessProfile, RegionDefinition, SafetyPolicy,
+            TargetProfile, TextMatchMode, TextRule, TimeoutOutcome,
         },
         types::{PointRatio, Rect, RectRatio, ScreenImage},
     };
@@ -2001,6 +2014,75 @@ mod tests {
             _capture: &(dyn CaptureSource + Send + Sync),
         ) -> Result<super::super::DetectorEvidence> {
             bail!("capture device unavailable")
+        }
+    }
+
+    #[derive(Debug)]
+    struct LifecycleDetector {
+        fail_observation: bool,
+        finished: Mutex<Vec<(String, Vec<u64>)>>,
+    }
+
+    #[derive(Default)]
+    struct GenerationChangingDetector {
+        control: Mutex<Option<RuntimeControlHandle>>,
+        changed: AtomicBool,
+        observed: Mutex<Vec<u64>>,
+        finished: Mutex<Vec<u64>>,
+    }
+
+    impl ConditionDetector for GenerationChangingDetector {
+        fn observe(
+            &self,
+            request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            self.observed.lock().unwrap().push(request.generation);
+            if !self.changed.swap(true, Ordering::SeqCst) {
+                let control = self.control.lock().unwrap().clone().unwrap();
+                control.pause();
+                control.resume();
+            }
+            Ok(super::super::DetectorEvidence::unmatched(
+                request.observed_at_ms,
+                request.observed_at_ms,
+            ))
+        }
+
+        fn run_finished(&self, _run_id: &str, generations: &[u64]) {
+            self.finished.lock().unwrap().extend_from_slice(generations);
+        }
+    }
+
+    impl LifecycleDetector {
+        fn new(fail_observation: bool) -> Self {
+            Self {
+                fail_observation,
+                finished: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ConditionDetector for LifecycleDetector {
+        fn observe(
+            &self,
+            request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            if self.fail_observation {
+                bail!("lifecycle fixture failure");
+            }
+            Ok(super::super::DetectorEvidence::unmatched(
+                request.observed_at_ms,
+                request.observed_at_ms,
+            ))
+        }
+
+        fn run_finished(&self, run_id: &str, generations: &[u64]) {
+            self.finished
+                .lock()
+                .unwrap()
+                .push((run_id.to_string(), generations.to_vec()));
         }
     }
 
@@ -2186,6 +2268,12 @@ mod tests {
             timeout_ms: Limit::Finite(10),
         };
         rule.verification = Some(if let Some(template) = template {
+            let negative_samples = vec![NegativeCorpusSample {
+                stable_id: "negative/a".to_string(),
+                content_sha256: NEGATIVE_CORPUS_SHA256.to_string(),
+                measured_score: 0.80,
+                evaluation: NegativeSampleEvaluationInputs::for_rule(&rule, 96, 1, (384, 216)),
+            }];
             ImageRuleVerification::verify(ImageRuleVerificationInput {
                 rule: &rule,
                 template,
@@ -2194,14 +2282,12 @@ mod tests {
                 current_dpi: 96,
                 region_revision: 1,
                 search_dimensions: (384, 216),
-                negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
-                negative_sample_count: 100_000,
-                best_negative_score: 0.80,
+                negative_samples: &negative_samples,
                 observed_clusters: &[],
                 maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
             })
             .unwrap()
-            .artifact
+            .into_artifact()
         } else {
             let mut artifact = ImageRuleVerificationArtifact {
                 version: IMAGE_RULE_VERIFICATION_VERSION,
@@ -2225,7 +2311,7 @@ mod tests {
                 verification_fingerprint_sha256: String::new(),
             };
             artifact.verification_fingerprint_sha256 =
-                super::super::image_match::verification::fingerprint(&artifact);
+                super::super::image_verification::fingerprint(&artifact);
             artifact
         });
         rule
@@ -2282,6 +2368,62 @@ mod tests {
                 },
             },
         )
+    }
+
+    fn check_now_observation_macro() -> SavedRevision {
+        saved(fixture_definition(vec![block(
+            "observe",
+            BlockKind::Observe {
+                condition: text_condition("observe", ObserveMode::CheckNow),
+            },
+        )]))
+    }
+
+    #[test]
+    fn detector_run_finished_hook_runs_exactly_once_on_success_and_failure() {
+        for fail_observation in [false, true] {
+            let detector = Arc::new(LifecycleDetector::new(fail_observation));
+            let runtime = MacroRuntime::new(
+                Arc::new(FakeCapture),
+                detector.clone(),
+                Arc::new(FakeClock::default()),
+            );
+
+            let events = runtime
+                .run(check_now_observation_macro(), RunMode::DryRun)
+                .unwrap();
+            let stopped_run_id = match events.last().unwrap() {
+                RunEvent::RunStopped { run_id, .. } => run_id,
+                event => panic!("expected terminal run event, got {event:?}"),
+            };
+            let finished = detector.finished.lock().unwrap();
+            assert_eq!(finished.len(), 1);
+            assert_eq!(&finished[0].0, stopped_run_id);
+            assert!(!finished[0].1.is_empty());
+            assert!(finished[0].1.iter().all(|generation| *generation > 0));
+        }
+    }
+
+    #[test]
+    fn detector_completion_covers_generation_changes_during_the_run() {
+        let detector = Arc::new(GenerationChangingDetector::default());
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeCapture),
+            detector.clone(),
+            Arc::new(FakeClock::default()),
+        );
+        *detector.control.lock().unwrap() = Some(runtime.control_handle());
+
+        runtime
+            .run(check_now_observation_macro(), RunMode::DryRun)
+            .unwrap();
+
+        let observed = detector.observed.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(
+            detector.finished.lock().unwrap().as_slice(),
+            observed.as_slice()
+        );
     }
 
     #[test]

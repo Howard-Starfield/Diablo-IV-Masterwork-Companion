@@ -506,7 +506,24 @@ fn dispatch_planned_action(
         }
     }
     match dispatch_inputs(api, click_inputs) {
-        Ok(()) => InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched),
+        Ok(()) => {
+            if stop.is_stopped() {
+                return uncertain(InputDispatchFailure::Stopped);
+            }
+            match manual_takeover() {
+                Ok(true) => return uncertain(InputDispatchFailure::ManualTakeover),
+                Ok(false) => {}
+                Err(error) => {
+                    return uncertain(InputDispatchFailure::InputFailure {
+                        message: error.to_string(),
+                    });
+                }
+            }
+            if let Err(reason) = validate_after_movement() {
+                return uncertain(InputDispatchFailure::Validation { reason });
+            }
+            InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+        }
         Err(failure) => uncertain(InputDispatchFailure::SendInput(failure)),
     }
 }
@@ -1681,6 +1698,7 @@ mod tests {
         outcomes: Mutex<VecDeque<std::result::Result<(), SendInputFailure>>>,
         call_lengths: Mutex<Vec<usize>>,
         stop_after_call: Option<(usize, Arc<Stop>)>,
+        manual_after_call: Option<(usize, Arc<AtomicBool>)>,
     }
 
     impl ScriptedSendInputApi {
@@ -1689,6 +1707,7 @@ mod tests {
                 outcomes: Mutex::new(outcomes.into()),
                 call_lengths: Mutex::new(Vec::new()),
                 stop_after_call: None,
+                manual_after_call: None,
             }
         }
     }
@@ -1707,6 +1726,11 @@ mod tests {
                 && call == *stop_call
             {
                 stop.0.store(true, Ordering::Release);
+            }
+            if let Some((manual_call, manual)) = &self.manual_after_call
+                && call == *manual_call
+            {
+                manual.store(true, Ordering::Release);
             }
             self.outcomes
                 .lock()
@@ -2029,6 +2053,142 @@ mod tests {
             assert_eq!(result, expected);
             assert_eq!(*api.call_lengths.lock().unwrap(), vec![1, 2]);
         }
+    }
+
+    #[test]
+    fn planned_action_stop_during_click_syscall_is_committed_uncertain() {
+        let stop = Arc::new(Stop::default());
+        let mut api = ScriptedSendInputApi::new(vec![Ok(()), Ok(())]);
+        api.stop_after_call = Some((2, stop.clone()));
+        let movement = [marked_mouse_input(
+            windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE,
+            marker(46),
+        )];
+        let click = [
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN,
+                marker(46),
+            ),
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP,
+                marker(46),
+            ),
+        ];
+        let mut manual = || Ok(false);
+        let mut commit = || Ok(());
+        let mut validate = || Ok(());
+
+        let result = dispatch_planned_action(
+            &api,
+            &movement,
+            Duration::ZERO,
+            &click,
+            stop.as_ref(),
+            &mut manual,
+            &mut commit,
+            &mut validate,
+        );
+
+        assert_eq!(
+            result,
+            InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                failure: InputDispatchFailure::Stopped,
+            })
+        );
+        assert_eq!(*api.call_lengths.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn planned_action_manual_takeover_during_click_syscall_is_committed_uncertain() {
+        let manual_takeover = Arc::new(AtomicBool::new(false));
+        let mut api = ScriptedSendInputApi::new(vec![Ok(()), Ok(())]);
+        api.manual_after_call = Some((2, manual_takeover.clone()));
+        let movement = [marked_mouse_input(
+            windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE,
+            marker(47),
+        )];
+        let click = [
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN,
+                marker(47),
+            ),
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP,
+                marker(47),
+            ),
+        ];
+        let mut manual = || Ok(manual_takeover.load(Ordering::Acquire));
+        let mut commit = || Ok(());
+        let mut validate = || Ok(());
+
+        let result = dispatch_planned_action(
+            &api,
+            &movement,
+            Duration::ZERO,
+            &click,
+            &Stop::default(),
+            &mut manual,
+            &mut commit,
+            &mut validate,
+        );
+
+        assert_eq!(
+            result,
+            InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                failure: InputDispatchFailure::ManualTakeover,
+            })
+        );
+        assert_eq!(*api.call_lengths.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn planned_action_validation_failure_after_click_syscall_is_committed_uncertain() {
+        let api = ScriptedSendInputApi::new(vec![Ok(()), Ok(())]);
+        let movement = [marked_mouse_input(
+            windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE,
+            marker(48),
+        )];
+        let click = [
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN,
+                marker(48),
+            ),
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP,
+                marker(48),
+            ),
+        ];
+        let validations = AtomicU64::new(0);
+        let mut manual = || Ok(false);
+        let mut commit = || Ok(());
+        let mut validate = || {
+            if validations.fetch_add(1, Ordering::AcqRel) == 0 {
+                Ok(())
+            } else {
+                Err(BlockReason::StaleObservation)
+            }
+        };
+
+        let result = dispatch_planned_action(
+            &api,
+            &movement,
+            Duration::ZERO,
+            &click,
+            &Stop::default(),
+            &mut manual,
+            &mut commit,
+            &mut validate,
+        );
+
+        assert_eq!(
+            result,
+            InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                failure: InputDispatchFailure::Validation {
+                    reason: BlockReason::StaleObservation,
+                },
+            })
+        );
+        assert_eq!(*api.call_lengths.lock().unwrap(), vec![1, 2]);
     }
 
     #[test]

@@ -8676,6 +8676,83 @@ mod tests {
         }
     }
 
+    fn watch_pool_state_diagnostic(pool: &WatchDetectorPool) -> String {
+        let state = lock_watch_pool_state(&pool.inner);
+        let active: Vec<_> = state
+            .active
+            .iter()
+            .map(|(key, (job_id, family))| format!("{}:{job_id}:{family:?}", key.lane_id))
+            .collect();
+        let pending: Vec<_> = state
+            .pending
+            .iter()
+            .map(|(key, pending)| {
+                format!(
+                    "{}:{}:frame{}",
+                    key.lane_id,
+                    pending.newest.job_id,
+                    pending.newest.capture.frame_id()
+                )
+            })
+            .collect();
+        let delayed: Vec<_> = state
+            .delayed
+            .iter()
+            .map(|(key, delayed)| {
+                format!(
+                    "{}:{}:frame{}",
+                    key.lane_id,
+                    delayed.newest.job_id,
+                    delayed.newest.capture.frame_id()
+                )
+            })
+            .collect();
+        format!("active={active:?}, pending={pending:?}, delayed={delayed:?}")
+    }
+
+    fn wait_for_pending_watch_frame(pool: &WatchDetectorPool, lane_id: &str, frame_id: u64) -> u64 {
+        let started = std::time::Instant::now();
+        loop {
+            let pending_job_id = {
+                let state = lock_watch_pool_state(&pool.inner);
+                state.pending.iter().find_map(|(key, pending)| {
+                    (key.lane_id == lane_id && pending.newest.capture.frame_id() == frame_id)
+                        .then_some(pending.newest.job_id)
+                })
+            };
+            if let Some(job_id) = pending_job_id {
+                return job_id;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "pending Watch lane '{lane_id}' never installed frame {frame_id}; {}",
+                watch_pool_state_diagnostic(pool)
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn wait_for_watch_lane_idle(pool: &WatchDetectorPool, lane_id: &str) {
+        let started = std::time::Instant::now();
+        loop {
+            let idle = {
+                let state = lock_watch_pool_state(&pool.inner);
+                !state.active.keys().any(|key| key.lane_id == lane_id)
+                    && !state.pending.keys().any(|key| key.lane_id == lane_id)
+                    && !state.delayed.keys().any(|key| key.lane_id == lane_id)
+            };
+            if idle {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "Watch lane '{lane_id}' did not become idle; {}",
+                watch_pool_state_diagnostic(pool)
+            );
+            thread::yield_now();
+        }
+    }
+
     fn wait_for_cleanup_failures(pool: &WatchDetectorPool, minimum: usize) {
         let started = std::time::Instant::now();
         while lock_watch_pool_state(&pool.inner).cleanup_failures.len() < minimum {
@@ -9625,7 +9702,8 @@ mod tests {
             first_matched: false,
         });
         let mut runtime = MacroRuntime::new(capture.clone(), detector.clone(), clock.clone());
-        runtime.watch_pool = isolated_text_watch_pool(false);
+        let pool = isolated_text_watch_pool(false);
+        runtime.watch_pool = pool;
         let mut watch = watch_group(
             vec![watch_lane(
                 "lane-1",
@@ -9651,14 +9729,17 @@ mod tests {
 
         clock.set(60);
         wait_for_counter(&capture.0, 2);
+        let frame_2_job_id = wait_for_pending_watch_frame(pool, "lane-1", 2);
         clock.set(120);
         wait_for_counter(&capture.0, 3);
+        let frame_3_job_id = wait_for_pending_watch_frame(pool, "lane-1", 3);
+        assert!(frame_3_job_id > frame_2_job_id);
         clock.set(121);
         let (lock, wake) = &*release;
         *lock.lock().unwrap() = true;
         wake.notify_all();
         wait_for_counter(&detector.calls, 2);
-        thread::sleep(Duration::from_millis(20));
+        wait_for_watch_lane_idle(pool, "lane-1");
         clock.set(146);
 
         let events = done_rx

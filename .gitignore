@@ -1,5 +1,6 @@
 # Local notes/backups
 /.git-backups/
+/.worktrees/
 /learn.txt
 
 # Rust build outputs

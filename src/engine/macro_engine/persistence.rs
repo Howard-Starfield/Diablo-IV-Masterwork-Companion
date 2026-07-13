@@ -11,7 +11,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{AssetRef, MACRO_SCHEMA_VERSION, MacroDefinition};
+use super::{
+    AssetRef, CandidateCluster, ImageRuleVerification, ImageRuleVerificationArtifact,
+    ImageRuleVerificationInput, MACRO_SCHEMA_VERSION, MacroDefinition, NegativeCorpusSample,
+    NegativeSampleEvaluationInputs,
+};
 
 static STORE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 static STORE_ACTIVITY: OnceLock<Mutex<HashMap<PathBuf, Weak<StoreActivity>>>> = OnceLock::new();
@@ -123,6 +127,12 @@ pub struct PinnedAsset {
 }
 
 pub const PACKAGE_SCHEMA_VERSION: u32 = 1;
+const MAX_PACKAGE_IMAGE_RULES: usize = 128;
+const MAX_PACKAGE_ASSETS: usize = 256;
+const MAX_PACKAGE_MANIFEST_BYTES: u64 = 1_048_576;
+const MAX_PACKAGE_DEFINITION_BYTES: u64 = 4_194_304;
+const MAX_PACKAGE_ASSET_BYTES: u64 = 4_194_304;
+const MAX_PACKAGE_TOTAL_ASSET_BYTES: u64 = 67_108_864;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackageAsset {
@@ -136,6 +146,91 @@ pub struct MacroPackage {
     pub schema_version: u32,
     pub definition: MacroDefinition,
     pub assets: Vec<PackageAsset>,
+}
+
+#[derive(Debug)]
+pub enum PreparedPackageImport {
+    Text(PreparedTextImport),
+    Image(PendingImageImport),
+}
+
+#[derive(Debug)]
+pub struct PreparedTextImport {
+    package: MacroPackage,
+    package_fingerprint: String,
+}
+
+impl PreparedTextImport {
+    pub fn package_fingerprint(&self) -> &str {
+        &self.package_fingerprint
+    }
+}
+
+#[derive(Debug)]
+pub struct PendingImageImport {
+    package_fingerprint: String,
+    plan_fingerprint: String,
+    destination_state_fingerprint: String,
+    source_macro_id: String,
+    destination_macro_id: String,
+    definition: MacroDefinition,
+    image_rule_ids: Vec<String>,
+    portable_assets: HashSet<AssetRef>,
+}
+
+impl PendingImageImport {
+    pub fn package_fingerprint(&self) -> &str {
+        &self.package_fingerprint
+    }
+
+    pub fn destination_macro_id(&self) -> &str {
+        &self.destination_macro_id
+    }
+
+    pub fn definition(&self) -> &MacroDefinition {
+        &self.definition
+    }
+
+    pub fn image_rule_ids(&self) -> &[String] {
+        &self.image_rule_ids
+    }
+}
+
+/// Native composition supplies freshly captured PNG bytes and current target
+/// evidence. The store derives the exact rule geometry from the pending plan,
+/// runs the existing verifier, and returns a private-field completion token.
+pub struct LocalImageRuleVerificationInput<'a> {
+    pub rule_id: &'a str,
+    pub template_png: &'a [u8],
+    pub mask_png: Option<&'a [u8]>,
+    pub current_dpi: u32,
+    pub negative_samples: &'a [LocalNegativeSample],
+    pub observed_clusters: &'a [CandidateCluster],
+    pub maximum_score_cells: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalNegativeSample {
+    pub stable_id: String,
+    pub content_sha256: String,
+    pub measured_score: f32,
+}
+
+#[derive(Debug)]
+pub struct LocalImageRuleReverification {
+    package_fingerprint: String,
+    plan_fingerprint: String,
+    destination_state_fingerprint: String,
+    rule_id: String,
+    template: PackageAsset,
+    mask: Option<PackageAsset>,
+    artifact: ImageRuleVerificationArtifact,
+}
+
+impl LocalImageRuleReverification {
+    pub fn rule_id(&self) -> &str {
+        &self.rule_id
+    }
 }
 
 /// Portable image-verification artifacts are untrusted until the destination
@@ -1426,12 +1521,20 @@ impl MacroStore {
             bail!("package path is not a folder");
         }
         let manifest_path = package_file(&root, Path::new("manifest.json"))?;
-        let manifest: PackageManifest = serde_json::from_slice(
-            &fs::read(&manifest_path).context("could not read package manifest")?,
-        )
+        let manifest: PackageManifest = serde_json::from_slice(&read_bounded_file(
+            &manifest_path,
+            MAX_PACKAGE_MANIFEST_BYTES,
+            "package manifest",
+        )?)
         .context("corrupt package manifest JSON")?;
         if manifest.schema_version != PACKAGE_SCHEMA_VERSION {
             bail!("unsupported package schema {}", manifest.schema_version);
+        }
+        if manifest.assets.len() > MAX_PACKAGE_ASSETS {
+            bail!(
+                "package asset count {} exceeds maximum {MAX_PACKAGE_ASSETS}",
+                manifest.assets.len()
+            );
         }
         validate_package_relative(&manifest.definition)?;
         for asset in &manifest.assets {
@@ -1439,9 +1542,11 @@ impl MacroStore {
         }
 
         let definition_path = package_file(&root, &manifest.definition)?;
-        let definition: MacroDefinition = serde_json::from_slice(
-            &fs::read(&definition_path).context("could not read package definition")?,
-        )
+        let definition: MacroDefinition = serde_json::from_slice(&read_bounded_file(
+            &definition_path,
+            MAX_PACKAGE_DEFINITION_BYTES,
+            "package definition",
+        )?)
         .context("corrupt macro JSON")?;
         if definition.schema_version != MACRO_SCHEMA_VERSION {
             bail!("unsupported macro schema {}", definition.schema_version);
@@ -1452,13 +1557,19 @@ impl MacroStore {
 
         let mut assets = Vec::with_capacity(manifest.assets.len());
         let mut manifest_refs = HashSet::new();
+        let mut total_asset_bytes = 0_u64;
         for entry in manifest.assets {
             if !manifest_refs.insert(entry.asset.clone()) {
                 bail!("duplicate asset entry in package manifest");
             }
             let path = package_file(&root, &entry.path)?;
-            let bytes = fs::read(&path)
-                .with_context(|| format!("missing package asset {}", entry.asset.content_hash))?;
+            let bytes = read_bounded_file(&path, MAX_PACKAGE_ASSET_BYTES, "package asset")?;
+            total_asset_bytes = total_asset_bytes
+                .checked_add(bytes.len() as u64)
+                .context("package asset byte total overflow")?;
+            if total_asset_bytes > MAX_PACKAGE_TOTAL_ASSET_BYTES {
+                bail!("package asset bytes exceed maximum {MAX_PACKAGE_TOTAL_ASSET_BYTES}");
+            }
             if sha256_hex(&bytes) != entry.asset.content_hash {
                 bail!("package asset hash mismatch: {}", entry.asset.content_hash);
             }
@@ -1483,8 +1594,21 @@ impl MacroStore {
         Ok(package)
     }
 
-    pub fn export_package(&self, saved: &SavedRevision, package_root: &Path) -> Result<()> {
+    /// Exports only the checked current immutable revision owned by this store.
+    /// Callers cannot substitute an editor draft or a forged `SavedRevision`.
+    pub fn export_current_package(&self, macro_id: &str, package_root: &Path) -> Result<()> {
         let _guard = lock_store(&self.lock)?;
+        let saved = self.load_current_locked(macro_id)?;
+        self.export_package_locked(&saved, package_root)
+    }
+
+    #[cfg(test)]
+    fn export_package(&self, saved: &SavedRevision, package_root: &Path) -> Result<()> {
+        let _guard = lock_store(&self.lock)?;
+        self.export_package_locked(saved, package_root)
+    }
+
+    fn export_package_locked(&self, saved: &SavedRevision, package_root: &Path) -> Result<()> {
         validate_identity_set(referenced_assets(&saved.definition))?;
         let parent = package_root
             .parent()
@@ -1544,12 +1668,355 @@ impl MacroStore {
         Ok(())
     }
 
-    pub fn import_package(&self, package_root: &Path) -> Result<SavedRevision> {
+    pub fn prepare_package_import(&self, package_root: &Path) -> Result<PreparedPackageImport> {
         let package = Self::validate_package(package_root)?;
-        self.import_validated_package(package)
+        self.prepare_validated_package_import(package)
     }
 
-    pub fn import_validated_package(&self, mut package: MacroPackage) -> Result<SavedRevision> {
+    fn prepare_validated_package_import(
+        &self,
+        mut package: MacroPackage,
+    ) -> Result<PreparedPackageImport> {
+        validate_package_memory(&package)?;
+        let fingerprint = package_fingerprint(&package)?;
+        if package.definition.image_rules.is_empty() {
+            validate_package_compiles(&package)?;
+            return Ok(PreparedPackageImport::Text(PreparedTextImport {
+                package,
+                package_fingerprint: fingerprint,
+            }));
+        }
+        if package.definition.image_rules.len() > MAX_PACKAGE_IMAGE_RULES {
+            bail!(
+                "package image rule count {} exceeds maximum {MAX_PACKAGE_IMAGE_RULES}",
+                package.definition.image_rules.len()
+            );
+        }
+
+        // Portable proof is intentionally discarded before any validation that
+        // could treat it as executable/trusted verifier output.
+        for rule in &mut package.definition.image_rules {
+            rule.verification = None;
+        }
+        validate_image_import_structure(&package)?;
+        let _guard = lock_store(&self.lock)?;
+        let existing_macro_ids = self.existing_macro_ids_locked()?;
+        let source_macro_id = package.definition.id.clone();
+        let destination_macro_id = remap_id(&source_macro_id, &existing_macro_ids);
+        package.definition.id = destination_macro_id.clone();
+        let destination_state_fingerprint = self.import_destination_fingerprint_locked()?;
+        let image_rule_ids = package
+            .definition
+            .image_rules
+            .iter()
+            .map(|rule| rule.id.clone())
+            .collect::<Vec<_>>();
+        let portable_assets = package
+            .assets
+            .iter()
+            .map(|asset| asset.asset.clone())
+            .collect::<HashSet<_>>();
+        let plan_fingerprint = pending_image_plan_fingerprint(
+            &fingerprint,
+            &destination_state_fingerprint,
+            &source_macro_id,
+            &destination_macro_id,
+            &package.definition,
+            &portable_assets,
+        )?;
+        Ok(PreparedPackageImport::Image(PendingImageImport {
+            package_fingerprint: fingerprint,
+            plan_fingerprint,
+            destination_state_fingerprint,
+            source_macro_id,
+            destination_macro_id,
+            definition: package.definition,
+            image_rule_ids,
+            portable_assets,
+        }))
+    }
+
+    pub fn commit_text_package_import(
+        &self,
+        prepared: PreparedTextImport,
+    ) -> Result<SavedRevision> {
+        if package_fingerprint(&prepared.package)? != prepared.package_fingerprint {
+            bail!("prepared text package fingerprint changed");
+        }
+        self.import_validated_package(prepared.package)
+    }
+
+    pub fn import_package(&self, package_root: &Path) -> Result<SavedRevision> {
+        let package = Self::validate_package(package_root)?;
+        if !package.definition.image_rules.is_empty() {
+            return Err(LocalReverificationRequired {
+                image_rule_ids: package
+                    .definition
+                    .image_rules
+                    .iter()
+                    .map(|rule| rule.id.clone())
+                    .collect(),
+            }
+            .into());
+        }
+        match self.prepare_validated_package_import(package)? {
+            PreparedPackageImport::Text(prepared) => self.commit_text_package_import(prepared),
+            PreparedPackageImport::Image(_) => unreachable!("image packages returned above"),
+        }
+    }
+
+    pub fn complete_local_image_reverification(
+        &self,
+        pending: &PendingImageImport,
+        input: LocalImageRuleVerificationInput<'_>,
+    ) -> Result<LocalImageRuleReverification> {
+        let _guard = lock_store(&self.lock)?;
+        self.recheck_pending_image_import_locked(pending)?;
+        let mut definition = pending.definition.clone();
+        let rule_index = definition
+            .image_rules
+            .iter()
+            .position(|rule| rule.id == input.rule_id)
+            .with_context(|| format!("pending image rule '{}' does not exist", input.rule_id))?;
+        if definition.image_rules[rule_index]
+            .transparent_mask
+            .is_some()
+            != input.mask_png.is_some()
+        {
+            bail!("local image recapture must preserve transparent-mask presence");
+        }
+        let portable_identities = pending.portable_assets.iter().cloned().collect::<Vec<_>>();
+        let index = self.assets.load_index_locked()?;
+        let template = fresh_local_import_asset(
+            &index.bindings,
+            &portable_identities,
+            &pending.package_fingerprint,
+            input.rule_id,
+            "template",
+            input.template_png,
+        )?;
+        let mut reserved = portable_identities;
+        reserved.push(template.asset.clone());
+        let mask = input
+            .mask_png
+            .map(|bytes| {
+                fresh_local_import_asset(
+                    &index.bindings,
+                    &reserved,
+                    &pending.package_fingerprint,
+                    input.rule_id,
+                    "mask",
+                    bytes,
+                )
+            })
+            .transpose()?;
+
+        {
+            let rule = &mut definition.image_rules[rule_index];
+            rule.template = template.asset.clone();
+            rule.transparent_mask = mask.as_ref().map(|asset| asset.asset.clone());
+            rule.verification = None;
+        }
+        let rule = &definition.image_rules[rule_index];
+        let region = definition
+            .regions
+            .iter()
+            .find(|region| region.id == rule.region_id)
+            .context("pending image rule region is missing")?;
+        let client = crate::engine::types::Rect::new(
+            0,
+            0,
+            definition.target.captured_client_width,
+            definition.target.captured_client_height,
+        );
+        let search = client.rect_from_ratio(region.rect);
+        let template_image = ImageRuleVerification::decode_template_png(&template.bytes)?;
+        let mask_image = mask
+            .as_ref()
+            .map(|asset| ImageRuleVerification::decode_mask_png(&asset.bytes))
+            .transpose()?;
+        let negative_samples = input
+            .negative_samples
+            .iter()
+            .map(|sample| NegativeCorpusSample {
+                stable_id: sample.stable_id.clone(),
+                content_sha256: sample.content_sha256.clone(),
+                measured_score: sample.measured_score,
+                evaluation: NegativeSampleEvaluationInputs::for_rule(
+                    rule,
+                    definition.target.captured_dpi,
+                    region.revision,
+                    (search.width, search.height),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let verification = ImageRuleVerification::verify(ImageRuleVerificationInput {
+            rule,
+            template: &template_image,
+            mask: mask_image.as_ref(),
+            captured_dpi: definition.target.captured_dpi,
+            current_dpi: input.current_dpi,
+            region_revision: region.revision,
+            search_dimensions: (search.width, search.height),
+            negative_samples: &negative_samples,
+            observed_clusters: input.observed_clusters,
+            maximum_score_cells: input.maximum_score_cells,
+        })
+        .map_err(anyhow::Error::new)?;
+        let artifact = verification.into_artifact();
+        super::image_verification::validate_candidate_binding(&definition, rule, &artifact)
+            .map_err(|problem| {
+                anyhow::anyhow!("local image verification binding is invalid: {problem:?}")
+            })?;
+        Ok(LocalImageRuleReverification {
+            package_fingerprint: pending.package_fingerprint.clone(),
+            plan_fingerprint: pending.plan_fingerprint.clone(),
+            destination_state_fingerprint: pending.destination_state_fingerprint.clone(),
+            rule_id: input.rule_id.to_string(),
+            template,
+            mask,
+            artifact,
+        })
+    }
+
+    pub fn commit_image_package_import(
+        &self,
+        pending: PendingImageImport,
+        completions: Vec<LocalImageRuleReverification>,
+    ) -> Result<SavedRevision> {
+        let _guard = lock_store(&self.lock)?;
+        self.recheck_pending_image_import_locked(&pending)?;
+        if completions.len() != pending.image_rule_ids.len() {
+            bail!("every pending image rule requires one local re-verification");
+        }
+        let mut by_rule = HashMap::new();
+        for completion in completions {
+            if completion.package_fingerprint != pending.package_fingerprint
+                || completion.plan_fingerprint != pending.plan_fingerprint
+                || completion.destination_state_fingerprint != pending.destination_state_fingerprint
+            {
+                bail!("local image re-verification belongs to a stale package plan");
+            }
+            if by_rule
+                .insert(completion.rule_id.clone(), completion)
+                .is_some()
+            {
+                bail!("duplicate local image re-verification");
+            }
+        }
+        let mut definition = pending.definition.clone();
+        let mut local_assets = Vec::new();
+        for rule in &mut definition.image_rules {
+            let completion = by_rule
+                .remove(&rule.id)
+                .with_context(|| format!("image rule '{}' was not locally re-verified", rule.id))?;
+            if pending.portable_assets.contains(&completion.template.asset)
+                || completion
+                    .mask
+                    .as_ref()
+                    .is_some_and(|mask| pending.portable_assets.contains(&mask.asset))
+            {
+                bail!("portable image asset identity cannot satisfy local re-verification");
+            }
+            rule.template = completion.template.asset.clone();
+            rule.transparent_mask = completion.mask.as_ref().map(|mask| mask.asset.clone());
+            rule.verification = Some(completion.artifact);
+            local_assets.push(completion.template);
+            if let Some(mask) = completion.mask {
+                local_assets.push(mask);
+            }
+        }
+        if !by_rule.is_empty() {
+            bail!("local image re-verification references an unexpected rule");
+        }
+        validate_identity_set(local_assets.iter().map(|asset| &asset.asset))?;
+        let mut installed = Vec::new();
+        for asset in &local_assets {
+            match self
+                .assets
+                .install_locked(asset.asset.clone(), &asset.bytes)
+            {
+                Ok(change) => installed.push(change),
+                Err(error) => {
+                    let rollback = self.assets.rollback_locked(&installed);
+                    return match rollback {
+                        Ok(()) => Err(error),
+                        Err(rollback_error) => Err(error
+                            .context(format!("asset rollback also failed: {rollback_error:#}"))),
+                    };
+                }
+            }
+        }
+        #[cfg(test)]
+        if self.fail_import_after_assets.swap(false, Ordering::SeqCst) {
+            self.assets.rollback_locked(&installed)?;
+            bail!("injected import failure after asset installs");
+        }
+        match self.save_validated_locked(definition) {
+            Ok(saved) => Ok(saved),
+            Err(error) => {
+                let rollback = self.assets.rollback_locked(&installed);
+                match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => {
+                        Err(error
+                            .context(format!("asset rollback also failed: {rollback_error:#}")))
+                    }
+                }
+            }
+        }
+    }
+
+    fn recheck_pending_image_import_locked(&self, pending: &PendingImageImport) -> Result<()> {
+        if pending_image_plan_fingerprint(
+            &pending.package_fingerprint,
+            &pending.destination_state_fingerprint,
+            &pending.source_macro_id,
+            &pending.destination_macro_id,
+            &pending.definition,
+            &pending.portable_assets,
+        )? != pending.plan_fingerprint
+        {
+            bail!("pending image import fingerprint changed; prepare again");
+        }
+        if self.import_destination_fingerprint_locked()? != pending.destination_state_fingerprint {
+            bail!("pending image import destination changed; prepare again");
+        }
+        let expected = remap_id(&pending.source_macro_id, &self.existing_macro_ids_locked()?);
+        if expected != pending.destination_macro_id || pending.definition.id != expected {
+            bail!("pending image import identity changed; prepare again");
+        }
+        Ok(())
+    }
+
+    fn existing_macro_ids_locked(&self) -> Result<HashSet<String>> {
+        Ok(fs::read_dir(self.root.join("definitions"))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| {
+                let id = entry.file_name().to_string_lossy().into_owned();
+                (!id.starts_with(".deleting-")).then_some(id)
+            })
+            .collect())
+    }
+
+    fn import_destination_fingerprint_locked(&self) -> Result<String> {
+        let mut macro_ids = self
+            .existing_macro_ids_locked()?
+            .into_iter()
+            .collect::<Vec<_>>();
+        macro_ids.sort();
+        let mut bindings = self.assets.load_index_locked()?.bindings;
+        bindings.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.revision.cmp(&right.revision))
+                .then_with(|| left.content_hash.cmp(&right.content_hash))
+        });
+        Ok(sha256_hex(&serde_json::to_vec(&(macro_ids, bindings))?))
+    }
+
+    fn import_validated_package(&self, mut package: MacroPackage) -> Result<SavedRevision> {
         reject_portable_image_rules(&package)?;
         validate_package_memory(&package)?;
         let _guard = lock_store(&self.lock)?;
@@ -1968,6 +2435,36 @@ fn validate_package_memory(package: &MacroPackage) -> Result<()> {
             package.definition.schema_version
         );
     }
+    if package.definition.image_rules.len() > MAX_PACKAGE_IMAGE_RULES {
+        bail!(
+            "package image rule count {} exceeds maximum {MAX_PACKAGE_IMAGE_RULES}",
+            package.definition.image_rules.len()
+        );
+    }
+    let definition_bytes = serde_json::to_vec(&package.definition)?;
+    if u64::try_from(definition_bytes.len()).context("package definition length overflow")?
+        > MAX_PACKAGE_DEFINITION_BYTES
+    {
+        bail!("package definition bytes exceed maximum {MAX_PACKAGE_DEFINITION_BYTES}");
+    }
+    if package.assets.len() > MAX_PACKAGE_ASSETS {
+        bail!(
+            "package asset count {} exceeds maximum {MAX_PACKAGE_ASSETS}",
+            package.assets.len()
+        );
+    }
+    let total_asset_bytes = package.assets.iter().try_fold(0_u64, |total, asset| {
+        let bytes = u64::try_from(asset.bytes.len()).context("package asset length overflow")?;
+        if bytes > MAX_PACKAGE_ASSET_BYTES {
+            bail!("package asset bytes exceed maximum {MAX_PACKAGE_ASSET_BYTES}");
+        }
+        total
+            .checked_add(bytes)
+            .context("package asset byte total overflow")
+    })?;
+    if total_asset_bytes > MAX_PACKAGE_TOTAL_ASSET_BYTES {
+        bail!("package asset bytes exceed maximum {MAX_PACKAGE_TOTAL_ASSET_BYTES}");
+    }
     validate_component("macro ID", &package.definition.id)?;
     validate_identity_set(referenced_assets(&package.definition))?;
     validate_identity_set(package.assets.iter().map(|asset| &asset.asset))?;
@@ -1988,6 +2485,111 @@ fn validate_package_memory(package: &MacroPackage) -> Result<()> {
         bail!("package asset references do not match definition");
     }
     Ok(())
+}
+
+fn package_fingerprint(package: &MacroPackage) -> Result<String> {
+    let assets = package
+        .assets
+        .iter()
+        .map(|asset| (&asset.asset, &asset.relative_path, &asset.bytes))
+        .collect::<Vec<_>>();
+    Ok(sha256_hex(&serde_json::to_vec(&(
+        package.schema_version,
+        &package.definition,
+        assets,
+    ))?))
+}
+
+fn pending_image_plan_fingerprint(
+    package_fingerprint: &str,
+    destination_state_fingerprint: &str,
+    source_macro_id: &str,
+    destination_macro_id: &str,
+    definition: &MacroDefinition,
+    portable_assets: &HashSet<AssetRef>,
+) -> Result<String> {
+    let mut assets = portable_assets.iter().collect::<Vec<_>>();
+    assets.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.revision.cmp(&right.revision))
+            .then_with(|| left.content_hash.cmp(&right.content_hash))
+    });
+    Ok(sha256_hex(&serde_json::to_vec(&(
+        package_fingerprint,
+        destination_state_fingerprint,
+        source_macro_id,
+        destination_macro_id,
+        definition,
+        assets,
+    ))?))
+}
+
+fn validate_image_import_structure(package: &MacroPackage) -> Result<()> {
+    validate_macro_name(&package.definition.name)?;
+    let problems = super::validate_macro(&package.definition)
+        .into_iter()
+        .filter(|problem| problem.code != "image_rule.missing_verification")
+        .collect::<Vec<_>>();
+    if !problems.is_empty() {
+        bail!("image package definition is invalid: {problems:?}");
+    }
+    let assets = package
+        .assets
+        .iter()
+        .map(|asset| (asset.asset.clone(), asset.bytes.as_slice()))
+        .collect::<HashMap<_, _>>();
+    for rule in &package.definition.image_rules {
+        let template = assets
+            .get(&rule.template)
+            .context("image package template is missing from its frozen snapshot")?;
+        ImageRuleVerification::decode_template_png(template)?;
+        if let Some(mask) = &rule.transparent_mask {
+            let mask = assets
+                .get(mask)
+                .context("image package mask is missing from its frozen snapshot")?;
+            ImageRuleVerification::decode_mask_png(mask)?;
+        }
+    }
+    Ok(())
+}
+
+fn fresh_local_import_asset(
+    existing: &[AssetRef],
+    reserved: &[AssetRef],
+    package_fingerprint: &str,
+    rule_id: &str,
+    kind: &str,
+    bytes: &[u8],
+) -> Result<PackageAsset> {
+    if bytes.is_empty() {
+        bail!("local {kind} recapture is empty");
+    }
+    let package_prefix = package_fingerprint
+        .get(..16)
+        .context("pending package fingerprint is invalid")?;
+    let rule_hash = sha256_hex(rule_id.as_bytes());
+    let rule_prefix = rule_hash
+        .get(..16)
+        .context("local rule fingerprint is invalid")?;
+    let base = format!("local-{package_prefix}-{rule_prefix}-{kind}");
+    let occupied = existing
+        .iter()
+        .chain(reserved)
+        .map(|asset| asset.id.clone())
+        .collect::<HashSet<_>>();
+    let id = remap_id(&base, &occupied);
+    let asset = AssetRef {
+        id,
+        revision: 1,
+        content_hash: sha256_hex(bytes),
+    };
+    validate_asset_ref(&asset)?;
+    Ok(PackageAsset {
+        relative_path: PathBuf::from(format!("local/{kind}.png")),
+        asset,
+        bytes: bytes.to_vec(),
+    })
 }
 
 fn reject_portable_image_rules(package: &MacroPackage) -> Result<()> {
@@ -2066,6 +2668,21 @@ fn package_file(root: &Path, relative: &Path) -> Result<PathBuf> {
         bail!("reference points outside package");
     }
     Ok(canonical)
+}
+
+fn read_bounded_file(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>> {
+    let metadata = fs::metadata(path).with_context(|| format!("could not inspect {label}"))?;
+    if !metadata.is_file() {
+        bail!("{label} is not a regular file");
+    }
+    if metadata.len() > maximum {
+        bail!("{label} bytes {} exceed maximum {maximum}", metadata.len());
+    }
+    let bytes = fs::read(path).with_context(|| format!("could not read {label}"))?;
+    if u64::try_from(bytes.len()).context("bounded file length overflow")? > maximum {
+        bail!("{label} grew beyond maximum {maximum} while reading");
+    }
+    Ok(bytes)
 }
 
 fn validate_package_relative(relative: &Path) -> Result<()> {
@@ -4048,5 +4665,399 @@ mod tests {
         assert!(active_path.exists());
         drop(active_journal);
         drop(active);
+    }
+
+    #[test]
+    fn export_current_rechecks_the_checked_immutable_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        store.save_validated(compilable_text_definition()).unwrap();
+        let package = temp.path().join("checked-export");
+
+        store.export_current_package("macro-one", &package).unwrap();
+        let exported: MacroDefinition =
+            serde_json::from_slice(&fs::read(package.join("macro.json")).unwrap()).unwrap();
+        assert_eq!(exported.name, "Macro One");
+
+        fs::write(
+            temp.path()
+                .join("macro_data/definitions/macro-one/current.json"),
+            b"{}",
+        )
+        .unwrap();
+        assert!(
+            store
+                .export_current_package("macro-one", &temp.path().join("rejected-export"))
+                .is_err()
+        );
+        assert!(!temp.path().join("rejected-export").exists());
+    }
+
+    #[test]
+    fn text_prepare_is_non_mutating_and_survives_source_deletion() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        source.save_validated(compilable_text_definition()).unwrap();
+        let package_path = source_temp.path().join("text-package");
+        source
+            .export_current_package("macro-one", &package_path)
+            .unwrap();
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+
+        let prepared = match destination.prepare_package_import(&package_path).unwrap() {
+            PreparedPackageImport::Text(prepared) => prepared,
+            PreparedPackageImport::Image(_) => panic!("text package was misclassified"),
+        };
+        assert_eq!(
+            fs::read_dir(destination.root.join("definitions"))
+                .unwrap()
+                .count(),
+            0
+        );
+        fs::remove_dir_all(&package_path).unwrap();
+
+        let imported = destination.commit_text_package_import(prepared).unwrap();
+        assert_eq!(imported.definition.id, "macro-one");
+    }
+
+    #[test]
+    fn image_prepare_is_non_mutating_and_strips_portable_proofs() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let (template, bytes) = fixture_png(7);
+        let asset = source.assets().put_png(&bytes).unwrap();
+        source
+            .save_validated(compilable_image_definition(asset, &template, None))
+            .unwrap();
+        let package_path = source_temp.path().join("image-package");
+        source
+            .export_current_package("macro-one", &package_path)
+            .unwrap();
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+
+        let pending = match destination.prepare_package_import(&package_path).unwrap() {
+            PreparedPackageImport::Image(pending) => pending,
+            PreparedPackageImport::Text(_) => panic!("image package was misclassified"),
+        };
+        assert_eq!(pending.image_rule_ids(), &["image-one"]);
+        assert!(
+            pending
+                .definition()
+                .image_rules
+                .iter()
+                .all(|rule| rule.verification.is_none())
+        );
+        assert_eq!(
+            fs::read_dir(destination.root.join("definitions"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(destination.root.join("assets"))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+                .count(),
+            0
+        );
+        fs::remove_dir_all(package_path).unwrap();
+        assert_eq!(pending.definition().id, "macro-one");
+    }
+
+    #[test]
+    fn image_commit_accepts_only_fresh_local_verifier_completions() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let (portable_template, portable_bytes) = fixture_png(7);
+        let portable_asset = source.assets().put_png(&portable_bytes).unwrap();
+        source
+            .save_validated(compilable_image_definition(
+                portable_asset.clone(),
+                &portable_template,
+                None,
+            ))
+            .unwrap();
+        let package_path = source_temp.path().join("image-package");
+        source
+            .export_current_package("macro-one", &package_path)
+            .unwrap();
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+        let pending = match destination.prepare_package_import(&package_path).unwrap() {
+            PreparedPackageImport::Image(pending) => pending,
+            PreparedPackageImport::Text(_) => panic!("image package was misclassified"),
+        };
+        fs::remove_dir_all(package_path).unwrap();
+        let (_local_template, local_bytes) = fixture_png(91);
+        let negatives = vec![LocalNegativeSample {
+            stable_id: "local-negative/a".to_string(),
+            content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            measured_score: 0.80,
+        }];
+        let completion = destination
+            .complete_local_image_reverification(
+                &pending,
+                LocalImageRuleVerificationInput {
+                    rule_id: "image-one",
+                    template_png: &local_bytes,
+                    mask_png: None,
+                    current_dpi: 96,
+                    negative_samples: &negatives,
+                    observed_clusters: &[],
+                    maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+                },
+            )
+            .unwrap();
+
+        let saved = destination
+            .commit_image_package_import(pending, vec![completion])
+            .unwrap();
+
+        let local = &saved.definition.image_rules[0].template;
+        assert!(local.id.starts_with("local-"));
+        assert_ne!(local, &portable_asset);
+        assert_eq!(destination.assets().read(local).unwrap(), local_bytes);
+        assert!(CompiledMacro::compile(saved).is_ok());
+    }
+
+    #[test]
+    fn image_commit_rechecks_destination_and_rolls_back_local_assets() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let (portable_template, portable_bytes) = fixture_png(7);
+        let portable_asset = source.assets().put_png(&portable_bytes).unwrap();
+        source
+            .save_validated(compilable_image_definition(
+                portable_asset,
+                &portable_template,
+                None,
+            ))
+            .unwrap();
+        let package_path = source_temp.path().join("image-package");
+        source
+            .export_current_package("macro-one", &package_path)
+            .unwrap();
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+        let pending = match destination.prepare_package_import(&package_path).unwrap() {
+            PreparedPackageImport::Image(pending) => pending,
+            PreparedPackageImport::Text(_) => panic!("image package was misclassified"),
+        };
+        let (_local_template, local_bytes) = fixture_png(91);
+        let negatives = vec![LocalNegativeSample {
+            stable_id: "local-negative/a".to_string(),
+            content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            measured_score: 0.80,
+        }];
+        let completion = destination
+            .complete_local_image_reverification(
+                &pending,
+                LocalImageRuleVerificationInput {
+                    rule_id: "image-one",
+                    template_png: &local_bytes,
+                    mask_png: None,
+                    current_dpi: 96,
+                    negative_samples: &negatives,
+                    observed_clusters: &[],
+                    maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+                },
+            )
+            .unwrap();
+        let mut other = compilable_text_definition();
+        other.id = "other".to_string();
+        other.name = "Other".to_string();
+        destination.save_validated(other).unwrap();
+
+        let error = destination
+            .commit_image_package_import(pending, vec![completion])
+            .unwrap_err();
+        assert!(error.to_string().contains("destination changed"));
+        assert!(!destination.root.join("definitions/macro-one").exists());
+        assert_eq!(
+            fs::read_dir(destination.root.join("assets"))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn image_commit_failure_after_asset_install_is_transactional() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let (portable_template, portable_bytes) = fixture_png(7);
+        let portable_asset = source.assets().put_png(&portable_bytes).unwrap();
+        source
+            .save_validated(compilable_image_definition(
+                portable_asset,
+                &portable_template,
+                None,
+            ))
+            .unwrap();
+        let package_path = source_temp.path().join("image-package");
+        source
+            .export_current_package("macro-one", &package_path)
+            .unwrap();
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+        let pending = match destination.prepare_package_import(&package_path).unwrap() {
+            PreparedPackageImport::Image(pending) => pending,
+            PreparedPackageImport::Text(_) => panic!("image package was misclassified"),
+        };
+        let (_local_template, local_bytes) = fixture_png(91);
+        let negatives = vec![LocalNegativeSample {
+            stable_id: "local-negative/a".to_string(),
+            content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            measured_score: 0.80,
+        }];
+        let completion = destination
+            .complete_local_image_reverification(
+                &pending,
+                LocalImageRuleVerificationInput {
+                    rule_id: "image-one",
+                    template_png: &local_bytes,
+                    mask_png: None,
+                    current_dpi: 96,
+                    negative_samples: &negatives,
+                    observed_clusters: &[],
+                    maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+                },
+            )
+            .unwrap();
+        destination.fail_next_import_after_asset_installs();
+
+        assert!(
+            destination
+                .commit_image_package_import(pending, vec![completion])
+                .is_err()
+        );
+        assert!(!destination.root.join("definitions/macro-one").exists());
+        assert_eq!(
+            fs::read_dir(destination.root.join("assets"))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn oversized_package_definition_is_rejected_before_read_and_mutates_nothing() {
+        let package_temp = tempfile::tempdir().unwrap();
+        let package = package_temp.path().join("oversized");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("manifest.json"),
+            serde_json::to_vec(&PackageManifest {
+                schema_version: PACKAGE_SCHEMA_VERSION,
+                definition: PathBuf::from("macro.json"),
+                assets: vec![],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            package.join("macro.json"),
+            vec![b' '; (MAX_PACKAGE_DEFINITION_BYTES + 1) as usize],
+        )
+        .unwrap();
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+
+        let error = destination.prepare_package_import(&package).unwrap_err();
+
+        assert!(error.to_string().contains("exceed maximum"));
+        assert_eq!(
+            fs::read_dir(destination.root.join("definitions"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn oversized_package_asset_count_is_rejected_before_asset_reads() {
+        let package_temp = tempfile::tempdir().unwrap();
+        let package = package_temp.path().join("too-many-assets");
+        fs::create_dir_all(&package).unwrap();
+        let placeholder = AssetRef {
+            id: "not-read".to_string(),
+            revision: 1,
+            content_hash: "0".repeat(64),
+        };
+        let assets = (0..=MAX_PACKAGE_ASSETS)
+            .map(|index| PackageManifestAsset {
+                asset: AssetRef {
+                    id: format!("not-read-{index}"),
+                    ..placeholder.clone()
+                },
+                path: PathBuf::from(format!("missing-{index}.png")),
+            })
+            .collect();
+        fs::write(
+            package.join("manifest.json"),
+            serde_json::to_vec(&PackageManifest {
+                schema_version: PACKAGE_SCHEMA_VERSION,
+                definition: PathBuf::from("macro.json"),
+                assets,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+
+        let error = destination.prepare_package_import(&package).unwrap_err();
+
+        assert!(error.to_string().contains("asset count"));
+        assert_eq!(
+            fs::read_dir(destination.root.join("definitions"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn oversized_package_asset_is_rejected_before_read_and_mutates_nothing() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let (template, bytes) = fixture_png(7);
+        let asset = source.assets().put_png(&bytes).unwrap();
+        source
+            .save_validated(compilable_image_definition(asset.clone(), &template, None))
+            .unwrap();
+        let package = source_temp.path().join("oversized-asset");
+        source
+            .export_current_package("macro-one", &package)
+            .unwrap();
+        fs::write(
+            package
+                .join("assets")
+                .join(format!("{}.png", asset.content_hash)),
+            vec![0_u8; (MAX_PACKAGE_ASSET_BYTES + 1) as usize],
+        )
+        .unwrap();
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+
+        let error = destination.prepare_package_import(&package).unwrap_err();
+
+        assert!(error.to_string().contains("exceed maximum"));
+        assert_eq!(
+            fs::read_dir(destination.root.join("definitions"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 }

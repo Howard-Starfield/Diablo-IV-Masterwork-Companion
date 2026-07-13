@@ -70,6 +70,13 @@ pub fn condition_wait_timeout_decision(mode: &ObserveMode) -> Option<WaitTimeout
     }
 }
 
+pub fn observation_satisfies_mode(mode: &ObserveMode, condition_met: bool) -> bool {
+    match mode {
+        ObserveMode::CheckNow | ObserveMode::WaitForTrue { .. } => condition_met,
+        ObserveMode::WaitForFalse { .. } => !condition_met,
+    }
+}
+
 pub fn repeat_n_decision(count: u32, completed_iterations: u32) -> LoopDecision {
     if completed_iterations < count {
         LoopDecision::EnterBody
@@ -195,5 +202,25 @@ mod tests {
             condition_wait_timeout_decision(&ObserveMode::CheckNow),
             None
         );
+    }
+
+    #[test]
+    fn wait_modes_have_explicit_success_targets() {
+        assert!(observation_satisfies_mode(&ObserveMode::CheckNow, true));
+        assert!(!observation_satisfies_mode(&ObserveMode::CheckNow, false));
+        assert!(observation_satisfies_mode(
+            &ObserveMode::WaitForTrue {
+                timeout_ms: Limit::Finite(1),
+                timeout_outcome: TimeoutOutcome::Continue,
+            },
+            true,
+        ));
+        assert!(observation_satisfies_mode(
+            &ObserveMode::WaitForFalse {
+                timeout_ms: Limit::Finite(1),
+                timeout_outcome: TimeoutOutcome::Continue,
+            },
+            false,
+        ));
     }
 }

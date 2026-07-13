@@ -24,7 +24,8 @@ use crate::engine::{
     automation::{InputSink, MouseButton, StopSource},
     config::MouseMovementProfile,
     macro_engine::{
-        BlockReason, InputDispatchOutcome, LiveActionInput, MovementOutcome, SendInputFailure,
+        BlockReason, CommittedInputOutcome, InputDispatchFailure, InputDispatchOutcome,
+        LiveActionInput, MovementOutcome, PreCommitInputBlock, SendInputFailure,
     },
     types::Point,
 };
@@ -144,6 +145,58 @@ impl WindowsInputSink {
         Ok(MovementOutcome::Reached)
     }
 
+    fn dispatch_live_action(
+        &self,
+        api: &dyn SendInputApi,
+        destination: Point,
+        button: MouseButton,
+        movement: Option<&MouseMovementProfile>,
+        stop: &dyn StopSource,
+        commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+        validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+    ) -> InputDispatchOutcome {
+        let start = match cursor_position() {
+            Ok(start) => start,
+            Err(error) => {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::InputFailure {
+                    message: error.to_string(),
+                });
+            }
+        };
+        let screen = match virtual_screen_geometry() {
+            Ok(screen) => screen,
+            Err(message) => {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::InputFailure {
+                    message,
+                });
+            }
+        };
+        let (points, segment_delay) = movement_plan(start, destination, movement);
+        let movement_inputs = points
+            .into_iter()
+            .map(|point| marked_move_input_for_screen(point, screen, self.marker))
+            .collect::<Vec<_>>();
+        let (down, up) = match button {
+            MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+            MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+        };
+        let click_inputs = [
+            marked_mouse_input(down, self.marker),
+            marked_mouse_input(up, self.marker),
+        ];
+        let mut manual_takeover = || self.monitor.manual_takeover_detected();
+        dispatch_planned_action(
+            api,
+            &movement_inputs,
+            segment_delay,
+            &click_inputs,
+            stop,
+            &mut manual_takeover,
+            commit,
+            validate_after_movement,
+        )
+    }
+
     fn send_click(
         &self,
         point: Point,
@@ -152,35 +205,37 @@ impl WindowsInputSink {
         commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
     ) -> InputDispatchOutcome {
         if stop.is_stopped() {
-            return InputDispatchOutcome::BlockedStopped;
+            return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped);
         }
         match self.monitor.manual_takeover_detected() {
-            Ok(true) => return InputDispatchOutcome::BlockedManualTakeover,
+            Ok(true) => {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::ManualTakeover);
+            }
             Ok(false) => {}
             Err(error) => {
-                return InputDispatchOutcome::BlockedInputFailure {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::InputFailure {
                     message: error.to_string(),
-                };
+                });
             }
         }
         if stop.is_stopped() {
-            return InputDispatchOutcome::BlockedStopped;
+            return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped);
         }
         let current = match cursor_position() {
             Ok(current) => current,
             Err(error) => {
-                return InputDispatchOutcome::BlockedInputFailure {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::InputFailure {
                     message: error.to_string(),
-                };
+                });
             }
         };
         if point_distance_squared(current, point)
             >= i64::from(DEFAULT_MANUAL_MOVEMENT_THRESHOLD_PX).pow(2)
         {
-            return InputDispatchOutcome::BlockedManualTakeover;
+            return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::ManualTakeover);
         }
         if let Err(reason) = commit() {
-            return InputDispatchOutcome::BlockedCommit { reason };
+            return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit { reason });
         }
         let (down, up) = match button {
             MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
@@ -191,8 +246,12 @@ impl WindowsInputSink {
             marked_mouse_input(up, self.marker),
         ];
         match dispatch_inputs(&WindowsSendInputApi, &inputs) {
-            Ok(()) => InputDispatchOutcome::Dispatched,
-            Err(failure) => InputDispatchOutcome::UncertainDispatch { failure },
+            Ok(()) => InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched),
+            Err(failure) => {
+                InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure: InputDispatchFailure::SendInput(failure),
+                })
+            }
         }
     }
 }
@@ -206,23 +265,24 @@ impl LiveActionInput for WindowsInputSink {
         self.monitor.manual_takeover_detected()
     }
 
-    fn move_to(
-        &self,
-        point: Point,
-        movement: Option<&MouseMovementProfile>,
-        stop: &dyn StopSource,
-    ) -> Result<MovementOutcome> {
-        self.move_cursor(point, movement, stop)
-    }
-
-    fn dispatch_click(
+    fn dispatch_action(
         &self,
         point: Point,
         button: MouseButton,
+        movement: Option<&MouseMovementProfile>,
         stop: &dyn StopSource,
         commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+        validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
     ) -> InputDispatchOutcome {
-        self.send_click(point, button, stop, commit)
+        self.dispatch_live_action(
+            &WindowsSendInputApi,
+            point,
+            button,
+            movement,
+            stop,
+            commit,
+            validate_after_movement,
+        )
     }
 }
 
@@ -249,18 +309,24 @@ impl InputSink for WindowsInputSink {
         {
             let mut commit = || Ok(());
             match self.send_click(point, button, stop, &mut commit) {
-                InputDispatchOutcome::Dispatched => {}
-                InputDispatchOutcome::BlockedStopped => return Ok(()),
-                InputDispatchOutcome::BlockedManualTakeover => {
+                InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched) => {}
+                InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped) => {
+                    return Ok(());
+                }
+                InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::ManualTakeover) => {
                     return Err(anyhow!("manual mouse takeover blocked input"));
                 }
-                InputDispatchOutcome::BlockedInputFailure { message } => {
+                InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::InputFailure {
+                    message,
+                }) => {
                     return Err(anyhow!(message));
                 }
-                InputDispatchOutcome::BlockedCommit { reason } => {
+                InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit { reason }) => {
                     return Err(anyhow!("input commit was blocked: {reason:?}"));
                 }
-                InputDispatchOutcome::UncertainDispatch { failure } => {
+                InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure,
+                }) => {
                     return Err(anyhow!(failure.to_string()));
                 }
             }
@@ -281,29 +347,197 @@ fn point_distance_squared(left: Point, right: Point) -> i64 {
     dx * dx + dy * dy
 }
 
+#[derive(Debug, Clone, Copy)]
+struct VirtualScreenGeometry {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+fn virtual_screen_geometry() -> std::result::Result<VirtualScreenGeometry, String> {
+    let screen = VirtualScreenGeometry {
+        x: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+        y: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+        width: unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+        height: unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+    };
+    if screen.width <= 1 || screen.height <= 1 {
+        Err("virtual screen geometry is not actionable".to_string())
+    } else {
+        Ok(screen)
+    }
+}
+
+fn movement_plan(
+    start: Point,
+    destination: Point,
+    movement: Option<&MouseMovementProfile>,
+) -> (Vec<Point>, Duration) {
+    let duration_ms = movement
+        .filter(|profile| profile.is_usable())
+        .map_or(0, |profile| profile.duration_ms.clamp(1, 2_000));
+    let segments = if duration_ms == 0 {
+        1
+    } else {
+        (duration_ms / 8).clamp(2, 90)
+    };
+    let delay = if duration_ms == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_millis((duration_ms / segments).max(1))
+    };
+    let dx = i64::from(destination.x) - i64::from(start.x);
+    let dy = i64::from(destination.y) - i64::from(start.y);
+    let points = (1..=segments)
+        .map(|segment| {
+            let progress = segment as f64 / segments as f64;
+            Point::new(
+                (f64::from(start.x) + dx as f64 * progress).round() as i32,
+                (f64::from(start.y) + dy as f64 * progress).round() as i32,
+            )
+        })
+        .collect();
+    (points, delay)
+}
+
+fn marked_move_input_for_screen(
+    point: Point,
+    screen: VirtualScreenGeometry,
+    marker: SessionInputMarker,
+) -> INPUT {
+    let normalized_x = ((i64::from(point.x) - i64::from(screen.x)) * 65_535)
+        .checked_div(i64::from(screen.width - 1))
+        .and_then(|value| i32::try_from(value.clamp(0, 65_535)).ok())
+        .unwrap_or(0);
+    let normalized_y = ((i64::from(point.y) - i64::from(screen.y)) * 65_535)
+        .checked_div(i64::from(screen.height - 1))
+        .and_then(|value| i32::try_from(value.clamp(0, 65_535)).ok())
+        .unwrap_or(0);
+    let mut input = marked_mouse_input(
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        marker,
+    );
+    input.Anonymous.mi.dx = normalized_x;
+    input.Anonymous.mi.dy = normalized_y;
+    input
+}
+
+fn dispatch_planned_action(
+    api: &dyn SendInputApi,
+    movement_inputs: &[INPUT],
+    segment_delay: Duration,
+    click_inputs: &[INPUT],
+    stop: &dyn StopSource,
+    manual_takeover: &mut dyn FnMut() -> Result<bool>,
+    commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+    validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+) -> InputDispatchOutcome {
+    let first_movement = &movement_inputs[..1];
+    if stop.is_stopped() {
+        return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped);
+    }
+    match manual_takeover() {
+        Ok(true) => {
+            return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::ManualTakeover);
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::InputFailure {
+                message: error.to_string(),
+            });
+        }
+    }
+    if stop.is_stopped() {
+        return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped);
+    }
+    if let Err(reason) = commit() {
+        return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit { reason });
+    }
+
+    if let Err(failure) = dispatch_inputs(api, first_movement) {
+        return uncertain(InputDispatchFailure::SendInput(failure));
+    }
+    for input in &movement_inputs[1..] {
+        if !segment_delay.is_zero() {
+            thread::sleep(segment_delay);
+        }
+        if stop.is_stopped() {
+            return uncertain(InputDispatchFailure::Stopped);
+        }
+        match manual_takeover() {
+            Ok(true) => return uncertain(InputDispatchFailure::ManualTakeover),
+            Ok(false) => {}
+            Err(error) => {
+                return uncertain(InputDispatchFailure::InputFailure {
+                    message: error.to_string(),
+                });
+            }
+        }
+        if let Err(failure) = dispatch_inputs(api, std::slice::from_ref(input)) {
+            return uncertain(InputDispatchFailure::SendInput(failure));
+        }
+    }
+    if stop.is_stopped() {
+        return uncertain(InputDispatchFailure::Stopped);
+    }
+    match manual_takeover() {
+        Ok(true) => return uncertain(InputDispatchFailure::ManualTakeover),
+        Ok(false) => {}
+        Err(error) => {
+            return uncertain(InputDispatchFailure::InputFailure {
+                message: error.to_string(),
+            });
+        }
+    }
+    if let Err(reason) = validate_after_movement() {
+        return uncertain(InputDispatchFailure::Validation { reason });
+    }
+    if stop.is_stopped() {
+        return uncertain(InputDispatchFailure::Stopped);
+    }
+    match manual_takeover() {
+        Ok(true) => return uncertain(InputDispatchFailure::ManualTakeover),
+        Ok(false) => {}
+        Err(error) => {
+            return uncertain(InputDispatchFailure::InputFailure {
+                message: error.to_string(),
+            });
+        }
+    }
+    match dispatch_inputs(api, click_inputs) {
+        Ok(()) => InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched),
+        Err(failure) => uncertain(InputDispatchFailure::SendInput(failure)),
+    }
+}
+
+fn uncertain(failure: InputDispatchFailure) -> InputDispatchOutcome {
+    InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch { failure })
+}
+
 trait SendInputApi {
-    fn send(&self, inputs: &[INPUT]) -> (u32, u32);
+    fn dispatch(&self, inputs: &[INPUT]) -> std::result::Result<(), SendInputFailure>;
 }
 
 struct WindowsSendInputApi;
 
 impl SendInputApi for WindowsSendInputApi {
-    fn send(&self, inputs: &[INPUT]) -> (u32, u32) {
+    fn dispatch(&self, inputs: &[INPUT]) -> std::result::Result<(), SendInputFailure> {
         unsafe {
             SetLastError(WIN32_ERROR(0));
             let inserted = SendInput(inputs, std::mem::size_of::<INPUT>() as i32);
             let error_code = GetLastError().0;
-            (inserted, error_code)
+            classify_send_input_result(inserted, inputs.len(), error_code)
         }
     }
 }
 
-fn dispatch_inputs(
-    api: &dyn SendInputApi,
-    inputs: &[INPUT],
+fn classify_send_input_result(
+    inserted: u32,
+    input_count: usize,
+    error_code: u32,
 ) -> std::result::Result<(), SendInputFailure> {
-    let expected = u32::try_from(inputs.len()).unwrap_or(u32::MAX);
-    let (inserted, error_code) = api.send(inputs);
+    let expected = u32::try_from(input_count).unwrap_or(u32::MAX);
     if inserted == expected {
         Ok(())
     } else if inserted == 0 {
@@ -318,6 +552,13 @@ fn dispatch_inputs(
             error_code,
         })
     }
+}
+
+fn dispatch_inputs(
+    api: &dyn SendInputApi,
+    inputs: &[INPUT],
+) -> std::result::Result<(), SendInputFailure> {
+    api.dispatch(inputs)
 }
 
 fn send_marked_move(
@@ -372,15 +613,20 @@ fn marked_mouse_input(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
+        time::Duration,
     };
 
     use anyhow::{Result, bail};
 
     use super::{
-        ManualInputMonitor, SendInputApi, WindowsInputSink, dispatch_inputs, marked_mouse_input,
+        ManualInputMonitor, SendInputApi, WindowsInputSink, classify_send_input_result,
+        dispatch_inputs, dispatch_planned_action, marked_mouse_input,
     };
     use crate::engine::platform::windows_mouse_hook::{
         MouseActivitySnapshot, MouseEventSource, MousePoint, SessionInputMarker,
@@ -390,9 +636,10 @@ mod tests {
         automation::{Clock, MouseButton, StopSource, TargetGuard, TargetSnapshot},
         macro_engine::{
             ActionAttemptId, ActionAuthorization, ActionCommitter, ActionOutcome,
-            ActionPrepareRequest, ActionState, BlockReason, CommitContext, InputDispatchOutcome,
-            Limit, LiveActionInput, LiveActionSession, LiveControlSink, MovementOutcome,
-            ObservationToken, ResumeAuthorization, SendInputFailure, TakeoverPolicy,
+            ActionPrepareRequest, ActionState, BlockReason, CommitContext, CommittedInputOutcome,
+            InputDispatchFailure, InputDispatchOutcome, Limit, LiveActionInput, LiveActionSession,
+            LiveControlSink, MovementOutcome, ObservationToken, PreCommitInputBlock,
+            ResumeAuthorization, SendInputFailure, TakeoverPolicy,
         },
         types::{Point, Rect},
     };
@@ -410,6 +657,18 @@ mod tests {
     impl Clock for FixedClock {
         fn now_ms(&self) -> u64 {
             self.0
+        }
+    }
+
+    struct ScriptedClock(Mutex<VecDeque<u64>>);
+    impl Clock for ScriptedClock {
+        fn now_ms(&self) -> u64 {
+            let mut times = self.0.lock().unwrap();
+            if times.len() > 1 {
+                times.pop_front().unwrap()
+            } else {
+                *times.front().expect("scripted clock is empty")
+            }
         }
     }
 
@@ -433,12 +692,37 @@ mod tests {
         }
     }
 
+    struct StoppingTarget {
+        stop: Arc<Stop>,
+        validation_count: AtomicU64,
+        stop_on_validation: u64,
+    }
+
+    impl TargetGuard for StoppingTarget {
+        fn snapshot(&self) -> Result<TargetSnapshot> {
+            Ok(target())
+        }
+
+        fn validate(&self, _expected: &TargetSnapshot) -> Result<()> {
+            let validation = self.validation_count.fetch_add(1, Ordering::AcqRel) + 1;
+            if validation == self.stop_on_validation {
+                self.stop.0.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct RecordingInput {
         calls: Mutex<Vec<&'static str>>,
         baseline_resets: AtomicU64,
         takeover: AtomicBool,
+        takeover_checks: AtomicU64,
+        takeover_on_check: AtomicU64,
         fail_dispatch: AtomicBool,
+        block_after_commit: AtomicBool,
+        movement_failure: Mutex<Option<SendInputFailure>>,
+        stop_during_move: Mutex<Option<Arc<Stop>>>,
         stop_during_dispatch: Mutex<Option<Arc<Stop>>>,
         movement_outcome: Mutex<Option<MovementOutcome>>,
     }
@@ -450,16 +734,55 @@ mod tests {
         }
 
         fn manual_takeover_detected(&self) -> Result<bool> {
-            Ok(self.takeover.load(Ordering::Acquire))
+            let check = self.takeover_checks.fetch_add(1, Ordering::AcqRel) + 1;
+            Ok(self.takeover.load(Ordering::Acquire)
+                || self.takeover_on_check.load(Ordering::Acquire) == check)
         }
-        fn move_to(
+        fn dispatch_action(
             &self,
             _point: Point,
+            _button: MouseButton,
             _movement: Option<&crate::engine::config::MouseMovementProfile>,
             stop: &dyn StopSource,
-        ) -> Result<MovementOutcome> {
+            commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+            validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+        ) -> InputDispatchOutcome {
+            if stop.is_stopped() {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped);
+            }
+            match self.manual_takeover_detected() {
+                Ok(true) => {
+                    return InputDispatchOutcome::PreCommitBlocked(
+                        PreCommitInputBlock::ManualTakeover,
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return InputDispatchOutcome::PreCommitBlocked(
+                        PreCommitInputBlock::InputFailure {
+                            message: error.to_string(),
+                        },
+                    );
+                }
+            }
+            if stop.is_stopped() {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped);
+            }
+            if let Err(reason) = commit() {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit {
+                    reason,
+                });
+            }
             self.calls.lock().unwrap().push("move");
-            Ok(self
+            if let Some(stop) = self.stop_during_move.lock().unwrap().as_ref() {
+                stop.0.store(true, Ordering::Release);
+            }
+            if let Some(failure) = self.movement_failure.lock().unwrap().take() {
+                return InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure: InputDispatchFailure::SendInput(failure),
+                });
+            }
+            match self
                 .movement_outcome
                 .lock()
                 .unwrap()
@@ -470,31 +793,47 @@ mod tests {
                     } else {
                         MovementOutcome::Reached
                     }
-                }))
-        }
-        fn dispatch_click(
-            &self,
-            _point: Point,
-            _button: MouseButton,
-            _stop: &dyn StopSource,
-            commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
-        ) -> InputDispatchOutcome {
-            if let Err(reason) = commit() {
-                return InputDispatchOutcome::BlockedCommit { reason };
+                }) {
+                MovementOutcome::Reached => {}
+                MovementOutcome::Cancelled => {
+                    return InputDispatchOutcome::Committed(
+                        CommittedInputOutcome::UncertainDispatch {
+                            failure: InputDispatchFailure::Stopped,
+                        },
+                    );
+                }
+                MovementOutcome::ManualTakeover => {
+                    return InputDispatchOutcome::Committed(
+                        CommittedInputOutcome::UncertainDispatch {
+                            failure: InputDispatchFailure::ManualTakeover,
+                        },
+                    );
+                }
+            }
+            if let Err(reason) = validate_after_movement() {
+                return InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure: InputDispatchFailure::Validation { reason },
+                });
+            }
+            if self.block_after_commit.load(Ordering::Acquire) {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped);
             }
             self.calls.lock().unwrap().push("dispatch");
             if let Some(stop) = self.stop_during_dispatch.lock().unwrap().as_ref() {
                 stop.0.store(true, Ordering::Release);
+                return InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure: InputDispatchFailure::Stopped,
+                });
             }
             if self.fail_dispatch.load(Ordering::Acquire) {
-                return InputDispatchOutcome::UncertainDispatch {
-                    failure: SendInputFailure::ZeroInsertion {
+                return InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure: InputDispatchFailure::SendInput(SendInputFailure::ZeroInsertion {
                         expected: 2,
                         error_code: 5,
-                    },
-                };
+                    }),
+                });
             }
-            InputDispatchOutcome::Dispatched
+            InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
         }
     }
 
@@ -661,6 +1000,70 @@ mod tests {
     }
 
     #[test]
+    fn stop_raised_during_expensive_target_preflight_is_caught_before_commit() {
+        let stop = Arc::new(Stop::default());
+        let input = Arc::new(RecordingInput::default());
+        let session = LiveActionSession::new(
+            Arc::new(StoppingTarget {
+                stop: stop.clone(),
+                validation_count: AtomicU64::new(0),
+                stop_on_validation: 2,
+            }),
+            input.clone(),
+            Arc::new(RecordingControl::default()),
+        );
+        session.activate_for_test(target());
+        let committer = ActionCommitter::new(
+            session,
+            Arc::new(FixedClock(100)),
+            "run-1",
+            Limit::Finite(10),
+            8,
+        );
+        let prepared = committer.prepare(request()).unwrap();
+
+        let result = committer.commit(
+            prepared,
+            stop.as_ref(),
+            CommitContext::new("run-1", 4, Some(token())),
+        );
+
+        assert!(matches!(
+            result,
+            ActionOutcome::Blocked {
+                reason: BlockReason::Stopped,
+                ..
+            }
+        ));
+        assert!(input.calls.lock().unwrap().is_empty());
+        assert_eq!(committer.committed_clicks(), 0);
+    }
+
+    #[test]
+    fn sequenced_manual_event_immediately_before_boundary_blocks_without_input() {
+        let input = Arc::new(RecordingInput::default());
+        input.takeover_on_check.store(2, Ordering::Release);
+        let committer = committer(vec![target(), target()], input.clone());
+        let prepared = committer.prepare(request()).unwrap();
+
+        let result = committer.commit(
+            prepared,
+            &Stop::default(),
+            CommitContext::new("run-1", 4, Some(token())),
+        );
+
+        assert!(matches!(
+            result,
+            ActionOutcome::Blocked {
+                reason: BlockReason::ManualTakeover(TakeoverPolicy::Pause),
+                ..
+            }
+        ));
+        assert!(input.calls.lock().unwrap().is_empty());
+        assert_eq!(committer.committed_clicks(), 0);
+    }
+
+    #[test]
     fn stop_after_commit_is_uncertain_and_never_retried() {
         let stop = Arc::new(Stop::default());
         let input = Arc::new(RecordingInput::default());
@@ -684,6 +1087,81 @@ mod tests {
                 ActionState::UncertainDispatch
             ]
         );
+    }
+
+    #[test]
+    fn stop_between_movement_segments_is_uncertain_and_consumes_budget() {
+        let stop = Arc::new(Stop::default());
+        let input = Arc::new(RecordingInput::default());
+        *input.stop_during_move.lock().unwrap() = Some(stop.clone());
+        let committer = committer(vec![target(), target()], input.clone());
+        let prepared = committer.prepare(request()).unwrap();
+
+        let result = committer.commit(
+            prepared,
+            stop.as_ref(),
+            CommitContext::new("run-1", 4, Some(token())),
+        );
+
+        assert!(matches!(result, ActionOutcome::UncertainDispatch { .. }));
+        assert_eq!(*input.calls.lock().unwrap(), vec!["move"]);
+        assert_eq!(committer.committed_clicks(), 1);
+    }
+
+    #[test]
+    fn first_movement_zero_or_partial_is_uncertain_and_replay_protected() {
+        for failure in [
+            SendInputFailure::ZeroInsertion {
+                expected: 1,
+                error_code: 5,
+            },
+            // A real one-event Win32 movement cannot naturally insert a positive count below
+            // expected. The adapter seam still injects this typed result to prove the state
+            // machine cannot misclassify a first-call partial result as retryable.
+            SendInputFailure::PartialInsertion {
+                inserted: 1,
+                expected: 2,
+                error_code: 87,
+            },
+        ] {
+            let input = Arc::new(RecordingInput::default());
+            *input.movement_failure.lock().unwrap() = Some(failure);
+            let committer = committer(vec![target()], input);
+            let mut original = request();
+            original.set_minimum_click_interval_for_test(0);
+            let replay = original.clone();
+            let prepared = committer.prepare(original).unwrap();
+
+            let result = committer.commit(
+                prepared,
+                &Stop::default(),
+                CommitContext::new("run-1", 4, Some(token())),
+            );
+
+            assert!(matches!(result, ActionOutcome::UncertainDispatch { .. }));
+            assert_eq!(committer.committed_clicks(), 1);
+            assert!(matches!(
+                committer.prepare(replay),
+                Err(BlockReason::AttemptReplay)
+            ));
+        }
+    }
+
+    #[test]
+    fn postcommit_blocked_trait_outcome_is_not_misclassified_as_retryable() {
+        let input = Arc::new(RecordingInput::default());
+        input.block_after_commit.store(true, Ordering::Release);
+        let committer = committer(vec![target(), target()], input);
+        let prepared = committer.prepare(request()).unwrap();
+
+        let result = committer.commit(
+            prepared,
+            &Stop::default(),
+            CommitContext::new("run-1", 4, Some(token())),
+        );
+
+        assert!(matches!(result, ActionOutcome::UncertainDispatch { .. }));
+        assert_eq!(committer.committed_clicks(), 1);
     }
 
     #[test]
@@ -790,7 +1268,7 @@ mod tests {
     }
 
     #[test]
-    fn target_change_after_movement_still_blocks_before_dispatch() {
+    fn target_change_after_first_movement_is_uncertain_and_consumes_budget() {
         let input = Arc::new(RecordingInput::default());
         let mut changed = target();
         changed.geometry_revision += 1;
@@ -803,14 +1281,42 @@ mod tests {
             CommitContext::new("run-1", 4, Some(token())),
         );
 
-        assert!(matches!(
-            result,
-            ActionOutcome::Blocked {
-                reason: BlockReason::TargetChanged,
-                ..
-            }
-        ));
+        assert!(matches!(result, ActionOutcome::UncertainDispatch { .. }));
         assert_eq!(*input.calls.lock().unwrap(), vec!["move"]);
+        assert_eq!(committer.committed_clicks(), 1);
+    }
+
+    #[test]
+    fn token_invalidation_after_first_movement_is_uncertain_and_consumes_budget() {
+        let input = Arc::new(RecordingInput::default());
+        let session = LiveActionSession::new(
+            Arc::new(ScriptedTarget(Mutex::new(vec![
+                target(),
+                target(),
+                target(),
+            ]))),
+            input.clone(),
+            Arc::new(RecordingControl::default()),
+        );
+        session.activate_for_test(target());
+        let committer = ActionCommitter::new(
+            session,
+            Arc::new(ScriptedClock(Mutex::new([100, 100, 100, 2_000].into()))),
+            "run-1",
+            Limit::Finite(10),
+            8,
+        );
+        let prepared = committer.prepare(request()).unwrap();
+
+        let result = committer.commit(
+            prepared,
+            &Stop::default(),
+            CommitContext::new("run-1", 4, Some(token())),
+        );
+
+        assert!(matches!(result, ActionOutcome::UncertainDispatch { .. }));
+        assert_eq!(*input.calls.lock().unwrap(), vec!["move"]);
+        assert_eq!(committer.committed_clicks(), 1);
     }
 
     #[test]
@@ -891,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn takeover_during_movement_uses_selected_policy() {
+    fn takeover_after_first_movement_is_uncertain_and_uses_selected_policy() {
         let input = Arc::new(RecordingInput::default());
         *input.movement_outcome.lock().unwrap() = Some(MovementOutcome::ManualTakeover);
         let committer = committer(vec![target()], input.clone());
@@ -905,14 +1411,9 @@ mod tests {
             CommitContext::new("run-1", 4, Some(token())),
         );
 
-        assert!(matches!(
-            result,
-            ActionOutcome::Blocked {
-                reason: BlockReason::ManualTakeover(TakeoverPolicy::Stop),
-                ..
-            }
-        ));
+        assert!(matches!(result, ActionOutcome::UncertainDispatch { .. }));
         assert_eq!(*input.calls.lock().unwrap(), vec!["move"]);
+        assert_eq!(committer.committed_clicks(), 1);
     }
 
     #[test]
@@ -1176,12 +1677,51 @@ mod tests {
         error_code: u32,
     }
 
-    impl SendInputApi for FakeSendInputApi {
-        fn send(
+    struct ScriptedSendInputApi {
+        outcomes: Mutex<VecDeque<std::result::Result<(), SendInputFailure>>>,
+        call_lengths: Mutex<Vec<usize>>,
+        stop_after_call: Option<(usize, Arc<Stop>)>,
+    }
+
+    impl ScriptedSendInputApi {
+        fn new(outcomes: Vec<std::result::Result<(), SendInputFailure>>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into()),
+                call_lengths: Mutex::new(Vec::new()),
+                stop_after_call: None,
+            }
+        }
+    }
+
+    impl SendInputApi for ScriptedSendInputApi {
+        fn dispatch(
             &self,
-            _inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
-        ) -> (u32, u32) {
-            (self.inserted, self.error_code)
+            inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+        ) -> std::result::Result<(), SendInputFailure> {
+            let call = {
+                let mut calls = self.call_lengths.lock().unwrap();
+                calls.push(inputs.len());
+                calls.len()
+            };
+            if let Some((stop_call, stop)) = &self.stop_after_call
+                && call == *stop_call
+            {
+                stop.0.store(true, Ordering::Release);
+            }
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("missing scripted SendInput outcome")
+        }
+    }
+
+    impl SendInputApi for FakeSendInputApi {
+        fn dispatch(
+            &self,
+            inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+        ) -> std::result::Result<(), SendInputFailure> {
+            classify_send_input_result(self.inserted, inputs.len(), self.error_code)
         }
     }
 
@@ -1279,6 +1819,264 @@ mod tests {
                 error_code: 87
             })
         );
+    }
+
+    #[test]
+    fn planned_action_first_movement_zero_and_typed_partial_are_uncertain() {
+        for failure in [
+            SendInputFailure::ZeroInsertion {
+                expected: 1,
+                error_code: 5,
+            },
+            // One movement INPUT cannot naturally produce inserted < expected. Injecting the
+            // typed adapter result proves the committed state machine still treats it as
+            // uncertainty without batching movement or weakening between-segment checks.
+            SendInputFailure::PartialInsertion {
+                inserted: 1,
+                expected: 2,
+                error_code: 87,
+            },
+        ] {
+            let api = ScriptedSendInputApi::new(vec![Err(failure.clone())]);
+            let movement = [marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE,
+                marker(41),
+            )];
+            let click = [
+                marked_mouse_input(
+                    windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN,
+                    marker(41),
+                ),
+                marked_mouse_input(
+                    windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP,
+                    marker(41),
+                ),
+            ];
+            let committed = AtomicBool::new(false);
+            let mut manual = || Ok(false);
+            let mut commit = || {
+                committed.store(true, Ordering::Release);
+                Ok(())
+            };
+            let mut validate = || panic!("validation must not run after failed first movement");
+
+            let result = dispatch_planned_action(
+                &api,
+                &movement,
+                Duration::ZERO,
+                &click,
+                &Stop::default(),
+                &mut manual,
+                &mut commit,
+                &mut validate,
+            );
+
+            assert_eq!(
+                result,
+                InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure: InputDispatchFailure::SendInput(failure),
+                })
+            );
+            assert!(committed.load(Ordering::Acquire));
+            assert_eq!(*api.call_lengths.lock().unwrap(), vec![1]);
+        }
+    }
+
+    #[test]
+    fn planned_action_stop_between_segments_is_committed_uncertain() {
+        let stop = Arc::new(Stop::default());
+        let mut api = ScriptedSendInputApi::new(vec![Ok(())]);
+        api.stop_after_call = Some((1, stop.clone()));
+        let movement = [
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE,
+                marker(42),
+            ),
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE,
+                marker(42),
+            ),
+        ];
+        let click = [
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN,
+                marker(42),
+            ),
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP,
+                marker(42),
+            ),
+        ];
+        let mut manual = || Ok(false);
+        let mut commit = || Ok(());
+        let mut validate = || panic!("validation must not run after stop between segments");
+
+        let result = dispatch_planned_action(
+            &api,
+            &movement,
+            Duration::ZERO,
+            &click,
+            stop.as_ref(),
+            &mut manual,
+            &mut commit,
+            &mut validate,
+        );
+
+        assert_eq!(
+            result,
+            InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                failure: InputDispatchFailure::Stopped,
+            })
+        );
+        assert_eq!(*api.call_lengths.lock().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn planned_action_focus_loss_after_movement_is_uncertain_before_click() {
+        let api = ScriptedSendInputApi::new(vec![Ok(())]);
+        let movement = [marked_mouse_input(
+            windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE,
+            marker(43),
+        )];
+        let click = [
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN,
+                marker(43),
+            ),
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP,
+                marker(43),
+            ),
+        ];
+        let mut manual = || Ok(false);
+        let mut commit = || Ok(());
+        let mut validate = || Err(BlockReason::TargetChanged);
+
+        let result = dispatch_planned_action(
+            &api,
+            &movement,
+            Duration::ZERO,
+            &click,
+            &Stop::default(),
+            &mut manual,
+            &mut commit,
+            &mut validate,
+        );
+
+        assert_eq!(
+            result,
+            InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                failure: InputDispatchFailure::Validation {
+                    reason: BlockReason::TargetChanged,
+                },
+            })
+        );
+        assert_eq!(*api.call_lengths.lock().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn planned_action_requires_full_movement_and_click_dispatch() {
+        let movement = [marked_mouse_input(
+            windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE,
+            marker(44),
+        )];
+        let click = [
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN,
+                marker(44),
+            ),
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP,
+                marker(44),
+            ),
+        ];
+        for (click_outcome, expected) in [
+            (
+                Ok(()),
+                InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched),
+            ),
+            (
+                Err(SendInputFailure::PartialInsertion {
+                    inserted: 1,
+                    expected: 2,
+                    error_code: 5,
+                }),
+                InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure: InputDispatchFailure::SendInput(SendInputFailure::PartialInsertion {
+                        inserted: 1,
+                        expected: 2,
+                        error_code: 5,
+                    }),
+                }),
+            ),
+        ] {
+            let api = ScriptedSendInputApi::new(vec![Ok(()), click_outcome]);
+            let mut manual = || Ok(false);
+            let mut commit = || Ok(());
+            let mut validate = || Ok(());
+
+            let result = dispatch_planned_action(
+                &api,
+                &movement,
+                Duration::ZERO,
+                &click,
+                &Stop::default(),
+                &mut manual,
+                &mut commit,
+                &mut validate,
+            );
+
+            assert_eq!(result, expected);
+            assert_eq!(*api.call_lengths.lock().unwrap(), vec![1, 2]);
+        }
+    }
+
+    #[test]
+    fn planned_action_manual_takeover_between_segments_is_committed_uncertain() {
+        let api = ScriptedSendInputApi::new(vec![Ok(())]);
+        let movement = [
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE,
+                marker(45),
+            ),
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE,
+                marker(45),
+            ),
+        ];
+        let click = [
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN,
+                marker(45),
+            ),
+            marked_mouse_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP,
+                marker(45),
+            ),
+        ];
+        let manual_checks = AtomicU64::new(0);
+        let mut manual = || Ok(manual_checks.fetch_add(1, Ordering::AcqRel) > 0);
+        let mut commit = || Ok(());
+        let mut validate = || panic!("validation must not run after manual takeover");
+
+        let result = dispatch_planned_action(
+            &api,
+            &movement,
+            Duration::ZERO,
+            &click,
+            &Stop::default(),
+            &mut manual,
+            &mut commit,
+            &mut validate,
+        );
+
+        assert_eq!(
+            result,
+            InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                failure: InputDispatchFailure::ManualTakeover,
+            })
+        );
+        assert_eq!(*api.call_lengths.lock().unwrap(), vec![1]);
     }
 
     fn marker(value: usize) -> SessionInputMarker {

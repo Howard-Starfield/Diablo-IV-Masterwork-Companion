@@ -123,13 +123,48 @@ impl std::fmt::Display for SendInputFailure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InputDispatchOutcome {
-    BlockedStopped,
-    BlockedManualTakeover,
-    BlockedInputFailure { message: String },
-    BlockedCommit { reason: BlockReason },
+pub enum PreCommitInputBlock {
+    Stopped,
+    ManualTakeover,
+    InputFailure { message: String },
+    Commit { reason: BlockReason },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputDispatchFailure {
+    SendInput(SendInputFailure),
+    Stopped,
+    ManualTakeover,
+    Validation { reason: BlockReason },
+    InputFailure { message: String },
+}
+
+impl std::fmt::Display for InputDispatchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SendInput(failure) => failure.fmt(formatter),
+            Self::Stopped => formatter.write_str("stop observed after input commit"),
+            Self::ManualTakeover => {
+                formatter.write_str("manual mouse takeover observed after input commit")
+            }
+            Self::Validation { reason } => {
+                write!(formatter, "post-movement validation failed: {reason:?}")
+            }
+            Self::InputFailure { message } => formatter.write_str(message),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommittedInputOutcome {
     Dispatched,
-    UncertainDispatch { failure: SendInputFailure },
+    UncertainDispatch { failure: InputDispatchFailure },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputDispatchOutcome {
+    PreCommitBlocked(PreCommitInputBlock),
+    Committed(CommittedInputOutcome),
 }
 
 /// Granular live-input boundary used only by `ActionCommitter`.
@@ -139,20 +174,16 @@ pub enum InputDispatchOutcome {
 pub trait LiveActionInput: Send + Sync {
     fn reset_manual_baseline(&self) -> Result<()>;
     fn manual_takeover_detected(&self) -> Result<bool>;
-    fn move_to(
-        &self,
-        point: Point,
-        movement: Option<&MouseMovementProfile>,
-        stop: &dyn StopSource,
-    ) -> Result<MovementOutcome>;
-    /// Performs the final stop/takeover check and the first `SendInput` as one input-owned
-    /// boundary. `UncertainDispatch` is returned only after dispatch was attempted.
-    fn dispatch_click(
+    /// Performs final stop/takeover checks, commits the attempt, and immediately issues the
+    /// first movement `SendInput`. Once `commit` succeeds, only `Committed` outcomes are valid.
+    fn dispatch_action(
         &self,
         point: Point,
         button: MouseButton,
+        movement: Option<&MouseMovementProfile>,
         stop: &dyn StopSource,
         commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+        validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
     ) -> InputDispatchOutcome;
 }
 
@@ -485,6 +516,12 @@ pub struct PreparedAction {
     ledger: Arc<Mutex<CommitLedger>>,
 }
 
+#[derive(Debug, Clone)]
+struct ReadyToCommit {
+    request: ActionPrepareRequest,
+    context: CommitContext,
+}
+
 impl std::fmt::Debug for PreparedAction {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -611,141 +648,28 @@ impl ActionCommitter {
                 transitions: vec![ActionState::Prepared, ActionState::Blocked],
             };
         }
-        let request = &prepared.request;
-        let authorization = &request.authorization;
         let blocked = |reason| ActionOutcome::Blocked {
             reason,
             transitions: vec![ActionState::Prepared, ActionState::Blocked],
         };
 
-        if stop.is_stopped() {
-            return blocked(BlockReason::Stopped);
-        }
-        match self.session.input.manual_takeover_detected() {
-            Ok(true) => {
-                self.session.apply_takeover(request.takeover_policy);
-                return blocked(BlockReason::ManualTakeover(request.takeover_policy));
+        let ready = match self.preflight(&prepared.request, stop, context) {
+            Ok(ready) => ready,
+            Err(reason) => {
+                if matches!(reason, BlockReason::ManualTakeover(_)) {
+                    self.session
+                        .apply_takeover(prepared.request.takeover_policy);
+                }
+                return blocked(reason);
             }
-            Ok(false) => {}
-            Err(error) => {
-                return blocked(BlockReason::InputFailure {
-                    message: error.to_string(),
-                });
-            }
-        }
-        if !target_is_actionable(&authorization.expected_target)
-            || self
-                .session
-                .target
-                .validate(&authorization.expected_target)
-                .is_err()
-        {
-            return blocked(BlockReason::TargetChanged);
-        }
-        if !point_inside_rect(
-            authorization.expected_target.client_rect,
-            authorization.destination,
-        ) {
-            return blocked(BlockReason::DestinationOutOfBounds);
-        }
-        if !observation_is_current(request, &context, self.clock.now_ms()) {
-            return blocked(BlockReason::StaleObservation);
-        }
-        if !observation_authorizes_destination(request) {
-            return blocked(BlockReason::DestinationOutOfBounds);
-        }
-        let now = self.clock.now_ms();
-        if self
-            .ledger
-            .lock()
-            .expect("action attempt ledger poisoned")
-            .last_click_at_ms
-            .is_some_and(|last| now < last.saturating_add(request.minimum_click_interval_ms))
-        {
-            return blocked(BlockReason::ClickPacing);
-        }
-
-        match self
-            .session
-            .input
-            .move_to(authorization.destination, request.movement.as_ref(), stop)
-        {
-            Ok(MovementOutcome::Reached) => {}
-            Ok(MovementOutcome::Cancelled) => return blocked(BlockReason::Stopped),
-            Ok(MovementOutcome::ManualTakeover) => {
-                self.session.apply_takeover(request.takeover_policy);
-                return blocked(BlockReason::ManualTakeover(request.takeover_policy));
-            }
-            Err(error) => {
-                return blocked(BlockReason::MovementFailed {
-                    message: error.to_string(),
-                });
-            }
-        }
-
-        // This is the linearization barrier: every cancellable check is repeated immediately
-        // before the first operating-system input call.
-        if stop.is_stopped() {
-            return blocked(BlockReason::Stopped);
-        }
-        match self.session.input.manual_takeover_detected() {
-            Ok(true) => {
-                self.session.apply_takeover(request.takeover_policy);
-                return blocked(BlockReason::ManualTakeover(request.takeover_policy));
-            }
-            Ok(false) => {}
-            Err(error) => {
-                return blocked(BlockReason::InputFailure {
-                    message: error.to_string(),
-                });
-            }
-        }
-        if self
-            .session
-            .target
-            .validate(&authorization.expected_target)
-            .is_err()
-        {
-            return blocked(BlockReason::TargetChanged);
-        }
-        if !observation_is_current(request, &context, self.clock.now_ms()) {
-            return blocked(BlockReason::StaleObservation);
-        }
-        if !observation_authorizes_destination(request) {
-            return blocked(BlockReason::DestinationOutOfBounds);
-        }
-        if !point_inside_rect(
-            authorization.expected_target.client_rect,
-            authorization.destination,
-        ) {
-            return blocked(BlockReason::DestinationOutOfBounds);
-        }
+        };
+        let request = &ready.request;
+        let authorization = &request.authorization;
         let attempt_id = authorization.attempt_id.clone();
+        let committed = std::cell::Cell::new(false);
         let mut commit_boundary = || {
-            if stop.is_stopped() {
-                return Err(BlockReason::Stopped);
-            }
             if !self.session.validate_resume(&request.resume) {
                 return Err(BlockReason::ResumeRequired);
-            }
-            if self
-                .session
-                .target
-                .validate(&authorization.expected_target)
-                .is_err()
-            {
-                return Err(BlockReason::TargetChanged);
-            }
-            if !observation_is_current(request, &context, self.clock.now_ms()) {
-                return Err(BlockReason::StaleObservation);
-            }
-            if !observation_authorizes_destination(request)
-                || !point_inside_rect(
-                    authorization.expected_target.client_rect,
-                    authorization.destination,
-                )
-            {
-                return Err(BlockReason::DestinationOutOfBounds);
             }
             let commit_time = self.clock.now_ms();
             let mut ledger = self.ledger.lock().expect("action attempt ledger poisoned");
@@ -776,26 +700,68 @@ impl ActionCommitter {
                 .get_mut(&attempt_id)
                 .expect("prepared attempt disappeared")
                 .status = AttemptStatus::Committed;
+            committed.set(true);
             Ok(())
         };
 
-        let dispatch = self.session.input.dispatch_click(
+        let mut validate_after_movement = || {
+            if !self.session.validate_resume(&request.resume) {
+                return Err(BlockReason::ResumeRequired);
+            }
+            if self
+                .session
+                .target
+                .validate(&authorization.expected_target)
+                .is_err()
+            {
+                return Err(BlockReason::TargetChanged);
+            }
+            if !observation_is_current(request, &ready.context, self.clock.now_ms()) {
+                return Err(BlockReason::StaleObservation);
+            }
+            if !observation_authorizes_destination(request)
+                || !point_inside_rect(
+                    authorization.expected_target.client_rect,
+                    authorization.destination,
+                )
+            {
+                return Err(BlockReason::DestinationOutOfBounds);
+            }
+            Ok(())
+        };
+
+        let dispatch = self.session.input.dispatch_action(
             authorization.destination,
             authorization.button,
+            request.movement.as_ref(),
             stop,
             &mut commit_boundary,
+            &mut validate_after_movement,
         );
-        match dispatch {
-            InputDispatchOutcome::BlockedStopped => blocked(BlockReason::Stopped),
-            InputDispatchOutcome::BlockedManualTakeover => {
-                self.session.apply_takeover(request.takeover_policy);
-                blocked(BlockReason::ManualTakeover(request.takeover_policy))
+        match (committed.get(), dispatch) {
+            (false, InputDispatchOutcome::PreCommitBlocked(block_reason)) => {
+                self.map_precommit_block(block_reason, request.takeover_policy)
             }
-            InputDispatchOutcome::BlockedInputFailure { message } => {
-                blocked(BlockReason::InputFailure { message })
+            (false, InputDispatchOutcome::Committed(_)) => blocked(BlockReason::InputFailure {
+                message: "input adapter reported a committed outcome before commit".to_string(),
+            }),
+            (true, InputDispatchOutcome::PreCommitBlocked(block_reason)) => {
+                if matches!(block_reason, PreCommitInputBlock::ManualTakeover) {
+                    self.session.apply_takeover(request.takeover_policy);
+                }
+                self.finish_attempt(&attempt_id, AttemptStatus::Uncertain);
+                ActionOutcome::UncertainDispatch {
+                    message: format!(
+                        "input adapter returned a precommit block after commit: {block_reason:?}"
+                    ),
+                    transitions: vec![
+                        ActionState::Prepared,
+                        ActionState::Committed,
+                        ActionState::UncertainDispatch,
+                    ],
+                }
             }
-            InputDispatchOutcome::BlockedCommit { reason } => blocked(reason),
-            InputDispatchOutcome::Dispatched if !stop.is_stopped() => {
+            (true, InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)) => {
                 self.finish_attempt(&attempt_id, AttemptStatus::Dispatched);
                 ActionOutcome::Dispatched {
                     transitions: vec![
@@ -805,18 +771,15 @@ impl ActionCommitter {
                     ],
                 }
             }
-            InputDispatchOutcome::Dispatched => {
-                self.finish_attempt(&attempt_id, AttemptStatus::Uncertain);
-                ActionOutcome::UncertainDispatch {
-                    message: "stop observed after input commit".to_string(),
-                    transitions: vec![
-                        ActionState::Prepared,
-                        ActionState::Committed,
-                        ActionState::UncertainDispatch,
-                    ],
+            (
+                true,
+                InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure,
+                }),
+            ) => {
+                if matches!(failure, InputDispatchFailure::ManualTakeover) {
+                    self.session.apply_takeover(request.takeover_policy);
                 }
-            }
-            InputDispatchOutcome::UncertainDispatch { failure } => {
                 self.finish_attempt(&attempt_id, AttemptStatus::Uncertain);
                 ActionOutcome::UncertainDispatch {
                     message: failure.to_string(),
@@ -827,6 +790,90 @@ impl ActionCommitter {
                     ],
                 }
             }
+        }
+    }
+
+    fn preflight(
+        &self,
+        request: &ActionPrepareRequest,
+        stop: &dyn StopSource,
+        context: CommitContext,
+    ) -> std::result::Result<ReadyToCommit, BlockReason> {
+        let authorization = &request.authorization;
+        if stop.is_stopped() {
+            return Err(BlockReason::Stopped);
+        }
+        match self.session.input.manual_takeover_detected() {
+            Ok(true) => return Err(BlockReason::ManualTakeover(request.takeover_policy)),
+            Ok(false) => {}
+            Err(error) => {
+                return Err(BlockReason::InputFailure {
+                    message: error.to_string(),
+                });
+            }
+        }
+        if !self.session.validate_resume(&request.resume)
+            || request.resume.target != authorization.expected_target
+        {
+            return Err(BlockReason::ResumeRequired);
+        }
+        if !target_is_actionable(&authorization.expected_target)
+            || self
+                .session
+                .target
+                .validate(&authorization.expected_target)
+                .is_err()
+        {
+            return Err(BlockReason::TargetChanged);
+        }
+        if !point_inside_rect(
+            authorization.expected_target.client_rect,
+            authorization.destination,
+        ) || !observation_authorizes_destination(request)
+        {
+            return Err(BlockReason::DestinationOutOfBounds);
+        }
+        if !observation_is_current(request, &context, self.clock.now_ms()) {
+            return Err(BlockReason::StaleObservation);
+        }
+        let now = self.clock.now_ms();
+        let ledger = self.ledger.lock().expect("action attempt ledger poisoned");
+        if ledger.finished {
+            return Err(BlockReason::RunFinished);
+        }
+        if !ledger.click_available() {
+            return Err(BlockReason::ClickBudgetExceeded);
+        }
+        if ledger
+            .last_click_at_ms
+            .is_some_and(|last| now < last.saturating_add(request.minimum_click_interval_ms))
+        {
+            return Err(BlockReason::ClickPacing);
+        }
+        drop(ledger);
+        Ok(ReadyToCommit {
+            request: request.clone(),
+            context,
+        })
+    }
+
+    fn map_precommit_block(
+        &self,
+        block: PreCommitInputBlock,
+        takeover_policy: TakeoverPolicy,
+    ) -> ActionOutcome {
+        let reason = match block {
+            PreCommitInputBlock::Stopped => BlockReason::Stopped,
+            PreCommitInputBlock::ManualTakeover => {
+                self.session.apply_takeover(takeover_policy);
+                BlockReason::ManualTakeover(takeover_policy)
+            }
+            PreCommitInputBlock::InputFailure { message } => BlockReason::InputFailure { message },
+            PreCommitInputBlock::Commit { reason } => reason,
+        };
+        ActionOutcome::Blocked {
+            reason,
+            transitions: vec![ActionState::Prepared, ActionState::Blocked],
         }
     }
 

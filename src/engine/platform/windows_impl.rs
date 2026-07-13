@@ -53,8 +53,9 @@ use windows::{
 use xcap::Monitor;
 
 use super::super::{
+    automation::{CaptureSource, InputSink, StopSource},
     config::{MouseMovementModel, MouseMovementProfile, MouseMovementSample, MouseMovementStep},
-    enchant_loop::{InputController, OcrReader, RegionCapture, StopSignal},
+    enchant_loop::OcrReader,
     types::{Point, Rect, ScreenImage},
 };
 
@@ -67,8 +68,8 @@ pub fn enable_per_monitor_dpi_awareness() {
 #[derive(Debug, Default, Clone)]
 pub struct XcapRegionCapture;
 
-impl RegionCapture for XcapRegionCapture {
-    fn capture_region(&self, rect: Rect) -> Result<ScreenImage> {
+impl CaptureSource for XcapRegionCapture {
+    fn capture(&self, rect: Rect) -> Result<ScreenImage> {
         let monitor = Monitor::from_point(rect.x, rect.y)
             .with_context(|| format!("failed to locate monitor for {}, {}", rect.x, rect.y))?;
         let monitor_x = monitor.x()?;
@@ -204,24 +205,20 @@ fn recognize_png_file(path: &std::path::Path) -> Result<String> {
 #[derive(Debug, Default, Clone)]
 pub struct SendInputController;
 
-impl InputController for SendInputController {
-    fn click(&self, point: Point) -> Result<()> {
-        click_at(point)
-    }
-
-    fn click_with_movement(
+impl InputSink for SendInputController {
+    fn move_and_click(
         &self,
         point: Point,
         movement: Option<&MouseMovementProfile>,
-        stop: Option<&dyn StopSignal>,
+        stop: Option<&dyn StopSource>,
     ) -> Result<()> {
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return Ok(());
         }
         if let Some(profile) = movement.filter(|profile| profile.is_usable()) {
             move_cursor_with_profile(point, profile, stop)?;
         }
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return Ok(());
         }
         click_at(point)
@@ -249,7 +246,7 @@ fn click_at(point: Point) -> Result<()> {
 fn move_cursor_with_profile(
     target: Point,
     profile: &MouseMovementProfile,
-    stop: Option<&dyn StopSignal>,
+    stop: Option<&dyn StopSource>,
 ) -> Result<()> {
     let start = cursor_pos()?;
     let dx = (target.x - start.x) as f32;
@@ -309,7 +306,7 @@ fn move_cursor_with_profile(
             }
             last_ms = at_ms;
         }
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return Ok(());
         }
 
@@ -336,7 +333,7 @@ fn move_cursor_with_motion_model(
     normal: (f32, f32),
     profile: &MouseMovementProfile,
     model: MouseMovementModel,
-    stop: Option<&dyn StopSignal>,
+    stop: Option<&dyn StopSource>,
 ) -> Result<()> {
     let recorded_id = fitts_index(profile.distance_px, model.target_width_px).max(0.1);
     let target_id = fitts_index(distance, model.target_width_px).max(0.1);
@@ -355,7 +352,7 @@ fn move_cursor_with_motion_model(
             return Ok(());
         }
         elapsed = next_elapsed;
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return Ok(());
         }
 
@@ -406,7 +403,7 @@ fn move_cursor_with_learned_steps(
     normal: (f32, f32),
     profile: &MouseMovementProfile,
     scaled_duration_ms: u64,
-    stop: Option<&dyn StopSignal>,
+    stop: Option<&dyn StopSource>,
 ) -> Result<()> {
     let total_delay_ms: u64 = profile
         .movement_steps
@@ -423,7 +420,7 @@ fn move_cursor_with_learned_steps(
         if sleep_until_or_stop(delay_ms, stop) {
             return Ok(());
         }
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return Ok(());
         }
 
@@ -444,17 +441,17 @@ fn move_cursor_with_learned_steps(
     Ok(())
 }
 
-fn sleep_until_or_stop(millis: u64, stop: Option<&dyn StopSignal>) -> bool {
+fn sleep_until_or_stop(millis: u64, stop: Option<&dyn StopSource>) -> bool {
     let mut remaining = millis;
     while remaining > 0 {
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return true;
         }
         let chunk = remaining.min(8);
         thread::sleep(Duration::from_millis(chunk));
         remaining -= chunk;
     }
-    stop.is_some_and(|stop| stop.should_stop())
+    stop.is_some_and(|stop| stop.is_stopped())
 }
 
 fn mouse_input(flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS) -> INPUT {
@@ -500,8 +497,8 @@ impl Default for EscStopSignal {
     }
 }
 
-impl StopSignal for EscStopSignal {
-    fn should_stop(&self) -> bool {
+impl StopSource for EscStopSignal {
+    fn is_stopped(&self) -> bool {
         self.is_stop_requested()
     }
 }

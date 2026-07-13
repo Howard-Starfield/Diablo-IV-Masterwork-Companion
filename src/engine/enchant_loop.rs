@@ -5,6 +5,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::{
+    automation::{CaptureSource, InputSink, StopSource},
     config::{EnchantConfig, MouseMovementProfile},
     matcher::{MatchResult, match_affix},
     types::{Point, Rect, ScreenImage},
@@ -14,12 +15,30 @@ pub trait RegionCapture {
     fn capture_region(&self, rect: Rect) -> Result<ScreenImage>;
 }
 
+impl<T> RegionCapture for T
+where
+    T: CaptureSource,
+{
+    fn capture_region(&self, rect: Rect) -> Result<ScreenImage> {
+        self.capture(rect)
+    }
+}
+
 pub trait OcrReader {
     fn read_text(&self, image: &ScreenImage) -> Result<String>;
 }
 
 pub trait StopSignal {
     fn should_stop(&self) -> bool;
+}
+
+impl<T> StopSignal for T
+where
+    T: StopSource,
+{
+    fn should_stop(&self) -> bool {
+        self.is_stopped()
+    }
 }
 
 pub trait InputController {
@@ -32,6 +51,38 @@ pub trait InputController {
         _stop: Option<&dyn StopSignal>,
     ) -> Result<()> {
         self.click(point)
+    }
+}
+
+struct StopSourceAdapter<'a>(&'a dyn StopSignal);
+
+impl StopSource for StopSourceAdapter<'_> {
+    fn is_stopped(&self) -> bool {
+        self.0.should_stop()
+    }
+}
+
+impl<T> InputController for T
+where
+    T: InputSink,
+{
+    fn click(&self, point: Point) -> Result<()> {
+        self.move_and_click(point, None, None)
+    }
+
+    fn click_with_movement(
+        &self,
+        point: Point,
+        movement: Option<&MouseMovementProfile>,
+        stop: Option<&dyn StopSignal>,
+    ) -> Result<()> {
+        match stop {
+            Some(stop) => {
+                let stop = StopSourceAdapter(stop);
+                self.move_and_click(point, movement, Some(&stop))
+            }
+            None => self.move_and_click(point, movement, None),
+        }
     }
 }
 
@@ -251,6 +302,61 @@ mod tests {
         config::{MouseMovementSample, MouseMovementStep},
         types::{PointRatio, RectRatio},
     };
+
+    #[derive(Clone)]
+    struct SharedCapture(Rc<RefCell<Vec<&'static str>>>);
+
+    impl CaptureSource for SharedCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            self.0.borrow_mut().push("capture");
+            Ok(ScreenImage::new(RgbaImage::new(rect.width, rect.height)))
+        }
+    }
+
+    struct RecordingOcr(Rc<RefCell<Vec<&'static str>>>);
+
+    impl OcrReader for RecordingOcr {
+        fn read_text(&self, _image: &ScreenImage) -> Result<String> {
+            self.0.borrow_mut().push("ocr");
+            Ok("Thorns".to_string())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedInput {
+        actions: Rc<RefCell<Vec<&'static str>>>,
+        stop_after_click: Option<Rc<Cell<bool>>>,
+    }
+
+    impl InputSink for SharedInput {
+        fn move_and_click(
+            &self,
+            point: Point,
+            _movement: Option<&MouseMovementProfile>,
+            _stop: Option<&dyn StopSource>,
+        ) -> Result<()> {
+            let action = match point {
+                Point { x: 10, y: 10 } => "enchant",
+                Point { x: 70, y: 70 } => "replace",
+                Point { x: 90, y: 10 } => "close",
+                _ => "unknown",
+            };
+            self.actions.borrow_mut().push(action);
+            if let Some(stop) = &self.stop_after_click {
+                stop.set(true);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedStop(Rc<Cell<bool>>);
+
+    impl StopSource for SharedStop {
+        fn is_stopped(&self) -> bool {
+            self.0.get()
+        }
+    }
 
     struct FakeCapture;
     impl RegionCapture for FakeCapture {
@@ -488,5 +594,54 @@ mod tests {
 
         assert!(matches!(outcome, EnchantOutcome::Stopped { attempts: 1 }));
         assert_eq!(*clicked.borrow(), vec![Point::new(10, 10)]);
+    }
+
+    #[test]
+    fn shared_adapters_preserve_enchant_ocr_replace_close_order() {
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let mut run_config = config("Max Health");
+        run_config.max_attempts = 1;
+        let runner = EnchantRunner::new(
+            run_config,
+            SharedCapture(actions.clone()),
+            RecordingOcr(actions.clone()),
+            SharedInput {
+                actions: actions.clone(),
+                stop_after_click: None,
+            },
+            SharedStop(Rc::new(Cell::new(false))),
+        );
+
+        let outcome = runner.run(|_| {}).unwrap();
+
+        assert!(matches!(
+            outcome,
+            EnchantOutcome::MaxAttempts { attempts: 1 }
+        ));
+        assert_eq!(
+            *actions.borrow(),
+            vec!["enchant", "capture", "ocr", "replace", "close"]
+        );
+    }
+
+    #[test]
+    fn shared_adapters_preserve_stop_before_later_action() {
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let stopped = Rc::new(Cell::new(false));
+        let runner = EnchantRunner::new(
+            config("Max Health"),
+            SharedCapture(actions.clone()),
+            RecordingOcr(actions.clone()),
+            SharedInput {
+                actions: actions.clone(),
+                stop_after_click: Some(stopped.clone()),
+            },
+            SharedStop(stopped),
+        );
+
+        let outcome = runner.run(|_| {}).unwrap();
+
+        assert!(matches!(outcome, EnchantOutcome::Stopped { attempts: 1 }));
+        assert_eq!(*actions.borrow(), vec!["enchant"]);
     }
 }

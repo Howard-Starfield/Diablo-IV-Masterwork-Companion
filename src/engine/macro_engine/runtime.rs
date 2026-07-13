@@ -592,9 +592,11 @@ fn decode_pinned_image_asset(
         .iter()
         .find(|pinned| pinned.asset == *asset)
         .ok_or_else(|| anyhow::anyhow!("compiled image {kind} asset is missing"))?;
-    image::load_from_memory(&pinned.bytes)
-        .map(|image| image.into_luma8())
-        .map_err(|error| anyhow::anyhow!("compiled image {kind} asset cannot be decoded: {error}"))
+    match kind {
+        "mask" => super::ImageRuleVerification::decode_mask_png(&pinned.bytes),
+        _ => super::ImageRuleVerification::decode_template_png(&pinned.bytes),
+    }
+    .map_err(|error| anyhow::anyhow!("compiled image {kind} asset cannot be decoded: {error}"))
 }
 
 fn referenced_assets(definition: &MacroDefinition) -> impl Iterator<Item = super::AssetRef> + '_ {
@@ -1927,6 +1929,8 @@ mod tests {
                     captured_at_ms: request.observed_at_ms,
                     window_id: 9,
                     window_revision: 2,
+                    client_width: 64,
+                    client_height: 48,
                     geometry_revision: 3,
                     display_profile_revision: 4,
                     dpi: 96,

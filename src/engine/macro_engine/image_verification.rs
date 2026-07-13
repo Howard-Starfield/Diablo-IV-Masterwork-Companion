@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use image::GrayImage;
+use image::{GrayImage, Luma};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -11,8 +11,8 @@ use super::{
     AssetRef, IMAGE_RULE_VERIFICATION_VERSION, ImageRule, ImageRuleVerificationArtifact,
     ImageVerificationPreprocess, MacroDefinition,
     image_match::{
-        DEFAULT_MAX_SCORE_CELLS, MIN_TEMPLATE_VARIANCE, estimate_score_cells, template_variance,
-        validate_mask_reference,
+        ImageWorkLimits, MIN_TEMPLATE_VARIANCE, template_variance, validate_mask_reference,
+        validated_scale_plan,
     },
 };
 
@@ -56,6 +56,29 @@ pub(crate) fn valid_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Decodes template pixels using the single grayscale preprocessing contract shared by
+/// authoring, compilation, and live detection.
+pub(crate) fn decode_template_png(bytes: &[u8]) -> Result<GrayImage> {
+    image::load_from_memory(bytes)
+        .map(|image| image.into_luma8())
+        .map_err(|error| anyhow::anyhow!("image template asset cannot be decoded: {error}"))
+}
+
+/// Decodes a portable mask. PNG alpha is authoritative when present; formats without alpha
+/// retain their grayscale luminance for backwards-compatible explicit masks.
+pub(crate) fn decode_mask_png(bytes: &[u8]) -> Result<GrayImage> {
+    let image = image::load_from_memory(bytes)
+        .map_err(|error| anyhow::anyhow!("image mask asset cannot be decoded: {error}"))?;
+    if image.color().has_alpha() {
+        let rgba = image.into_rgba8();
+        Ok(GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+            Luma([rgba.get_pixel(x, y)[3]])
+        }))
+    } else {
+        Ok(image.into_luma8())
+    }
 }
 
 pub(crate) fn fingerprint(artifact: &ImageRuleVerificationArtifact) -> String {
@@ -203,14 +226,13 @@ pub(crate) fn validate_decoded_rule(
             artifact.active_mask_variance
         );
     }
-    let score_cells = estimate_score_cells(
+    validated_scale_plan(
         (artifact.search_width, artifact.search_height),
-        template.dimensions(),
+        template,
+        mask,
         &rule.scales_percent,
-    );
-    if score_cells > DEFAULT_MAX_SCORE_CELLS {
-        bail!("image score-map work {score_cells} exceeds maximum {DEFAULT_MAX_SCORE_CELLS}");
-    }
+        ImageWorkLimits::production(),
+    )?;
     Ok(())
 }
 
@@ -255,4 +277,55 @@ pub(crate) fn trusted_remap_definition_assets(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use image::{
+        DynamicImage, GrayAlphaImage, GrayImage, ImageFormat, Luma, LumaA, Rgba, RgbaImage,
+    };
+
+    use super::*;
+
+    fn png(image: DynamicImage) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn rgba_mask_uses_alpha_instead_of_white_luminance() {
+        let image = RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                Rgba([255, 255, 255, 0])
+            } else {
+                Rgba([255, 255, 255, 128])
+            }
+        });
+
+        let decoded = decode_mask_png(&png(DynamicImage::ImageRgba8(image))).unwrap();
+
+        assert_eq!(decoded.as_raw(), &[0, 128]);
+    }
+
+    #[test]
+    fn grayscale_alpha_mask_uses_alpha_and_grayscale_mask_uses_luminance() {
+        let la = GrayAlphaImage::from_pixel(1, 1, LumaA([255, 17]));
+        let gray = GrayImage::from_pixel(1, 1, Luma([91]));
+
+        assert_eq!(
+            decode_mask_png(&png(DynamicImage::ImageLumaA8(la)))
+                .unwrap()
+                .as_raw(),
+            &[17]
+        );
+        assert_eq!(
+            decode_mask_png(&png(DynamicImage::ImageLuma8(gray)))
+                .unwrap()
+                .as_raw(),
+            &[91]
+        );
+    }
 }

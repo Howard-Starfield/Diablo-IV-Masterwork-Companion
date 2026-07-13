@@ -44,6 +44,14 @@ pub struct MacroPackage {
     pub assets: Vec<PackageAsset>,
 }
 
+/// Portable image-verification artifacts are untrusted until the destination
+/// machine reruns verification against its own captured target and corpus.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("package image rules require local re-verification before import: {image_rule_ids:?}")]
+pub struct LocalReverificationRequired {
+    pub image_rule_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalLimits {
     pub max_bytes_per_run: u64,
@@ -569,6 +577,7 @@ impl MacroStore {
     }
 
     pub fn import_validated_package(&self, mut package: MacroPackage) -> Result<SavedRevision> {
+        reject_portable_image_rules(&package)?;
         validate_package_memory(&package)?;
         let _guard = lock_store(&self.lock)?;
         let existing_macro_ids = fs::read_dir(self.root.join("definitions"))?
@@ -616,7 +625,7 @@ impl MacroStore {
             }
         }
         validate_package_memory(&package)?;
-        validate_verified_package_compiles(&package)?;
+        validate_package_compiles(&package)?;
         for package_asset in &mut package.assets {
             match self
                 .assets
@@ -959,15 +968,20 @@ fn validate_package_memory(package: &MacroPackage) -> Result<()> {
     Ok(())
 }
 
-fn validate_verified_package_compiles(package: &MacroPackage) -> Result<()> {
-    if !package
+fn reject_portable_image_rules(package: &MacroPackage) -> Result<()> {
+    let image_rule_ids = package
         .definition
         .image_rules
         .iter()
-        .any(|rule| rule.verification.is_some())
-    {
+        .map(|rule| rule.id.clone())
+        .collect::<Vec<_>>();
+    if image_rule_ids.is_empty() {
         return Ok(());
     }
+    Err(LocalReverificationRequired { image_rule_ids }.into())
+}
+
+fn validate_package_compiles(package: &MacroPackage) -> Result<()> {
     let definition_hash = sha256_hex(&serde_json::to_vec_pretty(&package.definition)?);
     let saved = SavedRevision {
         definition: package.definition.clone(),
@@ -982,7 +996,7 @@ fn validate_verified_package_compiles(package: &MacroPackage) -> Result<()> {
             .collect(),
     };
     if let Err(error) = super::runtime::CompiledMacro::compile(saved) {
-        bail!("verified package is not compilable: {error:#}");
+        bail!("package is not compilable: {error:#}");
     }
     Ok(())
 }
@@ -1137,8 +1151,8 @@ mod tests {
     use crate::engine::macro_engine::{
         Block, BlockKind, CompiledMacro, Condition, DEFAULT_MAX_SCORE_CELLS, FocusLossPolicy,
         ImageRule, ImageRuleVerification, ImageRuleVerificationInput, Limit, MatchSelectionPolicy,
-        NegativeCorpusSample, NegativeSampleEvaluationInputs, ObserveMode, RegionDefinition,
-        SafetyPolicy, TargetProfile, validate_macro,
+        NegativeCorpusSample, NegativeSampleEvaluationInputs, ObserveMode, PreprocessProfile,
+        RegionDefinition, SafetyPolicy, TargetProfile, TextMatchMode, TextRule,
     };
     use crate::engine::types::RectRatio;
     use image::{DynamicImage, GrayImage, ImageFormat, Luma};
@@ -1257,6 +1271,54 @@ mod tests {
             .unwrap()
             .into_artifact(),
         );
+        definition
+    }
+
+    fn compilable_text_definition() -> MacroDefinition {
+        let placeholder = AssetRef {
+            id: "unused".to_string(),
+            revision: 1,
+            content_hash: "0".repeat(64),
+        };
+        let mut definition = fixture_definition(placeholder);
+        definition.regions = vec![RegionDefinition {
+            id: "region-one".to_string(),
+            revision: 1,
+            rect: RectRatio {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        }];
+        definition.image_rules.clear();
+        definition.text_rules = vec![TextRule {
+            id: "text-one".to_string(),
+            revision: 1,
+            region_id: "region-one".to_string(),
+            language: "en-US".to_string(),
+            preprocess: PreprocessProfile::Original,
+            expected: "ready".to_string(),
+            match_mode: TextMatchMode::Contains,
+            threshold: 0.9,
+            case_sensitive: false,
+            allow_cross_line: false,
+            match_policy: MatchSelectionPolicy::HighestScore,
+            poll_interval_ms: 100,
+            timeout_ms: Limit::Finite(5_000),
+            stable_frames: 1,
+        }];
+        definition.blocks = vec![Block {
+            id: "observe".to_string(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "observe".to_string(),
+                    rule_id: "text-one".to_string(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        }];
         definition
     }
 
@@ -1389,7 +1451,7 @@ mod tests {
     }
 
     #[test]
-    fn package_import_remaps_colliding_macro_and_asset_ids_and_owns_bytes() {
+    fn image_package_collision_is_rejected_without_remapping_or_mutation() {
         let source_temp = tempfile::tempdir().unwrap();
         let source = MacroStore::open(source_temp.path()).unwrap();
         let source_bytes = b"source-template";
@@ -1423,23 +1485,115 @@ mod tests {
             .put_png_revision(existing_asset.clone(), existing_bytes)
             .unwrap();
         destination
-            .save(fixture_definition(existing_asset))
+            .save(fixture_definition(existing_asset.clone()))
             .unwrap();
 
-        let imported = destination.import_package(&package_folder).unwrap();
+        let error = destination.import_package(&package_folder).unwrap_err();
         fs::remove_dir_all(package_folder).unwrap();
 
-        assert_eq!(imported.definition.id, "macro-one-imported-1");
-        let imported_asset = &imported.definition.image_rules[0].template;
-        assert_eq!(imported_asset.id, "shared-template-imported-1");
+        assert!(
+            error
+                .downcast_ref::<LocalReverificationRequired>()
+                .is_some()
+        );
         assert_eq!(
-            destination.assets().read(imported_asset).unwrap(),
-            source_bytes
+            destination.assets().read(&existing_asset).unwrap(),
+            existing_bytes
+        );
+        assert_eq!(
+            fs::read_dir(destination.root.join("definitions"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(
+            destination
+                .assets()
+                .read(&AssetRef {
+                    id: "shared-template-imported-1".to_string(),
+                    ..source_asset
+                })
+                .is_err()
         );
     }
 
     #[test]
-    fn verified_image_package_collision_remap_stays_valid_and_compilable() {
+    fn image_package_without_local_verification_is_rejected_before_mutation() {
+        let bytes = b"portable-image-bytes".to_vec();
+        let asset = AssetRef {
+            id: "portable-template".to_string(),
+            revision: 1,
+            content_hash: sha256_hex(&bytes),
+        };
+        let package = MacroPackage {
+            schema_version: PACKAGE_SCHEMA_VERSION,
+            definition: fixture_definition(asset.clone()),
+            assets: vec![PackageAsset {
+                asset: asset.clone(),
+                relative_path: PathBuf::from("assets/portable.png"),
+                bytes,
+            }],
+        };
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+
+        let error = destination.import_validated_package(package).unwrap_err();
+
+        let local = error
+            .downcast_ref::<LocalReverificationRequired>()
+            .expect("image imports require a typed local re-verification outcome");
+        assert_eq!(local.image_rule_ids, vec!["image-one"]);
+        assert!(destination.assets().read(&asset).is_err());
+        assert!(!destination.root.join("definitions/macro-one").exists());
+    }
+
+    #[test]
+    fn valid_text_only_package_compiles_and_imports() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let saved = source.save(compilable_text_definition()).unwrap();
+        let package_path = source_temp.path().join("text-package");
+        source.export_package(&saved, &package_path).unwrap();
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+
+        let imported = destination.import_package(&package_path).unwrap();
+
+        assert_eq!(imported.definition.id, "macro-one");
+        assert_eq!(imported.definition.text_rules.len(), 1);
+        assert!(imported.definition.image_rules.is_empty());
+        assert!(CompiledMacro::compile(imported).is_ok());
+    }
+
+    #[test]
+    fn invalid_text_only_package_is_compiled_before_install_and_mutates_nothing() {
+        let mut definition = compilable_text_definition();
+        definition.text_rules[0].region_id = "missing-region".to_string();
+        let package = MacroPackage {
+            schema_version: PACKAGE_SCHEMA_VERSION,
+            definition,
+            assets: vec![],
+        };
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+
+        let error = destination.import_validated_package(package).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("saved macro revision is invalid")
+        );
+        assert_eq!(
+            fs::read_dir(destination.root.join("definitions"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn verified_image_package_collision_still_requires_local_reverification() {
         let source_temp = tempfile::tempdir().unwrap();
         let source = MacroStore::open(source_temp.path()).unwrap();
         let (source_template, source_bytes) = fixture_png(7);
@@ -1469,12 +1623,6 @@ mod tests {
                 Some((source_mask_asset.clone(), &source_mask)),
             ))
             .unwrap();
-        let source_fingerprint = source_saved.definition.image_rules[0]
-            .verification
-            .as_ref()
-            .unwrap()
-            .verification_fingerprint_sha256()
-            .to_string();
         let package_folder = source_temp.path().join("verified-package");
         source
             .export_package(&source_saved, &package_folder)
@@ -1507,38 +1655,20 @@ mod tests {
             )
             .unwrap();
 
-        let imported = destination.import_package(&package_folder).unwrap();
+        let error = destination.import_package(&package_folder).unwrap_err();
 
-        assert!(validate_macro(&imported.definition).is_empty());
-        let artifact = imported.definition.image_rules[0]
-            .verification
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            artifact.template,
-            imported.definition.image_rules[0].template
+        assert!(
+            error
+                .downcast_ref::<LocalReverificationRequired>()
+                .is_some()
         );
-        assert_eq!(
-            artifact.transparent_mask,
-            imported.definition.image_rules[0].transparent_mask
-        );
-        assert_eq!(
-            imported.definition.image_rules[0]
-                .transparent_mask
-                .as_ref()
-                .unwrap()
-                .id,
-            "shared-mask-imported-1"
-        );
-        assert_ne!(
-            artifact.verification_fingerprint_sha256(),
-            source_fingerprint
-        );
-        assert!(CompiledMacro::compile(imported).is_ok());
+        for id in ["shared-template-imported-1", "shared-mask-imported-1"] {
+            assert!(!destination.assets.root.join(id).exists());
+        }
     }
 
     #[test]
-    fn collision_remap_rejects_stale_verification_before_installing_assets() {
+    fn stale_portable_verification_is_rejected_by_local_trust_boundary_first() {
         let source_temp = tempfile::tempdir().unwrap();
         let source = MacroStore::open(source_temp.path()).unwrap();
         let (source_template, source_bytes) = fixture_png(7);
@@ -1592,8 +1722,8 @@ mod tests {
 
         assert!(
             error
-                .to_string()
-                .contains("cannot remap invalid image verification")
+                .downcast_ref::<LocalReverificationRequired>()
+                .is_some()
         );
         let would_be_remap = AssetRef {
             id: "shared-template-imported-1".to_string(),
@@ -1603,7 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_package_compile_failure_installs_nothing() {
+    fn invalid_portable_image_package_hits_local_reverification_boundary_first() {
         let (varied_template, _) = fixture_png(7);
         let flat = GrayImage::from_pixel(7, 5, Luma([80]));
         let mut flat_bytes = Cursor::new(Vec::new());
@@ -1631,7 +1761,11 @@ mod tests {
 
         let error = destination.import_validated_package(package).unwrap_err();
 
-        assert!(error.to_string().contains("template variance"));
+        assert!(
+            error
+                .downcast_ref::<LocalReverificationRequired>()
+                .is_some()
+        );
         assert!(destination.assets().read(&flat_asset).is_err());
         assert!(!destination.root.join("definitions/macro-one").exists());
     }
@@ -1867,7 +2001,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_import_rolls_back_new_assets_and_identity_bindings() {
+    fn image_import_rejection_precedes_asset_install_failure_injection() {
         let source_temp = tempfile::tempdir().unwrap();
         let source = MacroStore::open(source_temp.path()).unwrap();
         let asset = source.assets().put_png(b"source").unwrap();
@@ -1878,7 +2012,12 @@ mod tests {
         let destination_temp = tempfile::tempdir().unwrap();
         let destination = MacroStore::open(destination_temp.path()).unwrap();
         destination.fail_next_import_after_asset_installs();
-        assert!(destination.import_package(&package_path).is_err());
+        let error = destination.import_package(&package_path).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<LocalReverificationRequired>()
+                .is_some()
+        );
         assert!(destination.assets().read(&asset).is_err());
         assert_eq!(
             fs::read_dir(destination_temp.path().join("macro_data/definitions"))
@@ -1889,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn validated_package_import_uses_captured_bytes_after_source_substitution() {
+    fn validated_image_package_source_substitution_still_requires_local_reverification() {
         let source_temp = tempfile::tempdir().unwrap();
         let source = MacroStore::open(source_temp.path()).unwrap();
         let original = b"original";
@@ -1908,14 +2047,13 @@ mod tests {
 
         let destination_temp = tempfile::tempdir().unwrap();
         let destination = MacroStore::open(destination_temp.path()).unwrap();
-        let imported = destination.import_validated_package(package).unwrap();
-        assert_eq!(
-            destination
-                .assets()
-                .read(&imported.definition.image_rules[0].template)
-                .unwrap(),
-            original
+        let error = destination.import_validated_package(package).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<LocalReverificationRequired>()
+                .is_some()
         );
+        assert!(destination.assets().read(&asset).is_err());
     }
 
     #[test]
@@ -2065,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn import_remap_reserves_ids_already_present_in_the_package() {
+    fn image_import_rejection_precedes_collision_remap_reservations() {
         let source_temp = tempfile::tempdir().unwrap();
         let source = MacroStore::open(source_temp.path()).unwrap();
         let x_bytes = b"package-x";
@@ -2109,19 +2247,15 @@ mod tests {
             )
             .unwrap();
 
-        let imported = destination.import_package(&package_path).unwrap();
-        assert_eq!(
-            imported.definition.image_rules[0].template.id,
-            "x-imported-2"
+        let error = destination.import_package(&package_path).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<LocalReverificationRequired>()
+                .is_some()
         );
-        assert_eq!(
-            imported.definition.image_rules[0]
-                .transparent_mask
-                .as_ref()
-                .unwrap()
-                .id,
-            reserved.id
-        );
+        for id in ["x-imported-1", "x-imported-2"] {
+            assert!(!destination.assets.root.join(id).exists());
+        }
     }
 
     #[test]

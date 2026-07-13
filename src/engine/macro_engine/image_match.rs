@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Mutex,
+};
 
 use crate::engine::types::{Rect, ScreenImage};
 use anyhow::{Context, Result, bail};
@@ -20,6 +23,11 @@ pub const INITIAL_SIMILARITY_THRESHOLD: f32 = 0.95;
 /// Initial bounded work policy for the v1 640x360 three-scale envelope.
 /// Task 14 may lower this score-cell budget after named-hardware release benchmarks.
 pub const DEFAULT_MAX_SCORE_CELLS: u64 = 750_000;
+/// Caps the dominant normalized-correlation work: score cells times active template pixels.
+pub const DEFAULT_MAX_PIXEL_OPERATIONS: u64 = 50_000_000;
+/// Caps retained local maxima before deterministic spatial clustering.
+pub const DEFAULT_MAX_CANDIDATES: usize = 4_096;
+const DEFAULT_MAX_CLUSTER_COMPARISONS: u64 = 100_000;
 /// Grayscale intensity variance below this value is too flat for safe correlation.
 pub(super) const MIN_TEMPLATE_VARIANCE: f32 = 16.0;
 const DEFAULT_MAX_STABILITY_STATES: usize = 256;
@@ -56,6 +64,64 @@ pub struct RawImageMatch {
 pub enum ImageMatchError {
     #[error("image match coordinate exceeds the supported signed screen range")]
     CoordinateOverflow,
+    #[error("image match scale must be greater than zero")]
+    ZeroScale,
+    #[error("image match scale {scale_percent}% is duplicated")]
+    DuplicateScale { scale_percent: u16 },
+    #[error("image match scale {scale_percent}% overflows supported dimensions")]
+    ScaleDimensionOverflow { scale_percent: u16 },
+    #[error("image match scale {scale_percent}% does not fit the search region")]
+    ScaleDoesNotFit { scale_percent: u16 },
+    #[error("image match requires at least one fitting scale")]
+    NoFittingScale,
+    #[error("image score-map work {actual} exceeds maximum {maximum}")]
+    ScoreCellLimit { actual: u64, maximum: u64 },
+    #[error("image pixel work {actual} exceeds maximum {maximum}")]
+    PixelOperationLimit { actual: u64, maximum: u64 },
+    #[error("image candidate count exceeds maximum {maximum}")]
+    CandidateLimit { maximum: usize },
+    #[error("image spatial clustering comparisons exceed maximum {maximum}")]
+    ClusterComparisonLimit { maximum: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ImageWorkLimits {
+    maximum_score_cells: u64,
+    maximum_pixel_operations: u64,
+    maximum_candidates: usize,
+}
+
+impl ImageWorkLimits {
+    pub(super) const fn production() -> Self {
+        Self {
+            maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+            maximum_pixel_operations: DEFAULT_MAX_PIXEL_OPERATIONS,
+            maximum_candidates: DEFAULT_MAX_CANDIDATES,
+        }
+    }
+
+    const fn with_maximum_score_cells(maximum_score_cells: u64) -> Self {
+        Self {
+            maximum_score_cells,
+            ..Self::production()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidatedScale {
+    percent: u16,
+    width: u32,
+    height: u32,
+    score_cells: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ValidatedScalePlan {
+    scales: Vec<ValidatedScale>,
+    pub(super) score_cells: u64,
+    pixel_operations: u64,
+    maximum_candidates: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -96,7 +162,6 @@ impl CandidateCluster {
             self.best = peak.clone();
         }
         self.members.push(peak);
-        self.members.sort_by(candidate_order);
     }
 }
 
@@ -161,6 +226,10 @@ pub struct ImageFrameMetadata {
     pub captured_at_ms: u64,
     pub window_id: u64,
     pub window_revision: u64,
+    #[serde(default)]
+    pub client_width: u32,
+    #[serde(default)]
+    pub client_height: u32,
     pub geometry_revision: u64,
     pub display_profile_revision: u64,
     pub dpi: u32,
@@ -280,6 +349,8 @@ impl ImageDetector {
             captured_at_ms: captured.metadata.captured_at_ms,
             window_id: captured.metadata.window_id,
             window_revision: captured.metadata.window_revision,
+            client_width: captured.metadata.client_width,
+            client_height: captured.metadata.client_height,
             geometry_revision: captured.metadata.geometry_revision,
             display_profile_revision: captured.metadata.display_profile_revision,
             dpi: captured.metadata.dpi,
@@ -288,6 +359,20 @@ impl ImageDetector {
         };
         if frame.region_revision != region.revision || frame.rule_revision != rule.revision {
             bail!("image frame metadata does not match compiled region/rule revisions");
+        }
+        if (frame.client_width, frame.client_height)
+            != (
+                definition.target.captured_client_width,
+                definition.target.captured_client_height,
+            )
+        {
+            bail!(
+                "image template client geometry {}x{} is stale for current client geometry {}x{}",
+                definition.target.captured_client_width,
+                definition.target.captured_client_height,
+                frame.client_width,
+                frame.client_height
+            );
         }
         if frame.dpi != definition.target.captured_dpi {
             bail!(
@@ -315,7 +400,7 @@ impl ImageDetector {
             },
         )?;
         let result = ImageMatchResult::select(
-            cluster_peaks(raw.candidates, ClusterPolicy::default()),
+            cluster_peaks(raw.candidates, ClusterPolicy::default())?,
             rule,
         );
         let key = ImageStabilityKey {
@@ -416,9 +501,11 @@ fn decode_gray_asset(
         .iter()
         .find(|pinned| pinned.asset == *asset)
         .with_context(|| format!("compiled image {kind} asset is missing"))?;
-    image::load_from_memory(&pinned.bytes)
-        .with_context(|| format!("compiled image {kind} asset cannot be decoded"))
-        .map(|image| image.into_luma8())
+    match kind {
+        "mask" => ImageRuleVerification::decode_mask_png(&pinned.bytes),
+        _ => ImageRuleVerification::decode_template_png(&pinned.bytes),
+    }
+    .with_context(|| format!("compiled image {kind} asset cannot be decoded"))
 }
 
 fn validate_runtime_image_rule(
@@ -429,14 +516,13 @@ fn validate_runtime_image_rule(
     search_rect: Rect,
 ) -> Result<()> {
     verification::validate_decoded_rule(definition, rule, template, mask)?;
-    let score_cells = estimate_score_cells(
+    validated_scale_plan(
         (search_rect.width, search_rect.height),
-        template.dimensions(),
+        template,
+        mask,
         &rule.scales_percent,
-    );
-    if score_cells > DEFAULT_MAX_SCORE_CELLS {
-        bail!("image score-map work {score_cells} exceeds maximum {DEFAULT_MAX_SCORE_CELLS}");
-    }
+        ImageWorkLimits::production(),
+    )?;
     Ok(())
 }
 
@@ -515,6 +601,8 @@ impl StabilityTracker {
 fn same_frame_identity(left: ImageFrameMetadata, right: ImageFrameMetadata) -> bool {
     left.window_id == right.window_id
         && left.window_revision == right.window_revision
+        && left.client_width == right.client_width
+        && left.client_height == right.client_height
         && left.geometry_revision == right.geometry_revision
         && left.display_profile_revision == right.display_profile_revision
         && left.dpi == right.dpi
@@ -606,6 +694,14 @@ pub struct ImageRuleVerification {
 }
 
 impl ImageRuleVerification {
+    pub fn decode_template_png(bytes: &[u8]) -> Result<GrayImage> {
+        verification::decode_template_png(bytes)
+    }
+
+    pub fn decode_mask_png(bytes: &[u8]) -> Result<GrayImage> {
+        verification::decode_mask_png(bytes)
+    }
+
     pub fn threshold(&self) -> f32 {
         self.threshold
     }
@@ -651,6 +747,8 @@ pub enum ImageRuleVerificationError {
     InvalidNegativeSampleHash { stable_id: String },
     #[error("negative sample stable ID is duplicated: {stable_id}")]
     DuplicateNegativeSample { stable_id: String },
+    #[error("negative sample content SHA-256 is duplicated: {content_sha256}")]
+    DuplicateNegativeSampleContent { content_sha256: String },
     #[error("negative sample {stable_id} was evaluated with different inputs")]
     NegativeSampleEvaluationMismatch { stable_id: String },
     #[error("configured transparent mask asset is missing")]
@@ -661,8 +759,10 @@ pub enum ImageRuleVerificationError {
     LowTemplateVariance { variance: f32, minimum: f32 },
     #[error("template DPI {captured} is stale for current DPI {current}")]
     StaleDpi { captured: u32, current: u32 },
-    #[error("score-map work {score_cells} exceeds configured maximum {maximum}")]
-    WorkLimitExceeded { score_cells: u64, maximum: u64 },
+    #[error(transparent)]
+    InvalidWorkPlan(#[from] ImageMatchError),
+    #[error("observed image candidate cluster is empty")]
+    EmptyObservedCluster,
     #[error("negative margin {margin} is below required {minimum}")]
     InsufficientNegativeMargin { margin: f32, minimum: f32 },
     #[error("candidate ambiguity margin {margin} is below required {minimum}")]
@@ -700,16 +800,37 @@ impl ImageRuleVerification {
                 current: input.current_dpi,
             });
         }
-        let score_cells = estimate_score_cells(
+        let plan = validated_scale_plan(
             input.search_dimensions,
-            input.template.dimensions(),
+            input.template,
+            mask,
             &input.rule.scales_percent,
-        );
-        if score_cells > input.maximum_score_cells {
-            return Err(ImageRuleVerificationError::WorkLimitExceeded {
-                score_cells,
-                maximum: input.maximum_score_cells,
-            });
+            ImageWorkLimits::with_maximum_score_cells(input.maximum_score_cells),
+        )?;
+        let score_cells = plan.score_cells;
+        let observed_candidates =
+            input
+                .observed_clusters
+                .iter()
+                .try_fold(0_usize, |count, cluster| {
+                    if cluster.members.is_empty() {
+                        return Err(ImageRuleVerificationError::EmptyObservedCluster);
+                    }
+                    count.checked_add(cluster.members.len()).ok_or({
+                        ImageRuleVerificationError::InvalidWorkPlan(
+                            ImageMatchError::CandidateLimit {
+                                maximum: plan.maximum_candidates,
+                            },
+                        )
+                    })
+                })?;
+        if input.observed_clusters.len() > plan.maximum_candidates
+            || observed_candidates > plan.maximum_candidates
+        {
+            return Err(ImageMatchError::CandidateLimit {
+                maximum: plan.maximum_candidates,
+            }
+            .into());
         }
         let negative_margin = input.rule.threshold - negative_corpus.best_score;
         if negative_margin < input.rule.minimum_runner_up_margin {
@@ -775,6 +896,7 @@ fn verify_negative_corpus(
             .then_with(|| left.measured_score.total_cmp(&right.measured_score))
     });
     let mut previous_id: Option<&str> = None;
+    let mut content_hashes = std::collections::HashSet::new();
     for sample in &canonical {
         if sample.stable_id.is_empty()
             || sample.stable_id.len() > 256
@@ -794,6 +916,11 @@ fn verify_negative_corpus(
         if !verification::valid_sha256(&sample.content_sha256) {
             return Err(ImageRuleVerificationError::InvalidNegativeSampleHash {
                 stable_id: sample.stable_id.clone(),
+            });
+        }
+        if !content_hashes.insert(sample.content_sha256.clone()) {
+            return Err(ImageRuleVerificationError::DuplicateNegativeSampleContent {
+                content_sha256: sample.content_sha256.clone(),
             });
         }
         if !verification::normalized_score(sample.measured_score) {
@@ -837,13 +964,114 @@ fn verify_negative_corpus_for_test(
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ImageMatcher;
 
-fn scaled_dimension(dimension: u32, scale_percent: u16) -> Result<u32> {
+fn scaled_dimension(
+    dimension: u32,
+    scale_percent: u16,
+) -> std::result::Result<u32, ImageMatchError> {
     let rounded = u64::from(dimension)
         .checked_mul(u64::from(scale_percent))
         .and_then(|value| value.checked_add(50))
         .map(|value| value / 100)
-        .ok_or_else(|| anyhow::anyhow!("scaled template dimension calculation overflowed"))?;
-    u32::try_from(rounded).map_err(|_| anyhow::anyhow!("scaled template dimension exceeds u32"))
+        .ok_or(ImageMatchError::ScaleDimensionOverflow { scale_percent })?;
+    u32::try_from(rounded).map_err(|_| ImageMatchError::ScaleDimensionOverflow { scale_percent })
+}
+
+pub(super) fn validated_scale_plan(
+    search_dimensions: (u32, u32),
+    template: &GrayImage,
+    mask: Option<&GrayImage>,
+    scales_percent: &[u16],
+    limits: ImageWorkLimits,
+) -> std::result::Result<ValidatedScalePlan, ImageMatchError> {
+    if scales_percent.is_empty() {
+        return Err(ImageMatchError::NoFittingScale);
+    }
+    let mut seen = BTreeSet::new();
+    let mut scales = Vec::with_capacity(scales_percent.len());
+    let mut total_cells = 0_u64;
+    let mut total_pixel_operations = 0_u64;
+    for &percent in scales_percent {
+        if percent == 0 {
+            return Err(ImageMatchError::ZeroScale);
+        }
+        if !seen.insert(percent) {
+            return Err(ImageMatchError::DuplicateScale {
+                scale_percent: percent,
+            });
+        }
+        let width = scaled_dimension(template.width(), percent)?;
+        let height = scaled_dimension(template.height(), percent)?;
+        if width == 0 || height == 0 || width > search_dimensions.0 || height > search_dimensions.1
+        {
+            return Err(ImageMatchError::ScaleDoesNotFit {
+                scale_percent: percent,
+            });
+        }
+        let score_cells = u64::from(search_dimensions.0 - width + 1)
+            .checked_mul(u64::from(search_dimensions.1 - height + 1))
+            .ok_or(ImageMatchError::ScoreCellLimit {
+                actual: u64::MAX,
+                maximum: limits.maximum_score_cells,
+            })?;
+        total_cells =
+            total_cells
+                .checked_add(score_cells)
+                .ok_or(ImageMatchError::ScoreCellLimit {
+                    actual: u64::MAX,
+                    maximum: limits.maximum_score_cells,
+                })?;
+        if total_cells > limits.maximum_score_cells {
+            return Err(ImageMatchError::ScoreCellLimit {
+                actual: total_cells,
+                maximum: limits.maximum_score_cells,
+            });
+        }
+        let active_pixels = if let Some(mask) = mask {
+            let base_active = mask.pixels().filter(|pixel| pixel[0] != 0).count() as u64;
+            let horizontal_replication = width.div_ceil(template.width());
+            let vertical_replication = height.div_ceil(template.height());
+            base_active
+                .saturating_mul(u64::from(horizontal_replication))
+                .saturating_mul(u64::from(vertical_replication))
+                .min(u64::from(width) * u64::from(height))
+        } else {
+            u64::from(width) * u64::from(height)
+        };
+        let pixel_operations =
+            score_cells
+                .checked_mul(active_pixels)
+                .ok_or(ImageMatchError::PixelOperationLimit {
+                    actual: u64::MAX,
+                    maximum: limits.maximum_pixel_operations,
+                })?;
+        total_pixel_operations = total_pixel_operations.checked_add(pixel_operations).ok_or(
+            ImageMatchError::PixelOperationLimit {
+                actual: u64::MAX,
+                maximum: limits.maximum_pixel_operations,
+            },
+        )?;
+        if total_pixel_operations > limits.maximum_pixel_operations {
+            return Err(ImageMatchError::PixelOperationLimit {
+                actual: total_pixel_operations,
+                maximum: limits.maximum_pixel_operations,
+            });
+        }
+        scales.push(ValidatedScale {
+            percent,
+            width,
+            height,
+            score_cells,
+        });
+    }
+    if scales.is_empty() {
+        return Err(ImageMatchError::NoFittingScale);
+    }
+    Ok(ValidatedScalePlan {
+        scales,
+        score_cells: total_cells,
+        pixel_operations: total_pixel_operations,
+        maximum_candidates: limits.maximum_candidates,
+    })
 }
 
 fn candidate_order(left: &ImageMatchCandidate, right: &ImageMatchCandidate) -> std::cmp::Ordering {
@@ -905,23 +1133,62 @@ fn candidates_represent_same_object(
 pub fn cluster_peaks(
     mut peaks: Vec<ImageMatchCandidate>,
     policy: ClusterPolicy,
-) -> Vec<CandidateCluster> {
+) -> std::result::Result<Vec<CandidateCluster>, ImageMatchError> {
+    if peaks.len() > DEFAULT_MAX_CANDIDATES {
+        return Err(ImageMatchError::CandidateLimit {
+            maximum: DEFAULT_MAX_CANDIDATES,
+        });
+    }
     peaks.sort_by(candidate_order);
+    let cell_size = peaks
+        .iter()
+        .map(|peak| peak.rect.width.max(peak.rect.height))
+        .max()
+        .unwrap_or(1)
+        .max(policy.maximum_center_distance_px.ceil() as u32)
+        .max(1);
     let mut clusters: Vec<CandidateCluster> = Vec::new();
+    let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    let mut comparisons = 0_u64;
     for peak in peaks {
-        if let Some(cluster) = clusters.iter_mut().find(|cluster| {
-            cluster
-                .members
-                .iter()
-                .any(|member| candidates_represent_same_object(member, &peak, policy))
-        }) {
+        let center_x = i64::from(peak.rect.x) + i64::from(peak.rect.width) / 2;
+        let center_y = i64::from(peak.rect.y) + i64::from(peak.rect.height) / 2;
+        let key = (
+            center_x.div_euclid(i64::from(cell_size)),
+            center_y.div_euclid(i64::from(cell_size)),
+        );
+        let mut nearby = BTreeSet::new();
+        for y in key.1 - 1..=key.1 + 1 {
+            for x in key.0 - 1..=key.0 + 1 {
+                if let Some(indices) = grid.get(&(x, y)) {
+                    nearby.extend(indices.iter().copied());
+                }
+            }
+        }
+        let mut matching = None;
+        for index in nearby {
+            comparisons += 1;
+            if comparisons > DEFAULT_MAX_CLUSTER_COMPARISONS {
+                return Err(ImageMatchError::ClusterComparisonLimit {
+                    maximum: DEFAULT_MAX_CLUSTER_COMPARISONS,
+                });
+            }
+            if candidates_represent_same_object(&clusters[index].best, &peak, policy) {
+                matching = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = matching {
+            let cluster = &mut clusters[index];
             cluster.add(peak);
         } else {
+            let index = clusters.len();
             clusters.push(CandidateCluster::from_peak(peak));
+            grid.entry(key).or_default().push(index);
         }
     }
     clusters.sort_by(cluster_order);
-    clusters
+    Ok(clusters)
 }
 
 fn extract_local_maxima(
@@ -929,6 +1196,8 @@ fn extract_local_maxima(
     template_dimensions: (u32, u32),
     scale_percent: u16,
     threshold: f32,
+    existing_candidates: usize,
+    maximum_candidates: usize,
 ) -> Result<Vec<ImageMatchCandidate>> {
     let mut maxima = Vec::new();
     for y in 0..scores.height() {
@@ -952,6 +1221,12 @@ fn extract_local_maxima(
                 }
             }
             if is_maximum {
+                if existing_candidates + maxima.len() >= maximum_candidates {
+                    return Err(ImageMatchError::CandidateLimit {
+                        maximum: maximum_candidates,
+                    }
+                    .into());
+                }
                 maxima.push(ImageMatchCandidate {
                     rect: Rect::new(
                         i32::try_from(x).map_err(|_| ImageMatchError::CoordinateOverflow)?,
@@ -1056,28 +1331,6 @@ pub(super) fn template_variance(template: &GrayImage, mask: Option<&GrayImage>) 
         / values.len() as f64) as f32
 }
 
-pub(super) fn estimate_score_cells(
-    search_dimensions: (u32, u32),
-    template_dimensions: (u32, u32),
-    scales_percent: &[u16],
-) -> u64 {
-    scales_percent
-        .iter()
-        .filter_map(|&scale| {
-            let width = scaled_dimension(template_dimensions.0, scale).ok()?;
-            let height = scaled_dimension(template_dimensions.1, scale).ok()?;
-            (width > 0
-                && height > 0
-                && width <= search_dimensions.0
-                && height <= search_dimensions.1)
-                .then(|| {
-                    u64::from(search_dimensions.0 - width + 1)
-                        .saturating_mul(u64::from(search_dimensions.1 - height + 1))
-                })
-        })
-        .fold(0_u64, u64::saturating_add)
-}
-
 impl ImageMatcher {
     pub fn match_screen_image(
         &self,
@@ -1128,9 +1381,6 @@ impl ImageMatcher {
         if !(0.0..=1.0).contains(&config.threshold) {
             bail!("image match threshold must be between 0 and 1");
         }
-        if config.scales_percent.is_empty() {
-            bail!("image match requires at least one scale");
-        }
         if let Some(mask) = mask {
             if mask.dimensions() != template.dimensions() {
                 bail!("image match mask dimensions must match the template");
@@ -1140,20 +1390,19 @@ impl ImageMatcher {
             }
         }
 
+        let plan = validated_scale_plan(
+            search.dimensions(),
+            template,
+            mask,
+            &config.scales_percent,
+            ImageWorkLimits::production(),
+        )?;
         let mut candidates = Vec::new();
         let mut best: Option<ImageMatchCandidate> = None;
-        for &scale_percent in &config.scales_percent {
-            if scale_percent == 0 {
-                bail!("image match scale must be greater than zero");
-            }
-            let width = scaled_dimension(template.width(), scale_percent)?;
-            let height = scaled_dimension(template.height(), scale_percent)?;
-            if width == 0 || height == 0 {
-                continue;
-            }
-            if width > search.width() || height > search.height() {
-                continue;
-            }
+        for scale in plan.scales {
+            let scale_percent = scale.percent;
+            let width = scale.width;
+            let height = scale.height;
             let scaled = if scale_percent == 100 {
                 template.clone()
             } else {
@@ -1199,6 +1448,8 @@ impl ImageMatcher {
                 (width, height),
                 scale_percent,
                 config.threshold,
+                candidates.len(),
+                plan.maximum_candidates,
             )?);
         }
 
@@ -1222,7 +1473,7 @@ mod tests {
         automation::{CaptureFrameMetadata, CaptureSource, CapturedScreenFrame},
         types::{RectRatio, ScreenImage},
     };
-    use image::{DynamicImage, GrayImage, ImageFormat, Luma};
+    use image::{DynamicImage, GrayImage, ImageFormat, Luma, Rgba, RgbaImage};
     use sha2::{Digest, Sha256};
     use std::{io::Cursor, sync::Mutex};
 
@@ -1291,6 +1542,8 @@ mod tests {
                 captured_at_ms,
                 window_id: 11,
                 window_revision: 3,
+                client_width: 64,
+                client_height: 48,
                 geometry_revision: 5,
                 display_profile_revision: 7,
                 dpi: 96,
@@ -1307,6 +1560,8 @@ mod tests {
             captured_at_ms: frame.captured_at_ms,
             window_id: frame.window_id,
             window_revision: frame.window_revision,
+            client_width: frame.client_width,
+            client_height: frame.client_height,
             geometry_revision: frame.geometry_revision,
             display_profile_revision: frame.display_profile_revision,
             dpi: frame.dpi,
@@ -1501,7 +1756,72 @@ mod tests {
     fn scaled_dimension_rejects_result_larger_than_u32() {
         let error = scaled_dimension(u32::MAX, u16::MAX).unwrap_err();
 
-        assert!(error.to_string().contains("exceeds u32"));
+        assert!(matches!(
+            error,
+            ImageMatchError::ScaleDimensionOverflow { .. }
+        ));
+    }
+
+    #[test]
+    fn validated_scale_plan_rejects_zero_duplicate_and_non_fitting_scales() {
+        let template = fixture_icon();
+        let limits = ImageWorkLimits::production();
+
+        assert_eq!(
+            validated_scale_plan((64, 48), &template, None, &[0], limits).unwrap_err(),
+            ImageMatchError::ZeroScale
+        );
+        assert_eq!(
+            validated_scale_plan((64, 48), &template, None, &[100, 100], limits).unwrap_err(),
+            ImageMatchError::DuplicateScale { scale_percent: 100 }
+        );
+        assert_eq!(
+            validated_scale_plan((6, 4), &template, None, &[100], limits).unwrap_err(),
+            ImageMatchError::ScaleDoesNotFit { scale_percent: 100 }
+        );
+    }
+
+    #[test]
+    fn validated_scale_plan_bounds_pixel_operations_independently_of_score_cells() {
+        let template = fixture_icon();
+        let limits = ImageWorkLimits {
+            maximum_score_cells: u64::MAX,
+            maximum_pixel_operations: 10,
+            maximum_candidates: DEFAULT_MAX_CANDIDATES,
+        };
+
+        assert!(matches!(
+            validated_scale_plan((64, 48), &template, None, &[100], limits).unwrap_err(),
+            ImageMatchError::PixelOperationLimit { .. }
+        ));
+    }
+
+    #[test]
+    fn local_maxima_fail_closed_at_candidate_capacity() {
+        let mut scores = ImageBuffer::from_pixel(3, 1, Luma([0.1_f32]));
+        scores.put_pixel(0, 0, Luma([0.99]));
+        scores.put_pixel(2, 0, Luma([0.98]));
+
+        let error = extract_local_maxima(&scores, (1, 1), 100, 0.9, 0, 1).unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<ImageMatchError>(),
+            Some(ImageMatchError::CandidateLimit { maximum: 1 })
+        ));
+    }
+
+    #[test]
+    fn spatial_clustering_rejects_unbounded_candidate_input() {
+        let peaks = (0..=DEFAULT_MAX_CANDIDATES)
+            .map(|x| peak(x as i32 * 20, 0, 0.99, 100))
+            .collect();
+
+        assert_eq!(
+            cluster_peaks(peaks, ClusterPolicy::default()).unwrap_err(),
+            ImageMatchError::CandidateLimit {
+                maximum: DEFAULT_MAX_CANDIDATES
+            }
+        );
     }
 
     #[test]
@@ -1544,7 +1864,7 @@ mod tests {
     fn adjacent_score_peaks_form_one_visual_candidate() {
         let peaks = vec![peak(20, 20, 0.97, 100), peak(21, 20, 0.96, 100)];
 
-        let clusters = cluster_peaks(peaks, ClusterPolicy::default());
+        let clusters = cluster_peaks(peaks, ClusterPolicy::default()).unwrap();
 
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].best.score, 0.97);
@@ -1556,8 +1876,10 @@ mod tests {
         let peaks = vec![peak(20, 20, 0.97, 95), peak(20, 20, 0.98, 100)];
         let rule = fixture_rule(0.95);
 
-        let result =
-            ImageMatchResult::select(cluster_peaks(peaks, ClusterPolicy::default()), &rule);
+        let result = ImageMatchResult::select(
+            cluster_peaks(peaks, ClusterPolicy::default()).unwrap(),
+            &rule,
+        );
 
         assert!(result.matched);
         assert_eq!(result.clusters.len(), 1);
@@ -1575,8 +1897,10 @@ mod tests {
         rule.match_policy = MatchSelectionPolicy::HighestScore;
         rule.minimum_runner_up_margin = 0.03;
 
-        let result =
-            ImageMatchResult::select(cluster_peaks(peaks, ClusterPolicy::default()), &rule);
+        let result = ImageMatchResult::select(
+            cluster_peaks(peaks, ClusterPolicy::default()).unwrap(),
+            &rule,
+        );
 
         assert!(!result.matched);
         assert_eq!(result.runner_up.as_ref().unwrap().best.score, 0.96);
@@ -1605,7 +1929,7 @@ mod tests {
         scores.put_pixel(3, 2, Luma([0.96]));
         scores.put_pixel(7, 1, Luma([0.95]));
 
-        let maxima = extract_local_maxima(&scores, (7, 5), 100, 0.90).unwrap();
+        let maxima = extract_local_maxima(&scores, (7, 5), 100, 0.90, 0, 16).unwrap();
 
         assert_eq!(maxima.len(), 2);
         assert!(
@@ -1872,6 +2196,15 @@ mod tests {
             }
         );
 
+        let mut same_content = a.clone();
+        same_content.stable_id = "negative/same-bytes".to_string();
+        assert_eq!(
+            verify_negative_corpus_for_test(&rule, &[a.clone(), same_content]).unwrap_err(),
+            ImageRuleVerificationError::DuplicateNegativeSampleContent {
+                content_sha256: NEGATIVE_CORPUS_SHA256.to_string(),
+            }
+        );
+
         let mut malformed_hash = a.clone();
         malformed_hash.content_sha256 = "not-a-sha".to_string();
         assert!(matches!(
@@ -1958,7 +2291,7 @@ mod tests {
         };
         assert!(matches!(
             ImageRuleVerification::verify(oversized).unwrap_err(),
-            ImageRuleVerificationError::WorkLimitExceeded { .. }
+            ImageRuleVerificationError::InvalidWorkPlan(ImageMatchError::ScoreCellLimit { .. })
         ));
     }
 
@@ -2091,6 +2424,23 @@ mod tests {
             ImageRuleVerificationError::InvalidMask { .. }
         ));
 
+        let transparent_white = RgbaImage::from_pixel(
+            template.width(),
+            template.height(),
+            Rgba([255, 255, 255, 0]),
+        );
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(transparent_white)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        let alpha_mask = ImageRuleVerification::decode_mask_png(&bytes.into_inner()).unwrap();
+        let mut transparent = input.clone();
+        transparent.mask = Some(&alpha_mask);
+        assert!(matches!(
+            ImageRuleVerification::verify(transparent).unwrap_err(),
+            ImageRuleVerificationError::InvalidMask { .. }
+        ));
+
         let valid_mask = GrayImage::from_pixel(template.width(), template.height(), Luma([255]));
         let mut negative = input.clone();
         negative.mask = Some(&valid_mask);
@@ -2165,6 +2515,69 @@ mod tests {
     }
 
     #[test]
+    fn verification_rejects_unbounded_observed_candidate_count() {
+        let mut rule = fixture_rule(0.91);
+        rule.scales_percent = vec![100];
+        let template = fixture_icon();
+        let samples = vec![corpus_sample(
+            &rule,
+            "negative/a",
+            NEGATIVE_CORPUS_SHA256,
+            0.80,
+        )];
+        let clusters = (0..=DEFAULT_MAX_CANDIDATES)
+            .map(|x| CandidateCluster::from_peak(peak(x as i32, 0, 0.96, 100)))
+            .collect::<Vec<_>>();
+
+        let error = ImageRuleVerification::verify(ImageRuleVerificationInput {
+            rule: &rule,
+            template: &template,
+            mask: None,
+            captured_dpi: 96,
+            current_dpi: 96,
+            region_revision: 13,
+            search_dimensions: (640, 360),
+            negative_samples: &samples,
+            observed_clusters: &clusters,
+            maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            ImageRuleVerificationError::InvalidWorkPlan(ImageMatchError::CandidateLimit {
+                maximum: DEFAULT_MAX_CANDIDATES,
+            })
+        );
+
+        let one_unbounded_cluster = CandidateCluster {
+            best: peak(0, 0, 0.96, 100),
+            members: (0..=DEFAULT_MAX_CANDIDATES)
+                .map(|x| peak(x as i32, 0, 0.96, 100))
+                .collect(),
+        };
+        let error = ImageRuleVerification::verify(ImageRuleVerificationInput {
+            rule: &rule,
+            template: &template,
+            mask: None,
+            captured_dpi: 96,
+            current_dpi: 96,
+            region_revision: 13,
+            search_dimensions: (640, 360),
+            negative_samples: &samples,
+            observed_clusters: &[one_unbounded_cluster],
+            maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ImageRuleVerificationError::InvalidWorkPlan(ImageMatchError::CandidateLimit {
+                maximum: DEFAULT_MAX_CANDIDATES,
+            })
+        );
+    }
+
+    #[test]
     fn image_detector_emits_click_geometry_only_after_stable_immutable_frames() {
         let compiled = compiled_image_macro(fixture_icon());
         let condition = &compiled.definition().blocks[0];
@@ -2211,6 +2624,37 @@ mod tests {
         assert_eq!(second.match_rect, Some(Rect::new(23, 17, 7, 5)));
         assert_eq!(second.frame_metadata.unwrap().window_id, 11);
         assert_eq!(second.details["selected_scale_percent"], 100);
+    }
+
+    #[test]
+    fn image_detector_rejects_frame_from_different_client_dimensions() {
+        let compiled = compiled_image_macro(fixture_icon());
+        let BlockKind::Observe { condition } = &compiled.definition().blocks[0].kind else {
+            unreachable!()
+        };
+        let mut stale = frame(1, 100, 23, 100).frame;
+        stale.client_width += 1;
+        let capture = FixtureCapture {
+            frames: Mutex::new(vec![captured_frame(
+                fixture_search_with_icon_at(23, 17),
+                stale,
+            )]),
+        };
+
+        let error = ImageDetector::new()
+            .observe(
+                &ObservationRequest {
+                    run_id: "run",
+                    generation: 1,
+                    condition,
+                    compiled: &compiled,
+                    observed_at_ms: 100,
+                },
+                &capture,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("client geometry"));
     }
 
     #[test]

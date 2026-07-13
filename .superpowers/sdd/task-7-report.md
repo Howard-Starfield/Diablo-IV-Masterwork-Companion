@@ -19,7 +19,7 @@ DONE
 - Stability requires distinct frame IDs, at least the configured poll interval between accepted frames, center drift within the rule limit, the exact same selected scale, and exact equality of window identity/revision, geometry revision, display-profile revision, DPI, region revision, and rule revision.
 - Duplicate frames and frames arriving before minimum separation do not advance or replace the accepted stability state. Incompatible eligible frames start a new one-frame sequence. No qualifying candidate clears stability.
 - `0.95` is exported only as `INITIAL_SIMILARITY_THRESHOLD`. Rule verification and live matching use the saved rule threshold; a verified `0.91` regression proves it is not hardcoded truth.
-- The initial work gate is 750,000 generated score-map cells, sized to admit the v1 640x360 three-scale envelope. Task 14 may lower it after named-hardware release benchmarks; dimensions alone are not the gate.
+- The validated work plan rejects zero, duplicate, overflowed, or individually non-fitting scales. It admits at most 750,000 generated score-map cells, 50,000,000 conservative pixel operations (score cells times active scaled template/mask pixels), 4,096 retained candidates, and 100,000 deterministic spatial-cluster comparisons. Task 14 may lower these limits after named-hardware release benchmarks.
 
 ## Verification behavior
 
@@ -33,7 +33,7 @@ The dedicated internal `image_verification` owner constructs artifacts, derives 
 - best-to-distinct-runner-up ambiguity margin below that same rule margin;
 - non-finite or out-of-range thresholds.
 
-Authoring supplies ordered-independent negative samples containing stable ID, content SHA-256, normalized measured score, and the relevant evaluation inputs. The owner canonicalizes and sorts them, rejects duplicate or malformed entries, and derives count, digest, and best score; callers cannot supply those result fields. Compile and live observation share the same verification owner for binding, fingerprint, decoded-template/mask, variance, DPI, and work-budget checks. Negative-corpus margin remains an authoring/preflight input rather than being fabricated in the polling hot path.
+Authoring supplies ordered-independent negative samples containing stable ID, content SHA-256, normalized measured score, and the relevant evaluation inputs. The owner canonicalizes and sorts them, rejects duplicate stable IDs, duplicate content hashes, or malformed entries, and derives count, digest, and best score; callers cannot supply those result fields. Compile and live observation share the same verification owner for binding, fingerprint, decoded-template/mask, variance, DPI, and work-budget checks. Negative-corpus margin remains an authoring/preflight input rather than being fabricated in the polling hot path.
 
 ## TDD evidence
 
@@ -121,3 +121,19 @@ The post-Task-7 safety review was resolved issue by issue:
 - Window-coordinate RED: the production xcap wrapper accepted client-local detector regions but passed them to monitor capture as screen coordinates. `XcapWindowRegionCapture` now resolves the concrete window, bounds-checks the local crop, performs checked translation by the current window origin, and lets the atomic before/after snapshots reject motion during capture. The offset-window and outside-bounds regression is green.
 - Generation-cleanup RED: after an in-flight pause/resume, the detector observed generations 1 and 3 but the completion hook received only generation 1. `RunExecution` now records every generation actually sent to the detector, sorts the unique set, and calls one terminal completion hook with that set. `ImageDetector` removes only those run/generation keys, retaining absent generations and other runs.
 - Transactional-compile RED: a structurally valid artifact claiming varied pixels imported successfully when package bytes actually decoded to a flat template. Verified packages are now compiled from the in-memory remapped definition and captured package bytes before any asset or definition installation. The regression proves the import fails on decoded variance and leaves both assets and definition absent.
+
+### Final root-review remediation
+
+- Production window capture now derives physical client geometry from the concrete HWND with `GetClientRect` plus `ClientToScreen`. The same client rect owns local bounds, screen translation, atomic geometry identity, and captured client dimensions; framed-window tests prove xcap outer/DWM borders and title bars are excluded.
+- Portable package image artifacts are untrusted data. Every package containing image rules returns typed `LocalReverificationRequired` before lock/remap/install/save, while text-only packages compile unconditionally before installation. Task 13 owns the non-mutating local recapture and re-verification UI. No package HMAC or portable execution trust was added.
+- Authoring verification, immutable compile, and live matching use one typed scale/work-plan validator. Local maxima and spatial-grid NMS fail closed at fixed candidate/comparison limits rather than performing unbounded all-pairs clustering.
+- One decoder owner supplies template grayscale and mask semantics to authoring, compile, and live detection. RGBA/LA masks use alpha; masks without alpha use luminance. Fully transparent white is rejected and partial transparency is preserved consistently.
+- Negative corpora reject repeated content SHA-256 even when stable IDs differ.
+- Final independent review corrected xcap ID reconstruction to sign-extend 32-bit Windows user handles before rebuilding HWND, and verification now caps the checked sum of cluster members before cloning authoring evidence.
+
+### Final root-review verification
+
+- `cargo test` - 215 passed, 0 failed.
+- `cargo clippy --all-targets -- -D warnings -A dead_code -A clippy::collapsible-if -A clippy::too-many-arguments -A clippy::default-constructed-unit-structs -A clippy::ptr-arg` - exit 0.
+- `cargo build --release --bin macro_detection_bench` - exit 0.
+- `git diff --check 3515e43` and `git diff --check` - exit 0.

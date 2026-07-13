@@ -22,9 +22,9 @@ use windows::{
     Win32::{
         Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
-            BLACK_BRUSH, BeginPaint, CreatePen, DeleteObject, EndPaint, FillRect, GetStockObject,
-            NULL_BRUSH, PAINTSTRUCT, PS_SOLID, Rectangle, SelectObject, SetBkMode, SetTextColor,
-            TRANSPARENT, TextOutW,
+            BLACK_BRUSH, BeginPaint, ClientToScreen, CreatePen, DeleteObject, EndPaint, FillRect,
+            GetStockObject, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, Rectangle, SelectObject, SetBkMode,
+            SetTextColor, TRANSPARENT, TextOutW,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -39,9 +39,9 @@ use windows::{
             },
             WindowsAndMessaging::{
                 CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-                DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetSystemMetrics,
-                GetWindowLongPtrW, HTCLIENT, IDC_CROSS, LWA_ALPHA, LoadCursorW, MSG, PM_REMOVE,
-                PeekMessageW, PostQuitMessage, RegisterClassW, SM_CXVIRTUALSCREEN,
+                DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos,
+                GetSystemMetrics, GetWindowLongPtrW, HTCLIENT, IDC_CROSS, LWA_ALPHA, LoadCursorW,
+                MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SM_CXVIRTUALSCREEN,
                 SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOW, SetCursorPos,
                 SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, ShowWindow,
                 TranslateMessage, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
@@ -93,33 +93,111 @@ impl CaptureSource for XcapRegionCapture {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct XcapWindowRegionCapture {
-    window_id: u32,
+pub trait WindowClientGeometrySource {
+    fn client_rect(&self, window_id: u32) -> Result<Rect>;
 }
 
-impl XcapWindowRegionCapture {
-    pub const fn new(window_id: u32) -> Self {
-        Self { window_id }
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Win32ClientGeometrySource;
+
+impl WindowClientGeometrySource for Win32ClientGeometrySource {
+    fn client_rect(&self, window_id: u32) -> Result<Rect> {
+        let hwnd = hwnd_from_xcap_window_id(window_id);
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(hwnd, &mut client).with_context(|| {
+                format!("failed to query client rect for xcap window {window_id}")
+            })?;
+        }
+
+        let width = client
+            .right
+            .checked_sub(client.left)
+            .and_then(|value| u32::try_from(value).ok())
+            .context("window client width is invalid")?;
+        let height = client
+            .bottom
+            .checked_sub(client.top)
+            .and_then(|value| u32::try_from(value).ok())
+            .context("window client height is invalid")?;
+        anyhow::ensure!(width > 0 && height > 0, "window client area is empty");
+
+        let mut origin = POINT {
+            x: client.left,
+            y: client.top,
+        };
+        unsafe {
+            ClientToScreen(hwnd, &mut origin).ok().with_context(|| {
+                format!("failed to map client origin for xcap window {window_id}")
+            })?;
+        }
+        Ok(Rect::new(origin.x, origin.y, width, height))
     }
 }
 
-impl CaptureSource for XcapWindowRegionCapture {
+fn hwnd_from_xcap_window_id(window_id: u32) -> HWND {
+    // xcap publishes the low 32 bits of HWND as u32. Windows user handles are 32-bit values
+    // sign-extended to pointer width, so preserve bit 31 when reconstructing the concrete HWND.
+    HWND((window_id as i32 as isize) as *mut core::ffi::c_void)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XcapWindowRegionCapture<G = Win32ClientGeometrySource> {
+    window_id: u32,
+    geometry: G,
+}
+
+impl XcapWindowRegionCapture<Win32ClientGeometrySource> {
+    pub const fn new(window_id: u32) -> Self {
+        Self {
+            window_id,
+            geometry: Win32ClientGeometrySource,
+        }
+    }
+}
+
+impl<G> XcapWindowRegionCapture<G> {
+    fn with_geometry(window_id: u32, geometry: G) -> Self {
+        Self {
+            window_id,
+            geometry,
+        }
+    }
+}
+
+impl<G: WindowClientGeometrySource> XcapWindowRegionCapture<G> {
+    fn screen_rect(&self, local: Rect) -> Result<Rect> {
+        window_local_to_screen(self.geometry.client_rect(self.window_id)?, local)
+    }
+}
+
+impl<G: WindowClientGeometrySource> CaptureSource for XcapWindowRegionCapture<G> {
     fn capture(&self, rect: Rect) -> Result<ScreenImage> {
-        let window = WindowsXcapWindowSnapshotSource::new(self.window_id).target_window()?;
-        let window_rect = Rect::new(window.x()?, window.y()?, window.width()?, window.height()?);
-        XcapRegionCapture.capture(window_local_to_screen(window_rect, rect)?)
+        XcapRegionCapture.capture(self.screen_rect(rect)?)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowsXcapWindowSnapshotSource {
+pub struct WindowsXcapWindowSnapshotSource<G = Win32ClientGeometrySource> {
     window_id: u32,
+    geometry: G,
 }
 
-impl WindowsXcapWindowSnapshotSource {
+impl WindowsXcapWindowSnapshotSource<Win32ClientGeometrySource> {
     pub const fn new(window_id: u32) -> Self {
-        Self { window_id }
+        Self {
+            window_id,
+            geometry: Win32ClientGeometrySource,
+        }
+    }
+}
+
+impl<G> WindowsXcapWindowSnapshotSource<G> {
+    fn with_geometry(window_id: u32, geometry: G) -> Self {
+        Self {
+            window_id,
+            geometry,
+        }
     }
 
     fn target_window(&self) -> Result<Window> {
@@ -130,13 +208,21 @@ impl WindowsXcapWindowSnapshotSource {
     }
 }
 
-impl AtomicFrameSnapshotSource for WindowsXcapWindowSnapshotSource {
+impl<G: WindowClientGeometrySource> WindowsXcapWindowSnapshotSource<G> {
+    fn client_rect(&self) -> Result<Rect> {
+        self.geometry.client_rect(self.window_id)
+    }
+}
+
+impl<G: WindowClientGeometrySource> AtomicFrameSnapshotSource
+    for WindowsXcapWindowSnapshotSource<G>
+{
     fn snapshot(&self, requested_region: Rect) -> Result<AtomicCaptureSnapshot> {
         let window = self.target_window()?;
         let window_id = window.id()?;
         let process_id = window.pid()?;
-        let window_rect = Rect::new(window.x()?, window.y()?, window.width()?, window.height()?);
-        window_local_to_screen(window_rect, requested_region).with_context(|| {
+        let client_rect = self.client_rect()?;
+        window_local_to_screen(client_rect, requested_region).with_context(|| {
             format!("requested macro capture region is outside xcap window {window_id}")
         })?;
 
@@ -160,12 +246,12 @@ impl AtomicFrameSnapshotSource for WindowsXcapWindowSnapshotSource {
             window_id: u64::from(window_id),
             window_revision: stable_revision(&(window_id, process_id)),
             process_id,
-            window_rect,
+            client_rect,
             geometry_revision: stable_revision(&(
-                window_rect.x,
-                window_rect.y,
-                window_rect.width,
-                window_rect.height,
+                client_rect.x,
+                client_rect.y,
+                client_rect.width,
+                client_rect.height,
             )),
             display_id,
             display_profile_revision: stable_revision(&(
@@ -501,8 +587,8 @@ fn move_cursor_with_motion_model(
 ) -> Result<()> {
     let recorded_id = fitts_index(profile.distance_px, model.target_width_px).max(0.1);
     let target_id = fitts_index(distance, model.target_width_px).max(0.1);
-    let duration_ms = ((profile.duration_ms as f32 * target_id / recorded_id).round() as u64)
-        .clamp(70, 1_800);
+    let duration_ms =
+        ((profile.duration_ms as f32 * target_id / recorded_id).round() as u64).clamp(70, 1_800);
     let distance_scale = (distance / profile.distance_px.max(1.0)).sqrt();
     let point_count = ((model.point_count as f32 * distance_scale).round() as u32).clamp(10, 90);
     let curve = model.curve_lateral.clamp(-0.30, 0.30);
@@ -1031,7 +1117,9 @@ fn analyze_mouse_movement(samples: Vec<TimedPoint>) -> Result<MouseMovementProfi
     let dy = (end.y - start.y) as f32;
     let distance = (dx * dx + dy * dy).sqrt();
     if distance < 8.0 {
-        return Err(anyhow!("recorded mouse movement must move at least 8 pixels"));
+        return Err(anyhow!(
+            "recorded mouse movement must move at least 8 pixels"
+        ));
     }
 
     let duration_ms = samples.last().unwrap().at_ms.max(1);
@@ -1248,6 +1336,17 @@ fn cursor_pos() -> Result<Point> {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Clone, Copy)]
+    struct FakeClientGeometry {
+        client_rect: Rect,
+    }
+
+    impl WindowClientGeometrySource for FakeClientGeometry {
+        fn client_rect(&self, _window_id: u32) -> Result<Rect> {
+            Ok(self.client_rect)
+        }
+    }
+
     #[test]
     fn right_click_selects_right_button_flags() {
         assert_eq!(
@@ -1270,5 +1369,36 @@ mod tests {
             Rect::new(1_225, -260, 100, 80)
         );
         assert!(window_local_to_screen(window, Rect::new(750, 40, 100, 80)).is_err());
+    }
+
+    #[test]
+    fn framed_window_translation_uses_client_origin_and_bounds_not_xcap_outer_frame() {
+        let xcap_outer_frame = Rect::new(1_200, -300, 1_024, 768);
+        let client = FakeClientGeometry {
+            // Eight-pixel side frame plus a 31-pixel title bar.
+            client_rect: Rect::new(1_208, -269, 1_008, 729),
+        };
+        let local = Rect::new(25, 40, 100, 80);
+        let capture = XcapWindowRegionCapture::with_geometry(42, client);
+        let snapshots = WindowsXcapWindowSnapshotSource::with_geometry(42, client);
+
+        let translated = capture.screen_rect(local).unwrap();
+
+        assert_eq!(translated, Rect::new(1_233, -229, 100, 80));
+        assert_eq!(snapshots.client_rect().unwrap(), client.client_rect);
+        assert_ne!(
+            translated,
+            window_local_to_screen(xcap_outer_frame, local).unwrap()
+        );
+        assert!(capture.screen_rect(Rect::new(950, 700, 100, 80)).is_err());
+    }
+
+    #[test]
+    fn xcap_window_id_reconstruction_sign_extends_windows_user_handles() {
+        assert_eq!(hwnd_from_xcap_window_id(42).0 as isize, 42);
+        assert_eq!(
+            hwnd_from_xcap_window_id(0x8000_0001).0 as isize,
+            i32::MIN as isize + 1
+        );
     }
 }

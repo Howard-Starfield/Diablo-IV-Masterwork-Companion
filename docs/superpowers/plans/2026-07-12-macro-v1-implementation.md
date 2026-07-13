@@ -1057,6 +1057,8 @@ Show revision, status, block, branch/loops, Watch lanes/priority, iteration, can
 
 Create, rename, duplicate, enable, delete confirmation, search, folder export, validated import, history deletion, and orphan cleanup. Display all spec-defined lifecycle badges.
 
+Treat image verification stored in a portable package as untrusted. Text-only packages may import after a full compile check, but a package containing image rules must remain non-mutating and open a local re-verification flow in the Task 13 UI (recapture/confirm the target region, rebuild the local verification artifact, then save). Do not execute or install the portable image artifact directly.
+
 - [ ] **Step 5: Run tests and full manual flow**
 
 Run: `cargo test macro_ui; cargo test macro_engine::runtime; cargo test macro_engine::persistence`

@@ -17,6 +17,11 @@ pub struct CaptureFrameMetadata {
     pub captured_at_ms: u64,
     pub window_id: u64,
     pub window_revision: u64,
+    /// Physical client-area dimensions used to validate and translate the captured crop.
+    #[serde(default)]
+    pub client_width: u32,
+    #[serde(default)]
+    pub client_height: u32,
     pub geometry_revision: u64,
     pub display_profile_revision: u64,
     pub dpi: u32,
@@ -38,7 +43,8 @@ pub struct AtomicCaptureSnapshot {
     pub window_id: u64,
     pub window_revision: u64,
     pub process_id: u32,
-    pub window_rect: Rect,
+    /// Screen-space Win32 client area, excluding the non-client frame and title bar.
+    pub client_rect: Rect,
     pub geometry_revision: u64,
     pub display_id: String,
     pub display_profile_revision: u64,
@@ -100,6 +106,8 @@ where
                 captured_at_ms: self.clock.now_ms(),
                 window_id: before.window_id,
                 window_revision: before.window_revision,
+                client_width: before.client_rect.width,
+                client_height: before.client_rect.height,
                 geometry_revision: before.geometry_revision,
                 display_profile_revision: before.display_profile_revision,
                 dpi: before.dpi,
@@ -273,7 +281,7 @@ mod tests {
             window_id: 91,
             window_revision: 7,
             process_id: 4,
-            window_rect: Rect::new(10, 20, 800, 600),
+            client_rect: Rect::new(10, 20, 800, 600),
             geometry_revision: 8,
             display_id: "display-a".to_string(),
             display_profile_revision: 9,
@@ -297,17 +305,19 @@ mod tests {
         assert_eq!(frame.metadata.frame_id, 1);
         assert_eq!(frame.metadata.captured_at_ms, 123);
         assert_eq!(frame.metadata.window_id, 91);
+        assert_eq!(frame.metadata.client_width, 800);
+        assert_eq!(frame.metadata.client_height, 600);
         assert_eq!(frame.metadata.geometry_revision, 8);
         assert_eq!(frame.metadata.display_profile_revision, 9);
         assert_eq!(frame.metadata.dpi, 144);
     }
 
     #[test]
-    fn bracketed_capture_rejects_target_or_requested_region_drift() {
+    fn bracketed_capture_rejects_client_geometry_or_requested_region_drift() {
         let region = Rect::new(50, 60, 20, 10);
         let before = atomic_snapshot(region);
         let mut after = before.clone();
-        after.window_rect.x += 1;
+        after.client_rect.width -= 1;
         let capture = AtomicFrameCapture::new(
             FakeSnapshots(Mutex::new(VecDeque::from([before, after]))),
             FakeRawCapture,

@@ -190,6 +190,8 @@ mod tests {
             captured_at_ms: 120,
             window_id: 9,
             window_revision: 2,
+            client_width: 64,
+            client_height: 48,
             geometry_revision: 3,
             display_profile_revision: 4,
             dpi: 96,

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "definition": "macro.json",
+  "assets": [
+    {
+      "asset": {
+        "id": "outside",
+        "revision": 1,
+        "content_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "path": "../outside.png"
+    }
+  ]
+}

@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 
 pub const MACRO_SCHEMA_VERSION: u32 = 1;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AssetRef {
+    pub id: String,
+    pub revision: u64,
+    pub content_hash: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Limit<T> {
@@ -72,8 +79,8 @@ pub struct ImageRule {
     pub id: String,
     pub revision: u64,
     pub region_id: String,
-    pub template_asset_id: String,
-    pub transparent_mask_asset_id: Option<String>,
+    pub template: AssetRef,
+    pub transparent_mask: Option<AssetRef>,
     pub threshold: f32,
     pub scales_percent: Vec<u16>,
     pub stable_frames: u8,

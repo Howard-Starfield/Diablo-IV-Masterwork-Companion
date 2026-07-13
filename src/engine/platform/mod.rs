@@ -11,4 +11,4 @@ pub use windows_impl::{
 };
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
-pub use windows_ocr::{OcrFrame, WindowsTextRecognizer};
+pub use windows_ocr::{OcrFrame, OcrPixelFormat, PositionedOcrWord, WindowsTextRecognizer};

@@ -1,0 +1,6 @@
+[
+  { "text": "Max", "rect": { "x": 10, "y": 5, "width": 30, "height": 12 }, "line_index": 0, "word_index": 0 },
+  { "text": "Health", "rect": { "x": 44, "y": 5, "width": 48, "height": 12 }, "line_index": 0, "word_index": 1 },
+  { "text": "Critical", "rect": { "x": 10, "y": 25, "width": 40, "height": 12 }, "line_index": 1, "word_index": 0 },
+  { "text": "Strike", "rect": { "x": 54, "y": 25, "width": 58, "height": 12 }, "line_index": 1, "word_index": 1 }
+]

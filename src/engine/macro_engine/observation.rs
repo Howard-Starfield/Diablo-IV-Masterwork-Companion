@@ -29,6 +29,29 @@ pub struct DetectorEvidence {
 }
 
 impl DetectorEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        matched: bool,
+        frame_id: u64,
+        captured_at_ms: u64,
+        match_rect: Option<Rect>,
+        score: Option<f64>,
+        match_count: u32,
+        stable_frames: u8,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            matched,
+            frame_id,
+            captured_at_ms,
+            match_rect: matched.then_some(match_rect).flatten(),
+            score,
+            match_count,
+            stable_frames,
+            details,
+        }
+    }
+
     pub fn unmatched(frame_id: u64, captured_at_ms: u64) -> Self {
         Self {
             matched: false,
@@ -103,5 +126,26 @@ pub struct UnavailableCapture;
 impl CaptureSource for UnavailableCapture {
     fn capture(&self, _rect: Rect) -> Result<ScreenImage> {
         anyhow::bail!("no capture source is configured")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_evidence_cannot_retain_click_geometry() {
+        let evidence = DetectorEvidence::new(
+            false,
+            1,
+            2,
+            Some(Rect::new(10, 20, 30, 40)),
+            Some(0.9),
+            1,
+            1,
+            serde_json::Value::Null,
+        );
+
+        assert!(evidence.match_rect.is_none());
     }
 }

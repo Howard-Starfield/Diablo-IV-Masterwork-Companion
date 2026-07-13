@@ -5,7 +5,6 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
-    thread,
     time::Duration,
 };
 
@@ -96,16 +95,61 @@ pub enum CommandDelivery {
     Disconnected,
 }
 
+#[derive(Default)]
+struct EmergencySignal {
+    requested: AtomicBool,
+    wake_lock: Mutex<()>,
+    wake: Condvar,
+}
+
+impl EmergencySignal {
+    fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+
+    fn reset(&self) {
+        self.requested.store(false, Ordering::Release);
+    }
+
+    fn requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    fn take(&self) -> bool {
+        self.requested.swap(false, Ordering::AcqRel)
+    }
+
+    fn notify(&self) {
+        self.wake.notify_all();
+    }
+
+    fn wait(&self, duration: Duration) {
+        let guard = self.wake_lock.lock().expect("runtime wake lock poisoned");
+        if !self.requested() {
+            let _ = self
+                .wake
+                .wait_timeout(guard, duration)
+                .expect("runtime wake lock poisoned while waiting");
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeCommandSender {
     sender: SyncSender<RuntimeCommand>,
-    emergency_stop: Arc<AtomicBool>,
+    emergency_stop: Arc<EmergencySignal>,
 }
 
 impl RuntimeCommandSender {
     pub fn send(&self, command: RuntimeCommand) -> CommandDelivery {
         if matches!(command, RuntimeCommand::EmergencyStop) {
-            self.emergency_stop.store(true, Ordering::Release);
+            self.emergency_stop.request();
+            return match self.sender.try_send(command) {
+                Ok(()) => CommandDelivery::Sent,
+                Err(TrySendError::Full(_)) => CommandDelivery::Full,
+                Err(TrySendError::Disconnected(_)) => CommandDelivery::Disconnected,
+            };
         }
         match self.sender.send(command) {
             Ok(()) => CommandDelivery::Sent,
@@ -115,7 +159,7 @@ impl RuntimeCommandSender {
 
     pub fn try_send(&self, command: RuntimeCommand) -> CommandDelivery {
         if matches!(command, RuntimeCommand::EmergencyStop) {
-            self.emergency_stop.store(true, Ordering::Release);
+            self.emergency_stop.request();
         }
         match self.sender.try_send(command) {
             Ok(()) => CommandDelivery::Sent,
@@ -125,13 +169,13 @@ impl RuntimeCommandSender {
     }
 
     pub fn emergency_stop_requested(&self) -> bool {
-        self.emergency_stop.load(Ordering::Acquire)
+        self.emergency_stop.requested()
     }
 }
 
 pub struct RuntimeCommandReceiver {
     receiver: Receiver<RuntimeCommand>,
-    emergency_stop: Arc<AtomicBool>,
+    emergency_stop: Arc<EmergencySignal>,
 }
 
 impl RuntimeCommandReceiver {
@@ -144,7 +188,7 @@ impl RuntimeCommandReceiver {
     }
 
     pub fn take_emergency_stop(&self) -> bool {
-        self.emergency_stop.swap(false, Ordering::AcqRel)
+        self.emergency_stop.take()
     }
 }
 
@@ -266,6 +310,18 @@ pub struct RuntimeChannels {
 }
 
 pub fn bounded_runtime_channels(command_capacity: usize, event_capacity: usize) -> RuntimeChannels {
+    bounded_runtime_channels_with_signal(
+        command_capacity,
+        event_capacity,
+        Arc::new(EmergencySignal::default()),
+    )
+}
+
+fn bounded_runtime_channels_with_signal(
+    command_capacity: usize,
+    event_capacity: usize,
+    emergency_stop: Arc<EmergencySignal>,
+) -> RuntimeChannels {
     assert!(
         command_capacity > 0,
         "command channel capacity must be positive"
@@ -275,7 +331,6 @@ pub fn bounded_runtime_channels(command_capacity: usize, event_capacity: usize) 
         "event channel capacity must be positive"
     );
     let (command_sender, command_receiver) = mpsc::sync_channel(command_capacity);
-    let emergency_stop = Arc::new(AtomicBool::new(false));
     let event_queue = Arc::new(EventQueue {
         capacity: event_capacity,
         queue: Mutex::new(VecDeque::with_capacity(event_capacity)),
@@ -482,8 +537,11 @@ impl CompiledMacro {
             bail!("saved definition hash does not match immutable revision bytes");
         }
 
-        let referenced: HashSet<_> = referenced_assets(&saved.definition).collect();
+        let referenced_assets: Vec<_> = referenced_assets(&saved.definition).collect();
+        validate_asset_identities(referenced_assets.iter())?;
+        let referenced: HashSet<_> = referenced_assets.into_iter().collect();
         let mut pinned = HashSet::new();
+        validate_asset_identities(saved.pinned_assets.iter().map(|asset| &asset.asset))?;
         for asset in &saved.pinned_assets {
             if sha256_hex(&asset.bytes) != asset.asset.content_hash {
                 bail!("pinned asset hash mismatch: {}", asset.asset.content_hash);
@@ -514,6 +572,26 @@ fn referenced_assets(definition: &MacroDefinition) -> impl Iterator<Item = super
     })
 }
 
+fn validate_asset_identities<'a>(
+    assets: impl IntoIterator<Item = &'a super::AssetRef>,
+) -> Result<()> {
+    let mut hashes = HashMap::<(&str, u64), &str>::new();
+    for asset in assets {
+        let identity = (asset.id.as_str(), asset.revision);
+        if hashes
+            .insert(identity, asset.content_hash.as_str())
+            .is_some_and(|existing| existing != asset.content_hash)
+        {
+            bail!(
+                "conflicting hashes for immutable asset identity '{}@{}'",
+                asset.id,
+                asset.revision
+            );
+        }
+    }
+    Ok(())
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -528,6 +606,7 @@ struct ControlState {
 #[derive(Clone)]
 pub struct RuntimeControlHandle {
     control: Arc<Mutex<ControlState>>,
+    emergency_stop: Arc<EmergencySignal>,
 }
 
 impl RuntimeControlHandle {
@@ -537,6 +616,8 @@ impl RuntimeControlHandle {
             control.paused = true;
             control.generation = control.generation.wrapping_add(1);
         }
+        drop(control);
+        self.emergency_stop.notify();
     }
 
     pub fn resume(&self) {
@@ -545,6 +626,8 @@ impl RuntimeControlHandle {
             control.paused = false;
             control.generation = control.generation.wrapping_add(1);
         }
+        drop(control);
+        self.emergency_stop.notify();
     }
 
     pub fn stop(&self) {
@@ -552,6 +635,7 @@ impl RuntimeControlHandle {
     }
 
     pub fn emergency_stop(&self) {
+        self.emergency_stop.request();
         self.set_stop(StopReason::EmergencyStopped);
     }
 
@@ -561,6 +645,8 @@ impl RuntimeControlHandle {
             control.stop = Some(reason);
             control.generation = control.generation.wrapping_add(1);
         }
+        drop(control);
+        self.emergency_stop.notify();
     }
 
     pub fn generation(&self) -> u64 {
@@ -576,6 +662,7 @@ pub struct MacroRuntime {
     detector: Arc<dyn ConditionDetector>,
     clock: Arc<dyn Clock + Send + Sync>,
     control: Arc<Mutex<ControlState>>,
+    emergency_stop: Arc<EmergencySignal>,
     active: Arc<Mutex<bool>>,
     event_capacity: usize,
 }
@@ -587,6 +674,7 @@ impl Clone for MacroRuntime {
             detector: Arc::clone(&self.detector),
             clock: Arc::clone(&self.clock),
             control: Arc::clone(&self.control),
+            emergency_stop: Arc::clone(&self.emergency_stop),
             active: Arc::clone(&self.active),
             event_capacity: self.event_capacity,
         }
@@ -617,6 +705,7 @@ impl MacroRuntime {
             detector,
             clock,
             control: Arc::new(Mutex::new(ControlState::default())),
+            emergency_stop: Arc::new(EmergencySignal::default()),
             active: Arc::new(Mutex::new(false)),
             event_capacity,
         }
@@ -624,16 +713,17 @@ impl MacroRuntime {
 
     pub fn run(&self, saved: SavedRevision, mode: RunMode) -> Result<Vec<RunEvent>> {
         let _active = ActiveRunGuard::acquire(&self.active)?;
-        let compiled = CompiledMacro::compile(saved)?;
-        let started_at = self.clock.now_ms();
-        let run_number = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
-        let run_id = format!("{}-{}-{run_number}", compiled.definition().id, started_at);
         {
+            self.emergency_stop.reset();
             let mut control = self.control.lock().expect("runtime control poisoned");
             control.generation = control.generation.wrapping_add(1);
             control.paused = false;
             control.stop = None;
         }
+        let compiled = CompiledMacro::compile(saved)?;
+        let started_at = self.clock.now_ms();
+        let run_number = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
+        let run_id = format!("{}-{}-{run_number}", compiled.definition().id, started_at);
         let mut emitter = EventEmitter::new(&*self.clock, started_at, run_id, self.event_capacity);
         emitter.run_started(&compiled, mode);
         emitter.status(RunStatus::Running);
@@ -670,7 +760,20 @@ impl MacroRuntime {
     pub fn control_handle(&self) -> RuntimeControlHandle {
         RuntimeControlHandle {
             control: Arc::clone(&self.control),
+            emergency_stop: Arc::clone(&self.emergency_stop),
         }
+    }
+
+    pub fn bounded_channels(
+        &self,
+        command_capacity: usize,
+        event_capacity: usize,
+    ) -> RuntimeChannels {
+        bounded_runtime_channels_with_signal(
+            command_capacity,
+            event_capacity,
+            Arc::clone(&self.emergency_stop),
+        )
     }
 
     pub fn pause(&self) {
@@ -854,9 +957,13 @@ impl RunExecution<'_, '_> {
         let mode = condition_mode(condition);
         let started = self.runtime.clock.now_ms();
         let mut attempts = 0_u64;
+        let mut last_matched = false;
         loop {
             if let Some(reason) = self.check_control() {
                 return self.stop_condition(reason);
+            }
+            if attempts > 0 && timeout_reached(mode, started, self.runtime.clock.now_ms()) {
+                return self.resolve_condition_timeout(mode, last_matched);
             }
             attempts = attempts.saturating_add(1);
             if exceeds_limit(
@@ -871,6 +978,9 @@ impl RunExecution<'_, '_> {
             if let Some(reason) = self.pace_observation() {
                 return self.stop_condition(reason);
             }
+            if attempts > 1 && timeout_reached(mode, started, self.runtime.clock.now_ms()) {
+                return self.resolve_condition_timeout(mode, last_matched);
+            }
             let generation = self.runtime.control_handle().generation();
             let observed_at_ms = self.runtime.clock.now_ms();
             self.last_observation_at_ms = Some(observed_at_ms);
@@ -881,18 +991,10 @@ impl RunExecution<'_, '_> {
                 compiled: self.compiled,
                 observed_at_ms,
             };
-            let evidence = match self
+            let observation = self
                 .runtime
                 .detector
-                .observe(&request, &*self.runtime.capture)
-            {
-                Ok(evidence) => evidence,
-                Err(error) => {
-                    return self.stop_condition(StopReason::TechnicalFailure {
-                        message: format!("detector failed for block '{owner_block_id}': {error}"),
-                    });
-                }
-            };
+                .observe(&request, &*self.runtime.capture);
             if let Some(reason) = self.check_control() {
                 return self.stop_condition(reason);
             }
@@ -900,6 +1002,15 @@ impl RunExecution<'_, '_> {
                 self.emitter.observation_progress(owner_block_id, attempts);
                 continue;
             }
+            let evidence = match observation {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    return self.stop_condition(StopReason::TechnicalFailure {
+                        message: format!("detector failed for block '{owner_block_id}': {error}"),
+                    });
+                }
+            };
+            last_matched = evidence.matched;
             let token = if evidence.matched {
                 match self.make_token(condition, &evidence, generation) {
                     Ok(token) => Some(token),
@@ -910,11 +1021,12 @@ impl RunExecution<'_, '_> {
             } else {
                 None
             };
+            let source_block_id = condition_source_id(condition);
             if let Some(token) = &token {
                 self.observations
-                    .insert(owner_block_id.to_string(), token.clone());
+                    .insert(source_block_id.to_string(), token.clone());
             } else {
-                self.observations.remove(owner_block_id);
+                self.observations.remove(source_block_id);
             }
             self.emitter
                 .observation_completed(owner_block_id, evidence.clone(), token);
@@ -934,26 +1046,37 @@ impl RunExecution<'_, '_> {
                 });
             }
             if timeout_reached(mode, started, self.runtime.clock.now_ms()) {
-                return match timeout_outcome(mode) {
-                    TimeoutOutcome::Continue => Some(ConditionOutcome {
-                        matched: evidence.matched,
-                        timeout_body: None,
-                    }),
-                    TimeoutOutcome::RunBody { body } => Some(ConditionOutcome {
-                        matched: evidence.matched,
-                        timeout_body: Some(body.clone()),
-                    }),
-                    TimeoutOutcome::StopError { message } => {
-                        self.stop_condition(StopReason::StopError {
-                            message: message.clone(),
-                        })
-                    }
-                };
+                return self.resolve_condition_timeout(mode, last_matched);
             }
             self.emitter.observation_progress(owner_block_id, attempts);
-            if let Some(reason) = self.cooperative_wait(self.poll_interval_ms(condition)) {
+            let wait_ms = remaining_condition_time_ms(mode, started, self.runtime.clock.now_ms())
+                .map_or_else(
+                    || self.poll_interval_ms(condition),
+                    |remaining| self.poll_interval_ms(condition).min(remaining),
+                );
+            if let Some(reason) = self.cooperative_wait(wait_ms) {
                 return self.stop_condition(reason);
             }
+        }
+    }
+
+    fn resolve_condition_timeout(
+        &mut self,
+        mode: &ObserveMode,
+        last_matched: bool,
+    ) -> Option<ConditionOutcome> {
+        match timeout_outcome(mode) {
+            TimeoutOutcome::Continue => Some(ConditionOutcome {
+                matched: last_matched,
+                timeout_body: None,
+            }),
+            TimeoutOutcome::RunBody { body } => Some(ConditionOutcome {
+                matched: last_matched,
+                timeout_body: Some(body.clone()),
+            }),
+            TimeoutOutcome::StopError { message } => self.stop_condition(StopReason::StopError {
+                message: message.clone(),
+            }),
         }
     }
 
@@ -1090,6 +1213,12 @@ impl RunExecution<'_, '_> {
                         .action_blocked(block_id, action.clone(), reason.clone());
                     return Some(StopReason::TechnicalFailure { message: reason });
                 }
+                if let Err(error) = validate_action_token(self.compiled, action, &token) {
+                    let reason = error.to_string();
+                    self.emitter
+                        .action_blocked(block_id, action.clone(), reason.clone());
+                    return Some(StopReason::TechnicalFailure { message: reason });
+                }
                 Some(token)
             }
             None => None,
@@ -1120,7 +1249,9 @@ impl RunExecution<'_, '_> {
                 return None;
             }
             let slice = deadline.saturating_sub(now).clamp(1, 10);
-            thread::park_timeout(Duration::from_millis(slice));
+            self.runtime
+                .emergency_stop
+                .wait(Duration::from_millis(slice));
         }
     }
 
@@ -1130,7 +1261,13 @@ impl RunExecution<'_, '_> {
                 message: "synchronous event capacity reached".to_string(),
             });
         }
+        if self.runtime.emergency_stop.requested() {
+            return Some(StopReason::EmergencyStopped);
+        }
         loop {
+            if self.runtime.emergency_stop.requested() {
+                return Some(StopReason::EmergencyStopped);
+            }
             let (paused, stop) = {
                 let control = self
                     .runtime
@@ -1141,6 +1278,14 @@ impl RunExecution<'_, '_> {
             };
             if let Some(reason) = stop {
                 return Some(reason);
+            }
+            if exceeds_limit(
+                self.emitter.elapsed_now(),
+                &self.compiled.definition().safety.max_runtime_ms,
+            ) {
+                return Some(StopReason::SafetyLimit {
+                    message: "maximum runtime exceeded".to_string(),
+                });
             }
             if !paused {
                 if self.paused_event_emitted {
@@ -1154,17 +1299,9 @@ impl RunExecution<'_, '_> {
                 self.observations.clear();
                 self.paused_event_emitted = true;
             }
-            thread::park_timeout(Duration::from_millis(10));
+            self.runtime.emergency_stop.wait(Duration::from_millis(10));
         }
 
-        if exceeds_limit(
-            self.emitter.elapsed_now(),
-            &self.compiled.definition().safety.max_runtime_ms,
-        ) {
-            return Some(StopReason::SafetyLimit {
-                message: "maximum runtime exceeded".to_string(),
-            });
-        }
         None
     }
 }
@@ -1177,6 +1314,17 @@ struct ConditionOutcome {
 fn condition_mode(condition: &Condition) -> &ObserveMode {
     match condition {
         Condition::Text { mode, .. } | Condition::Image { mode, .. } => mode,
+    }
+}
+
+fn condition_source_id(condition: &Condition) -> &str {
+    match condition {
+        Condition::Text {
+            source_block_id, ..
+        }
+        | Condition::Image {
+            source_block_id, ..
+        } => source_block_id,
     }
 }
 
@@ -1200,6 +1348,28 @@ fn timeout_reached(mode: &ObserveMode, started_at: u64, now: u64) -> bool {
         | ObserveMode::WaitForFalse { timeout_ms, .. } => {
             matches!(timeout_ms, Limit::Finite(limit) if elapsed >= *limit)
         }
+    }
+}
+
+fn remaining_condition_time_ms(mode: &ObserveMode, started_at: u64, now: u64) -> Option<u64> {
+    match mode {
+        ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Finite(limit),
+            ..
+        }
+        | ObserveMode::WaitForFalse {
+            timeout_ms: Limit::Finite(limit),
+            ..
+        } => Some(limit.saturating_sub(now.saturating_sub(started_at))),
+        ObserveMode::CheckNow
+        | ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Unlimited,
+            ..
+        }
+        | ObserveMode::WaitForFalse {
+            timeout_ms: Limit::Unlimited,
+            ..
+        } => None,
     }
 }
 
@@ -1230,6 +1400,178 @@ fn action_source(action: &Action) -> Option<&str> {
         | Action::MoveOnly {
             target: super::ActionTarget::Point { .. } | super::ActionTarget::Region { .. },
         } => None,
+    }
+}
+
+fn validate_action_token(
+    compiled: &CompiledMacro,
+    action: &Action,
+    token: &ObservationToken,
+) -> Result<()> {
+    let source_block_id = action_source(action)
+        .ok_or_else(|| anyhow::anyhow!("action does not use observation evidence"))?;
+    if token.source_block_id != source_block_id {
+        bail!("observation token source does not match action source '{source_block_id}'");
+    }
+
+    let expected_detector = match action {
+        Action::ClickTextMatch { .. }
+        | Action::MoveOnly {
+            target: super::ActionTarget::TextMatch { .. },
+        } => DetectorKind::Text,
+        Action::ClickImageMatch { .. }
+        | Action::MoveOnly {
+            target: super::ActionTarget::ImageMatch { .. },
+        } => DetectorKind::Image,
+        _ => bail!("action does not use observation evidence"),
+    };
+    if token.detector != expected_detector {
+        bail!("observation token detector does not match the action detector");
+    }
+
+    let definition = compiled.definition();
+    let rule_region_id = match expected_detector {
+        DetectorKind::Text => {
+            let rule = definition
+                .text_rules
+                .iter()
+                .find(|rule| rule.id == token.rule_id && rule.revision == token.rule_revision)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("observation token text rule identity is not compiled")
+                })?;
+            &rule.region_id
+        }
+        DetectorKind::Image => {
+            let rule = definition
+                .image_rules
+                .iter()
+                .find(|rule| rule.id == token.rule_id && rule.revision == token.rule_revision)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("observation token image rule identity is not compiled")
+                })?;
+            &rule.region_id
+        }
+    };
+    let region = definition
+        .regions
+        .iter()
+        .find(|region| region.id == token.region_id && region.revision == token.region_revision)
+        .ok_or_else(|| anyhow::anyhow!("observation token region identity is not compiled"))?;
+    if &region.id != rule_region_id {
+        bail!("observation token rule and region identities do not agree");
+    }
+    if !blocks_contain_token_source(
+        &definition.blocks,
+        source_block_id,
+        expected_detector,
+        &token.rule_id,
+    ) {
+        bail!("observation token rule is not bound to source '{source_block_id}'");
+    }
+    Ok(())
+}
+
+fn blocks_contain_token_source(
+    blocks: &[Block],
+    source_block_id: &str,
+    detector: DetectorKind,
+    rule_id: &str,
+) -> bool {
+    blocks.iter().any(|block| match &block.kind {
+        BlockKind::Observe { condition } => {
+            condition_or_timeout_matches_token_source(condition, source_block_id, detector, rule_id)
+        }
+        BlockKind::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            condition_or_timeout_matches_token_source(condition, source_block_id, detector, rule_id)
+                || blocks_contain_token_source(then_body, source_block_id, detector, rule_id)
+                || blocks_contain_token_source(else_body, source_block_id, detector, rule_id)
+        }
+        BlockKind::RepeatUntil {
+            condition, body, ..
+        } => {
+            condition_or_timeout_matches_token_source(condition, source_block_id, detector, rule_id)
+                || blocks_contain_token_source(body, source_block_id, detector, rule_id)
+        }
+        BlockKind::RepeatN { body, .. } | BlockKind::Continuous { body } => {
+            blocks_contain_token_source(body, source_block_id, detector, rule_id)
+        }
+        BlockKind::WatchGroup { group } => group.lanes.iter().any(|lane| {
+            passive_condition_matches_token_source(
+                &lane.condition,
+                source_block_id,
+                detector,
+                rule_id,
+            ) || blocks_contain_token_source(&lane.then_body, source_block_id, detector, rule_id)
+        }),
+        _ => false,
+    })
+}
+
+fn condition_or_timeout_matches_token_source(
+    condition: &Condition,
+    source_block_id: &str,
+    detector: DetectorKind,
+    rule_id: &str,
+) -> bool {
+    condition_matches_token_source(condition, source_block_id, detector, rule_id)
+        || timeout_body(condition).is_some_and(|body| {
+            blocks_contain_token_source(body, source_block_id, detector, rule_id)
+        })
+}
+
+fn condition_matches_token_source(
+    condition: &Condition,
+    source_block_id: &str,
+    detector: DetectorKind,
+    rule_id: &str,
+) -> bool {
+    match condition {
+        Condition::Text {
+            source_block_id: source,
+            rule_id: rule,
+            ..
+        } => source == source_block_id && rule == rule_id && detector == DetectorKind::Text,
+        Condition::Image {
+            source_block_id: source,
+            rule_id: rule,
+            ..
+        } => source == source_block_id && rule == rule_id && detector == DetectorKind::Image,
+    }
+}
+
+fn passive_condition_matches_token_source(
+    condition: &super::PassiveCondition,
+    source_block_id: &str,
+    detector: DetectorKind,
+    rule_id: &str,
+) -> bool {
+    match condition {
+        super::PassiveCondition::Text {
+            source_block_id: source,
+            rule_id: rule,
+        } => source == source_block_id && rule == rule_id && detector == DetectorKind::Text,
+        super::PassiveCondition::Image {
+            source_block_id: source,
+            rule_id: rule,
+        } => source == source_block_id && rule == rule_id && detector == DetectorKind::Image,
+    }
+}
+
+fn timeout_body(condition: &Condition) -> Option<&[Block]> {
+    match condition_mode(condition) {
+        ObserveMode::WaitForTrue {
+            timeout_outcome: TimeoutOutcome::RunBody { body },
+            ..
+        }
+        | ObserveMode::WaitForFalse {
+            timeout_outcome: TimeoutOutcome::RunBody { body },
+            ..
+        } => Some(body),
+        _ => None,
     }
 }
 
@@ -1466,7 +1808,7 @@ mod tests {
         },
         types::{PointRatio, Rect, RectRatio, ScreenImage},
     };
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, thread};
 
     #[derive(Debug, Default)]
     struct FakeCapture;
@@ -1534,6 +1876,21 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct ManualClock(AtomicU64);
+
+    impl ManualClock {
+        fn set(&self, now_ms: u64) {
+            self.0.store(now_ms, Ordering::Relaxed);
+        }
+    }
+
+    impl Clock for ManualClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct RecordingDetector(Mutex<Vec<u64>>);
 
     impl ConditionDetector for RecordingDetector {
@@ -1569,6 +1926,23 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct CountingUnmatchedDetector(AtomicU64);
+
+    impl ConditionDetector for CountingUnmatchedDetector {
+        fn observe(
+            &self,
+            request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(super::super::DetectorEvidence::unmatched(
+                request.observed_at_ms,
+                request.observed_at_ms,
+            ))
+        }
+    }
+
     #[derive(Default)]
     struct InvalidatingDetector {
         control: Mutex<Option<RuntimeControlHandle>>,
@@ -1591,6 +1965,38 @@ mod tests {
             Ok(super::super::DetectorEvidence {
                 matched: true,
                 frame_id: 1,
+                captured_at_ms: request.observed_at_ms,
+                match_rect: Some(Rect::new(1, 2, 3, 4)),
+                score: Some(0.99),
+                match_count: 1,
+                stable_frames: 1,
+                details: serde_json::Value::Null,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct InvalidatingErrorDetector {
+        control: Mutex<Option<RuntimeControlHandle>>,
+        calls: AtomicU64,
+    }
+
+    impl ConditionDetector for InvalidatingErrorDetector {
+        fn observe(
+            &self,
+            request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call == 0 {
+                let control = self.control.lock().unwrap().clone().unwrap();
+                control.pause();
+                control.resume();
+                bail!("stale capture failure")
+            }
+            Ok(super::super::DetectorEvidence {
+                matched: true,
+                frame_id: 2,
                 captured_at_ms: request.observed_at_ms,
                 match_rect: Some(Rect::new(1, 2, 3, 4)),
                 score: Some(0.99),
@@ -1947,6 +2353,162 @@ mod tests {
     }
 
     #[test]
+    fn pause_and_resume_discard_in_flight_detector_errors_before_interpreting_them() {
+        let detector = Arc::new(InvalidatingErrorDetector::default());
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeCapture),
+            detector.clone(),
+            Arc::new(FakeClock::default()),
+        );
+        *detector.control.lock().unwrap() = Some(runtime.control_handle());
+        let definition = fixture_definition(vec![
+            block(
+                "observe",
+                BlockKind::Observe {
+                    condition: text_condition("observe", ObserveMode::CheckNow),
+                },
+            ),
+            block(
+                "click-match",
+                BlockKind::Action {
+                    action: Action::ClickTextMatch {
+                        source_block_id: "observe".to_string(),
+                        button: super::super::MouseButton::Left,
+                    },
+                },
+            ),
+        ]);
+
+        let events = runtime.run(saved(definition), RunMode::DryRun).unwrap();
+
+        assert_eq!(detector.calls.load(Ordering::Relaxed), 2);
+        assert!(events.iter().any(|event| {
+            matches!(event, RunEvent::ActionPlanned { block_id, .. } if block_id == "click-match")
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                RunEvent::RunStopped {
+                    reason: StopReason::TechnicalFailure { .. },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn later_false_observation_clears_the_declared_source_token() {
+        let definition = fixture_definition(vec![
+            block(
+                "source-a",
+                BlockKind::Observe {
+                    condition: text_condition("source-a", ObserveMode::CheckNow),
+                },
+            ),
+            block(
+                "recheck-a",
+                BlockKind::If {
+                    condition: text_condition("source-a", ObserveMode::CheckNow),
+                    then_body: vec![],
+                    else_body: vec![block(
+                        "must-not-click-stale-a",
+                        BlockKind::Action {
+                            action: Action::ClickTextMatch {
+                                source_block_id: "source-a".to_string(),
+                                button: super::super::MouseButton::Left,
+                            },
+                        },
+                    )],
+                },
+            ),
+        ]);
+
+        let events = fixture_runtime_with_detector(FakeDetector::returning([true, false]))
+            .run(saved(definition), RunMode::DryRun)
+            .unwrap();
+
+        assert!(!events.iter().any(|event| {
+            matches!(event, RunEvent::ActionPlanned { block_id, .. }
+                if block_id == "must-not-click-stale-a")
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event, RunEvent::ActionBlocked { block_id, reason, .. }
+                if block_id == "must-not-click-stale-a" && reason.contains("fresh observation"))
+        }));
+    }
+
+    #[test]
+    fn action_token_must_match_compiled_source_identity() {
+        let action = Action::ClickTextMatch {
+            source_block_id: "observe".to_string(),
+            button: super::super::MouseButton::Left,
+        };
+        let revision = saved(fixture_definition(vec![
+            block(
+                "observe",
+                BlockKind::Observe {
+                    condition: text_condition("observe", ObserveMode::CheckNow),
+                },
+            ),
+            block(
+                "click-match",
+                BlockKind::Action {
+                    action: action.clone(),
+                },
+            ),
+        ]));
+        let events = fixture_runtime_with_detector(FakeDetector::returning([true]))
+            .run(revision.clone(), RunMode::DryRun)
+            .unwrap();
+        let token = events
+            .iter()
+            .find_map(|event| match event {
+                RunEvent::ActionPlanned {
+                    token: Some(token), ..
+                } => Some(token.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let compiled = CompiledMacro::compile(revision).unwrap();
+
+        validate_action_token(&compiled, &action, &token).unwrap();
+        for mismatched in [
+            {
+                let mut token = token.clone();
+                token.source_block_id = "other".to_string();
+                token
+            },
+            {
+                let mut token = token.clone();
+                token.detector = DetectorKind::Image;
+                token
+            },
+            {
+                let mut token = token.clone();
+                token.rule_id = "other".to_string();
+                token
+            },
+            {
+                let mut token = token.clone();
+                token.rule_revision += 1;
+                token
+            },
+            {
+                let mut token = token.clone();
+                token.region_id = "other".to_string();
+                token
+            },
+            {
+                let mut token = token.clone();
+                token.region_revision += 1;
+                token
+            },
+        ] {
+            assert!(validate_action_token(&compiled, &action, &mismatched).is_err());
+        }
+    }
+
+    #[test]
     fn stop_is_checked_during_wait_slices() {
         let runtime = MacroRuntime::new(
             Arc::new(FakeCapture),
@@ -1971,6 +2533,41 @@ mod tests {
                 reason: StopReason::UserStopped,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn maximum_runtime_is_enforced_while_the_runtime_is_paused() {
+        let clock = Arc::new(ManualClock::default());
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeCapture),
+            Arc::new(FakeDetector::default()),
+            clock.clone(),
+        );
+        let runner = runtime.clone();
+        let mut definition = fixture_definition(vec![block(
+            "wait",
+            BlockKind::Wait {
+                duration_ms: 60_000,
+            },
+        )]);
+        definition.safety.max_runtime_ms = Limit::Finite(50);
+        let handle = thread::spawn(move || runner.run(saved(definition), RunMode::DryRun).unwrap());
+        thread::sleep(Duration::from_millis(20));
+        runtime.pause();
+        clock.set(100);
+        thread::sleep(Duration::from_millis(40));
+        if !handle.is_finished() {
+            runtime.stop();
+        }
+        let events = handle.join().unwrap();
+
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::SafetyLimit { message },
+                ..
+            }) if message == "maximum runtime exceeded"
         ));
     }
 
@@ -2152,6 +2749,48 @@ mod tests {
     }
 
     #[test]
+    fn emergency_stop_queue_bypass_stops_the_owning_runtime_and_wakes_waits() {
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeCapture),
+            Arc::new(FakeDetector::default()),
+            Arc::new(SystemClock::default()),
+        );
+        let channels = runtime.bounded_channels(1, 1);
+        assert_eq!(
+            channels.commands.try_send(RuntimeCommand::Pause),
+            CommandDelivery::Sent
+        );
+        let runner = runtime.clone();
+        let definition = fixture_definition(vec![block(
+            "wait",
+            BlockKind::Wait {
+                duration_ms: 60_000,
+            },
+        )]);
+        let handle = thread::spawn(move || runner.run(saved(definition), RunMode::DryRun).unwrap());
+        thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(
+            channels.commands.try_send(RuntimeCommand::EmergencyStop),
+            CommandDelivery::Full
+        );
+        let events = handle.join().unwrap();
+
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::EmergencyStopped,
+                ..
+            })
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RunEvent::ActionPlanned { .. }))
+        );
+    }
+
+    #[test]
     fn critical_events_wait_for_capacity_and_are_never_dropped() {
         let channels = bounded_runtime_channels(1, 1);
         let first = stopped_event();
@@ -2273,6 +2912,98 @@ mod tests {
                 reason: StopReason::Completed,
                 ..
             })
+        ));
+    }
+
+    fn run_finite_deadline_case(
+        outcome: TimeoutOutcome,
+        after: Vec<Block>,
+    ) -> (Vec<RunEvent>, u64) {
+        let detector = Arc::new(CountingUnmatchedDetector::default());
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeCapture),
+            detector.clone(),
+            Arc::new(SystemClock::default()),
+        );
+        let mut blocks = vec![block(
+            "observe",
+            BlockKind::Observe {
+                condition: text_condition(
+                    "observe",
+                    ObserveMode::WaitForTrue {
+                        timeout_ms: Limit::Finite(100),
+                        timeout_outcome: outcome,
+                    },
+                ),
+            },
+        )];
+        blocks.extend(after);
+        let mut definition = fixture_definition(blocks);
+        definition.text_rules[0].poll_interval_ms = 10_000;
+        definition.safety.max_observation_retries = Limit::Finite(0);
+        definition.safety.max_observations_per_second = 1_000;
+        let events = runtime.run(saved(definition), RunMode::DryRun).unwrap();
+        (events, detector.0.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn finite_deadline_continue_does_not_poll_again_after_expiry() {
+        let (events, calls) = run_finite_deadline_case(
+            TimeoutOutcome::Continue,
+            vec![point_action("after-continue")],
+        );
+
+        assert_eq!(calls, 1);
+        assert!(events.iter().any(|event| {
+            matches!(event, RunEvent::ActionPlanned { block_id, .. } if block_id == "after-continue")
+        }));
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::Completed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn finite_deadline_run_body_does_not_poll_again_after_expiry() {
+        let (events, calls) = run_finite_deadline_case(
+            TimeoutOutcome::RunBody {
+                body: vec![point_action("timeout-body")],
+            },
+            vec![],
+        );
+
+        assert_eq!(calls, 1);
+        assert!(events.iter().any(|event| {
+            matches!(event, RunEvent::ActionPlanned { block_id, .. } if block_id == "timeout-body")
+        }));
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::Completed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn finite_deadline_stop_error_does_not_poll_again_after_expiry() {
+        let (events, calls) = run_finite_deadline_case(
+            TimeoutOutcome::StopError {
+                message: "condition timed out".to_string(),
+            },
+            vec![],
+        );
+
+        assert_eq!(calls, 1);
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::StopError { message },
+                ..
+            }) if message == "condition timed out"
         ));
     }
 
@@ -2411,6 +3142,56 @@ mod tests {
 
         revision.pinned_assets[0].bytes.push(0);
         assert!(CompiledMacro::compile(revision).is_err());
+    }
+
+    #[test]
+    fn compiled_snapshot_rejects_conflicting_hashes_for_one_asset_revision() {
+        let first_bytes = b"first-template".to_vec();
+        let second_bytes = b"second-template".to_vec();
+        let first = AssetRef {
+            id: "template".to_string(),
+            revision: 1,
+            content_hash: sha256_hex(&first_bytes),
+        };
+        let second = AssetRef {
+            id: first.id.clone(),
+            revision: first.revision,
+            content_hash: sha256_hex(&second_bytes),
+        };
+        let mut definition = fixture_definition(vec![]);
+        for (id, template) in [("image-a", first.clone()), ("image-b", second.clone())] {
+            definition.image_rules.push(ImageRule {
+                id: id.to_string(),
+                revision: 1,
+                region_id: "region".to_string(),
+                template,
+                transparent_mask: None,
+                threshold: 0.95,
+                scales_percent: vec![100],
+                stable_frames: 1,
+                maximum_center_drift_px: 2,
+                minimum_runner_up_margin: 0.05,
+                match_policy: MatchSelectionPolicy::ExactlyOne,
+                poll_interval_ms: 1,
+                timeout_ms: Limit::Finite(10),
+            });
+        }
+        let mut revision = saved(definition);
+        revision.pinned_assets = vec![
+            PinnedAsset {
+                asset: first,
+                bytes: first_bytes,
+            },
+            PinnedAsset {
+                asset: second,
+                bytes: second_bytes,
+            },
+        ];
+        let revision: SavedRevision =
+            serde_json::from_value(serde_json::to_value(revision).unwrap()).unwrap();
+
+        let error = CompiledMacro::compile(revision).unwrap_err().to_string();
+        assert!(error.contains("conflicting hashes for immutable asset identity"));
     }
 
     fn progress_event(attempts: u64) -> RunEvent {

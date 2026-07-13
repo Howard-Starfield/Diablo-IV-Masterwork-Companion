@@ -788,6 +788,25 @@ pub struct CapturedTargetBinding {
     profile: CapturedTargetProfile,
     expected: TargetSnapshot,
     guard: WindowsTargetGuard,
+    activator: Arc<dyn TargetActivator>,
+}
+
+trait TargetActivator: std::fmt::Debug + Send + Sync {
+    fn activate(&self, window_id: u64) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Win32TargetActivator;
+
+impl TargetActivator for Win32TargetActivator {
+    fn activate(&self, window_id: u64) -> Result<()> {
+        let identity = CanonicalWindowIdentity::from_window_id(window_id)?;
+        anyhow::ensure!(
+            unsafe { SetForegroundWindow(identity.hwnd()) }.as_bool(),
+            "failed to bring the selected target window to the foreground"
+        );
+        Ok(())
+    }
 }
 
 impl CapturedTargetBinding {
@@ -797,12 +816,17 @@ impl CapturedTargetBinding {
 
     /// Brings the selected target forward, then revalidates its concrete HWND,
     /// process instance and capture geometry. Only absolute movement is refreshed.
-    pub fn refresh_client_rect(&self) -> Result<Rect> {
-        let identity = CanonicalWindowIdentity::from_window_id(self.expected.window_id)?;
-        anyhow::ensure!(
-            unsafe { SetForegroundWindow(identity.hwnd()) }.as_bool(),
-            "failed to bring the selected target window to the foreground"
-        );
+    pub fn prepare_client_rect(&self) -> Result<Rect> {
+        self.activator.activate(self.expected.window_id)?;
+        Ok(self
+            .guard
+            .refresh_authoring_snapshot(&self.expected)?
+            .client_rect)
+    }
+
+    /// Post-capture validation is deliberately observation-only. In particular,
+    /// it must not restore focus after an overlay or another application steals it.
+    pub fn validate_client_rect(&self) -> Result<Rect> {
         Ok(self
             .guard
             .refresh_authoring_snapshot(&self.expected)?
@@ -854,6 +878,7 @@ pub fn resolve_target_from_selection(selection: Rect) -> Result<CapturedTargetBi
         profile,
         expected,
         guard,
+        activator: Arc::new(Win32TargetActivator),
     })
 }
 
@@ -1431,6 +1456,8 @@ fn cursor_pos() -> Result<Point> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use image::RgbaImage;
 
     use crate::engine::{
@@ -1484,6 +1511,92 @@ mod tests {
         fn now_ms(&self) -> u64 {
             123
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordingActivator(Arc<AtomicUsize>);
+
+    impl TargetActivator for RecordingActivator {
+        fn activate(&self, _window_id: u64) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn authoring_binding(
+        expected_snapshot: CanonicalWindowsSnapshot,
+        current_snapshot: CanonicalWindowsSnapshot,
+        activations: Arc<AtomicUsize>,
+    ) -> CapturedTargetBinding {
+        let expected = expected_snapshot.target_snapshot();
+        let profile = CapturedTargetProfile {
+            process_path: expected_snapshot.process_path.clone(),
+            window_class: String::new(),
+            title: String::new(),
+            client_rect: expected_snapshot.client_rect,
+            dpi: expected_snapshot.dpi,
+        };
+        let guard = WindowsTargetGuard::with_snapshot_source_for_test(
+            expected_snapshot.identity,
+            DurableTargetHints {
+                process_path: expected_snapshot.process_path.clone(),
+                window_class: String::new(),
+                title_contains: String::new(),
+            },
+            FakeWindowsSnapshot(current_snapshot),
+        );
+        CapturedTargetBinding {
+            profile,
+            expected,
+            guard,
+            activator: Arc::new(RecordingActivator(activations)),
+        }
+    }
+
+    fn actionable_authoring_snapshot() -> CanonicalWindowsSnapshot {
+        CanonicalWindowsSnapshot {
+            identity: CanonicalWindowIdentity::from_xcap_window_id(42),
+            process_id: 7,
+            process_started_at_100ns: 100,
+            process_path: r#"C:\games\Diablo IV.exe"#.to_string(),
+            client_rect: Rect::new(100, 200, 800, 600),
+            dpi: 144,
+            display: DisplayProfileInputs {
+                display_id: 11,
+                monitor_rect: Rect::new(0, 0, 1_920, 1_080),
+                work_rect: Rect::new(0, 0, 1_920, 1_040),
+                flags: 1,
+            },
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
+        }
+    }
+
+    #[test]
+    fn authoring_post_validation_never_activates_and_rejects_lost_focus() {
+        let activations = Arc::new(AtomicUsize::new(0));
+        let expected = actionable_authoring_snapshot();
+        let binding =
+            authoring_binding(expected.clone(), expected.clone(), Arc::clone(&activations));
+
+        assert_eq!(
+            binding.validate_client_rect().unwrap(),
+            Rect::new(100, 200, 800, 600)
+        );
+        assert_eq!(activations.load(Ordering::SeqCst), 0);
+        binding.prepare_client_rect().unwrap();
+        assert_eq!(activations.load(Ordering::SeqCst), 1);
+
+        let mut unfocused = expected.clone();
+        unfocused.is_foreground = false;
+        let unfocused = authoring_binding(expected, unfocused, Arc::clone(&activations));
+        assert!(unfocused.validate_client_rect().is_err());
+        assert_eq!(
+            activations.load(Ordering::SeqCst),
+            1,
+            "post validation must not restore stolen focus"
+        );
     }
 
     #[test]

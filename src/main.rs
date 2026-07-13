@@ -4,6 +4,7 @@
 )]
 
 use std::{
+    collections::HashMap,
     fs,
     io::Cursor,
     path::PathBuf,
@@ -23,17 +24,18 @@ use crate::engine::{
     config::{EnchantConfig, MouseMovementProfile, default_mouse_movement_profile},
     enchant_loop::{EnchantEvent, EnchantRunner, OcrReader, RegionCapture},
     macro_engine::{
-        AssetStore, ClusterPolicy, DEFAULT_MAX_SCORE_CELLS, ImageMatchCandidate, ImageMatchConfig,
-        ImageMatchResult, ImageMatcher, ImageRule, ImageRuleVerification,
+        AssetRef, AssetStore, ClusterPolicy, DEFAULT_MAX_SCORE_CELLS, ImageMatchCandidate,
+        ImageMatchConfig, ImageMatchResult, ImageMatcher, ImageRule, ImageRuleVerification,
         ImageRuleVerificationInput, MacroStore, NegativeCorpusSample,
-        NegativeSampleEvaluationInputs, authoring_test_text_rule, cluster_peaks,
+        NegativeSampleEvaluationInputs, TargetProfile, authoring_test_text_rule, cluster_peaks,
     },
     matcher::{MatchResult, match_affix},
     platform::{
-        CaptureRequestId, CapturedTargetBinding, EscStopSignal, MacroCaptureKind,
-        MacroCaptureRequest, MacroCaptureSelection, SendInputController, WindowsOcrReader,
-        XcapRegionCapture, enable_per_monitor_dpi_awareness, record_mouse_movement_profile,
-        resolve_target_from_selection, select_macro_capture, select_screen_rect,
+        CaptureRequestId, CapturedTargetBinding, CapturedTargetProfile, EscStopSignal,
+        MacroCaptureKind, MacroCaptureRequest, MacroCaptureSelection, SendInputController,
+        WindowsOcrReader, XcapRegionCapture, enable_per_monitor_dpi_awareness,
+        record_mouse_movement_profile, resolve_target_from_selection, select_macro_capture,
+        select_screen_rect,
     },
     types::{PointRatio, Rect, RectRatio},
 };
@@ -222,10 +224,32 @@ enum UiEvent {
     BotEvent(EnchantEvent),
     BotFinished(anyhow::Result<()>),
     MacroAuthoringFinished {
-        result: WizardAuthoringResult,
+        request: WizardAuthoringRequest,
+        outcome: NativeWizardAuthoringOutcome,
         target_binding: Option<CapturedTargetBinding>,
     },
-    EditorAuthoringFinished(EditorAuthoringResult),
+    EditorAuthoringFinished {
+        request: EditorAuthoringRequest,
+        outcome: NativeEditorAuthoringOutcome,
+    },
+}
+
+#[derive(Debug)]
+enum NativeWizardAuthoringOutcome {
+    Complete(WizardAuthoringOutcome),
+    CapturedTemplate(PendingTemplateCapture),
+}
+
+#[derive(Debug)]
+enum NativeEditorAuthoringOutcome {
+    Complete(EditorAuthoringOutcome),
+    CapturedTemplate(PendingTemplateCapture),
+}
+
+#[derive(Debug)]
+struct PendingTemplateCapture {
+    bytes: Vec<u8>,
+    previous: Option<AssetRef>,
 }
 
 #[derive(Debug)]
@@ -304,14 +328,8 @@ struct NativeApp {
     stop_watcher_done: Option<Arc<AtomicBool>>,
     active_ocr_rect: Option<Rect>,
     dirty: bool,
-    macro_authoring_target: Option<NativeAuthoringTarget>,
+    macro_authoring_targets: HashMap<AuthoringSessionId, CapturedTargetBinding>,
     macro_store: Option<MacroStore>,
-}
-
-#[derive(Debug, Clone)]
-struct NativeAuthoringTarget {
-    session: AuthoringSessionId,
-    binding: CapturedTargetBinding,
 }
 
 impl NativeApp {
@@ -345,7 +363,7 @@ impl NativeApp {
             stop_watcher_done: None,
             active_ocr_rect: None,
             dirty: migrated_config,
-            macro_authoring_target: None,
+            macro_authoring_targets: HashMap::new(),
             macro_store,
         }
     }
@@ -409,11 +427,17 @@ impl NativeApp {
         let Some(wizard) = self.macro_state.wizard.clone() else {
             return;
         };
-        let target_binding = self
-            .macro_authoring_target
-            .as_ref()
-            .filter(|target| target.session == request.session)
-            .map(|target| target.binding.clone());
+        let target_binding = (request.kind != WizardAuthoringKind::CaptureTarget)
+            .then(|| self.macro_state.target_profile_for_session(request.session))
+            .flatten()
+            .and_then(|profile| {
+                authoring_target_for_session(
+                    &self.macro_authoring_targets,
+                    request.session,
+                    |binding| binding_matches_target_profile(binding, profile),
+                )
+                .cloned()
+            });
         let assets = self
             .macro_store
             .as_ref()
@@ -424,17 +448,12 @@ impl NativeApp {
             thread::sleep(Duration::from_millis(100));
             let (outcome, captured_target) =
                 run_macro_authoring_request(&request, &wizard, target_binding, assets);
-            let result = WizardAuthoringResult {
-                session: request.session,
-                id: request.id,
-                fingerprint: request.fingerprint,
-                outcome,
-            };
             send_ui_event(
                 &tx,
                 &repaint,
                 UiEvent::MacroAuthoringFinished {
-                    result,
+                    request,
+                    outcome,
                     target_binding: captured_target,
                 },
             );
@@ -446,10 +465,16 @@ impl NativeApp {
             return;
         };
         let target_binding = self
-            .macro_authoring_target
-            .as_ref()
-            .filter(|target| target.session == request.session)
-            .map(|target| target.binding.clone());
+            .macro_state
+            .target_profile_for_session(request.session)
+            .and_then(|profile| {
+                authoring_target_for_session(
+                    &self.macro_authoring_targets,
+                    request.session,
+                    |binding| binding_matches_target_profile(binding, profile),
+                )
+                .cloned()
+            });
         let assets = self
             .macro_store
             .as_ref()
@@ -462,12 +487,7 @@ impl NativeApp {
             send_ui_event(
                 &tx,
                 &repaint,
-                UiEvent::EditorAuthoringFinished(EditorAuthoringResult {
-                    session: request.session,
-                    id: request.id,
-                    fingerprint: request.fingerprint,
-                    outcome,
-                }),
+                UiEvent::EditorAuthoringFinished { request, outcome },
             );
         });
     }
@@ -610,16 +630,59 @@ impl NativeApp {
                     }
                 }
                 UiEvent::MacroAuthoringFinished {
-                    result,
+                    request,
+                    outcome,
                     target_binding,
                 } => {
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
-                    let session = result.session;
+                    let session = request.session;
+                    let current = self
+                        .macro_state
+                        .wizard_request_envelope_is_current(&request, request.kind);
+                    let outcome = match outcome {
+                        NativeWizardAuthoringOutcome::Complete(outcome) if current => outcome,
+                        NativeWizardAuthoringOutcome::Complete(_) => {
+                            self.macro_state.discard_wizard_result_envelope(&request);
+                            self.macro_state.editor_feedback =
+                                Some("Discarded stale macro authoring result.".into());
+                            continue;
+                        }
+                        NativeWizardAuthoringOutcome::CapturedTemplate(pending) => {
+                            let publish_current =
+                                self.macro_state.wizard_request_envelope_is_current(
+                                    &request,
+                                    WizardAuthoringKind::CaptureTemplate,
+                                );
+                            match publish_pending_template_if_current(
+                                publish_current,
+                                self.macro_store.as_ref().map(|store| store.assets()),
+                                pending,
+                            ) {
+                                Ok(Some(asset)) => WizardAuthoringOutcome::Template { asset },
+                                Ok(None) => {
+                                    self.macro_state.discard_wizard_result_envelope(&request);
+                                    self.macro_state.editor_feedback = Some(
+                                        "Discarded stale template capture without publishing it."
+                                            .into(),
+                                    );
+                                    continue;
+                                }
+                                Err(error) => WizardAuthoringOutcome::Failed(error.to_string()),
+                            }
+                        }
+                    };
+                    let result = WizardAuthoringResult {
+                        session,
+                        id: request.id,
+                        fingerprint: request.fingerprint,
+                        outcome,
+                    };
                     match self.macro_state.apply_wizard_result(result) {
                         Ok(()) => {
-                            if let Some(binding) = target_binding {
-                                self.macro_authoring_target =
-                                    Some(NativeAuthoringTarget { session, binding });
+                            if request.kind == WizardAuthoringKind::CaptureTarget {
+                                if let Some(binding) = target_binding {
+                                    self.macro_authoring_targets.insert(session, binding);
+                                }
                             }
                         }
                         Err(error) => {
@@ -628,8 +691,51 @@ impl NativeApp {
                         }
                     }
                 }
-                UiEvent::EditorAuthoringFinished(result) => {
+                UiEvent::EditorAuthoringFinished { request, outcome } => {
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    let expected_kind = request.kind.clone();
+                    let current = self
+                        .macro_state
+                        .editor_request_envelope_is_current(&request, &expected_kind);
+                    let outcome = match outcome {
+                        NativeEditorAuthoringOutcome::Complete(outcome) if current => outcome,
+                        NativeEditorAuthoringOutcome::Complete(_) => {
+                            self.macro_state.discard_editor_result_envelope(&request);
+                            self.macro_state.editor_feedback =
+                                Some("Discarded stale editor authoring result.".into());
+                            continue;
+                        }
+                        NativeEditorAuthoringOutcome::CapturedTemplate(pending) => {
+                            let publish_current = matches!(
+                                request.kind,
+                                EditorAuthoringKind::RecaptureTemplate { .. }
+                            ) && self
+                                .macro_state
+                                .editor_request_envelope_is_current(&request, &expected_kind);
+                            match publish_pending_template_if_current(
+                                publish_current,
+                                self.macro_store.as_ref().map(|store| store.assets()),
+                                pending,
+                            ) {
+                                Ok(Some(asset)) => EditorAuthoringOutcome::Template { asset },
+                                Ok(None) => {
+                                    self.macro_state.discard_editor_result_envelope(&request);
+                                    self.macro_state.editor_feedback = Some(
+                                        "Discarded stale template recapture without publishing it."
+                                            .into(),
+                                    );
+                                    continue;
+                                }
+                                Err(error) => EditorAuthoringOutcome::Failed(error.to_string()),
+                            }
+                        }
+                    };
+                    let result = EditorAuthoringResult {
+                        session: request.session,
+                        id: request.id,
+                        fingerprint: request.fingerprint,
+                        outcome,
+                    };
                     if let Err(error) = self.macro_state.apply_editor_authoring_result(result) {
                         self.macro_state.editor_feedback =
                             Some(format!("Discarded editor authoring result: {error:?}"));
@@ -894,6 +1000,8 @@ impl App for NativeApp {
                     });
             });
         if self.page == AppPage::Macro {
+            let active_sessions = self.macro_state.active_authoring_sessions();
+            prune_authoring_targets(&mut self.macro_authoring_targets, &active_sessions);
             if let Some(request) = self.macro_state.take_wizard_request() {
                 self.begin_macro_authoring(request);
             }
@@ -1535,115 +1643,182 @@ fn native_wizard_image_rule(wizard: &crate::macro_ui::WizardState) -> anyhow::Re
     Ok(rule)
 }
 
+fn binding_matches_target_profile(binding: &CapturedTargetBinding, target: &TargetProfile) -> bool {
+    captured_profile_matches_target(binding.profile(), target)
+}
+
+fn captured_profile_matches_target(
+    captured: &CapturedTargetProfile,
+    target: &TargetProfile,
+) -> bool {
+    captured
+        .process_path
+        .eq_ignore_ascii_case(&target.process_path)
+        && captured
+            .window_class
+            .eq_ignore_ascii_case(&target.window_class)
+        && captured.title.contains(&target.title_contains)
+        && captured.client_rect.width == target.captured_client_width
+        && captured.client_rect.height == target.captured_client_height
+        && captured.dpi == target.captured_dpi
+}
+
+fn authoring_target_for_session<'a, T>(
+    targets: &'a HashMap<AuthoringSessionId, T>,
+    session: AuthoringSessionId,
+    accepts: impl FnOnce(&T) -> bool,
+) -> Option<&'a T> {
+    targets.get(&session).filter(|target| accepts(target))
+}
+
+fn prune_authoring_targets<T>(
+    targets: &mut HashMap<AuthoringSessionId, T>,
+    active_sessions: &[AuthoringSessionId],
+) {
+    targets.retain(|session, _| active_sessions.contains(session));
+}
+
+fn publish_pending_template_if_current(
+    current: bool,
+    store: Option<&AssetStore>,
+    pending: PendingTemplateCapture,
+) -> anyhow::Result<Option<AssetRef>> {
+    if !current {
+        return Ok(None);
+    }
+    let store = store.ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
+    let asset = match pending.previous {
+        Some(previous) => store.put_next_png_revision(&previous, &pending.bytes)?,
+        None => store.put_png(&pending.bytes)?,
+    };
+    Ok(Some(asset))
+}
+
 fn run_macro_authoring_request(
     request: &WizardAuthoringRequest,
     wizard: &crate::macro_ui::WizardState,
     target_binding: Option<CapturedTargetBinding>,
     assets: Option<AssetStore>,
-) -> (WizardAuthoringOutcome, Option<CapturedTargetBinding>) {
-    let run = || -> anyhow::Result<(WizardAuthoringOutcome, Option<CapturedTargetBinding>)> {
-        if request.kind == WizardAuthoringKind::CaptureTarget {
-            let selection = select_screen_rect(40)?;
-            let binding = resolve_target_from_selection(selection)?;
-            let target = binding.profile();
-            return Ok((
-                WizardAuthoringOutcome::TargetGeometry {
-                    process_path: target.process_path.clone(),
-                    window_class: target.window_class.clone(),
-                    title: target.title.clone(),
-                    width: target.client_rect.width,
-                    height: target.client_rect.height,
-                    dpi: target.dpi,
-                },
-                Some(binding),
-            ));
-        }
-        let target = target_binding
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "capture the concrete target window first for this authoring session"
-                )
-            })?
-            .refresh_client_rect()?;
-        if matches!(
-            request.kind,
-            WizardAuthoringKind::TestDetector | WizardAuthoringKind::CaptureImageNegative
-        ) {
-            let capture_rect = target.rect_from_ratio(wizard.region);
-            let started = Instant::now();
-            let capture = XcapRegionCapture;
-            let image = RegionCapture::capture_region(&capture, capture_rect)?;
-            require_stable_authoring_client(
-                target,
-                target_binding
-                    .as_ref()
-                    .expect("target binding checked above")
-                    .refresh_client_rect()?,
-            )?;
-            return match &wizard.detector {
-                WizardDetector::Text => {
-                    anyhow::ensure!(
-                        request.kind == WizardAuthoringKind::TestDetector,
-                        "negative samples apply only to image rules"
-                    );
-                    let rule = wizard
-                        .text_rule_for_authoring()
-                        .ok_or_else(|| anyhow::anyhow!("wizard OCR rule is unavailable"))?;
-                    let tested = authoring_test_text_rule(&image, capture_rect, &rule)?;
-                    let evidence = tested
-                        .words
-                        .iter()
-                        .map(|word| word.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    Ok((
-                        WizardAuthoringOutcome::DetectorTest {
-                            passed: tested.text_match.matched,
-                            evidence,
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                            image_verification: None,
+) -> (NativeWizardAuthoringOutcome, Option<CapturedTargetBinding>) {
+    let run =
+        || -> anyhow::Result<(NativeWizardAuthoringOutcome, Option<CapturedTargetBinding>)> {
+            if request.kind == WizardAuthoringKind::CaptureTarget {
+                let selection = select_screen_rect(40)?;
+                let binding = resolve_target_from_selection(selection)?;
+                let target = binding.profile();
+                return Ok((
+                    NativeWizardAuthoringOutcome::Complete(
+                        WizardAuthoringOutcome::TargetGeometry {
+                            process_path: target.process_path.clone(),
+                            window_class: target.window_class.clone(),
+                            title: target.title.clone(),
+                            width: target.client_rect.width,
+                            height: target.client_rect.height,
+                            dpi: target.dpi,
                         },
-                        None,
-                    ))
-                }
-                WizardDetector::Image { template } => {
-                    let store = assets
+                    ),
+                    Some(binding),
+                ));
+            }
+            let target = target_binding
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "capture the concrete target window first for this authoring session"
+                    )
+                })?
+                .prepare_client_rect()?;
+            if matches!(
+                request.kind,
+                WizardAuthoringKind::TestDetector | WizardAuthoringKind::CaptureImageNegative
+            ) {
+                let capture_rect = target.rect_from_ratio(wizard.region);
+                let started = Instant::now();
+                let capture = XcapRegionCapture;
+                let image = RegionCapture::capture_region(&capture, capture_rect)?;
+                require_stable_authoring_client(
+                    target,
+                    target_binding
                         .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
-                    let template_bytes = store.read(template)?;
-                    let template_image =
-                        ImageRuleVerification::decode_template_png(&template_bytes)?;
-                    let rule = native_wizard_image_rule(wizard)?;
-                    anyhow::ensure!(
-                        rule.template == *template,
-                        "wizard image template changed before the authoring request"
-                    );
-                    let (result, selected) =
-                        match_authoring_image(&image, capture_rect, &template_image, None, &rule)?;
-                    if request.kind == WizardAuthoringKind::CaptureImageNegative {
+                        .expect("target binding checked above")
+                        .validate_client_rect()?,
+                )?;
+                return match &wizard.detector {
+                    WizardDetector::Text => {
                         anyhow::ensure!(
-                            result.candidates.is_empty(),
-                            "current frame still matches the template; show a known-negative frame"
+                            request.kind == WizardAuthoringKind::TestDetector,
+                            "negative samples apply only to image rules"
                         );
-                        let mut png = Vec::new();
-                        DynamicImage::ImageRgba8(image.rgba.clone())
-                            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)?;
-                        let sample = NegativeCorpusSample {
-                            stable_id: format!("wizard/negative/{}", request.id.0),
-                            content_sha256: format!("{:x}", Sha256::digest(&png)),
-                            measured_score: result.best.score,
-                            evaluation: NegativeSampleEvaluationInputs::for_rule(
-                                &rule,
-                                wizard.target.captured_dpi,
-                                1,
-                                (capture_rect.width, capture_rect.height),
+                        let rule = wizard
+                            .text_rule_for_authoring()
+                            .ok_or_else(|| anyhow::anyhow!("wizard OCR rule is unavailable"))?;
+                        let tested = authoring_test_text_rule(&image, capture_rect, &rule)?;
+                        let evidence = tested
+                            .words
+                            .iter()
+                            .map(|word| word.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        Ok((
+                            NativeWizardAuthoringOutcome::Complete(
+                                WizardAuthoringOutcome::DetectorTest {
+                                    passed: tested.text_match.matched,
+                                    evidence,
+                                    elapsed_ms: started.elapsed().as_millis() as u64,
+                                    image_verification: None,
+                                },
                             ),
-                        };
-                        return Ok((WizardAuthoringOutcome::ImageNegativeSample(sample), None));
+                            None,
+                        ))
                     }
-                    let verification =
-                        if selected.matched && !wizard.image_negative_samples.is_empty() {
+                    WizardDetector::Image { template } => {
+                        let store = assets
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
+                        let template_bytes = store.read(template)?;
+                        let template_image =
+                            ImageRuleVerification::decode_template_png(&template_bytes)?;
+                        let rule = native_wizard_image_rule(wizard)?;
+                        anyhow::ensure!(
+                            rule.template == *template,
+                            "wizard image template changed before the authoring request"
+                        );
+                        let (result, selected) = match_authoring_image(
+                            &image,
+                            capture_rect,
+                            &template_image,
+                            None,
+                            &rule,
+                        )?;
+                        if request.kind == WizardAuthoringKind::CaptureImageNegative {
+                            anyhow::ensure!(
+                                result.candidates.is_empty(),
+                                "current frame still matches the template; show a known-negative frame"
+                            );
+                            let mut png = Vec::new();
+                            DynamicImage::ImageRgba8(image.rgba.clone())
+                                .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)?;
+                            let sample = NegativeCorpusSample {
+                                stable_id: format!("wizard/negative/{}", request.id.0),
+                                content_sha256: format!("{:x}", Sha256::digest(&png)),
+                                measured_score: result.best.score,
+                                evaluation: NegativeSampleEvaluationInputs::for_rule(
+                                    &rule,
+                                    wizard.target.captured_dpi,
+                                    1,
+                                    (capture_rect.width, capture_rect.height),
+                                ),
+                            };
+                            return Ok((
+                                NativeWizardAuthoringOutcome::Complete(
+                                    WizardAuthoringOutcome::ImageNegativeSample(sample),
+                                ),
+                                None,
+                            ));
+                        }
+                        let verification = if selected.matched
+                            && !wizard.image_negative_samples.is_empty()
+                        {
                             Some(
                                 ImageRuleVerification::verify(ImageRuleVerificationInput {
                                     rule: &rule,
@@ -1662,98 +1837,110 @@ fn run_macro_authoring_request(
                         } else {
                             None
                         };
-                    Ok((
-                        WizardAuthoringOutcome::DetectorTest {
-                            passed: selected.matched && verification.is_some(),
-                            evidence: format!(
-                                "best {:.3}; {} candidate(s), {} cluster(s); {}",
-                                result.best.score,
-                                result.candidates.len(),
-                                selected.clusters.len(),
-                                if verification.is_some() {
-                                    "local verification passed"
-                                } else if !selected.matched {
-                                    "configured image selection policy did not select a match"
-                                } else {
-                                    "capture at least one explicit negative sample"
-                                }
+                        Ok((
+                            NativeWizardAuthoringOutcome::Complete(
+                                WizardAuthoringOutcome::DetectorTest {
+                                    passed: selected.matched && verification.is_some(),
+                                    evidence: format!(
+                                        "best {:.3}; {} candidate(s), {} cluster(s); {}",
+                                        result.best.score,
+                                        result.candidates.len(),
+                                        selected.clusters.len(),
+                                        if verification.is_some() {
+                                            "local verification passed"
+                                        } else if !selected.matched {
+                                            "configured image selection policy did not select a match"
+                                        } else {
+                                            "capture at least one explicit negative sample"
+                                        }
+                                    ),
+                                    elapsed_ms: started.elapsed().as_millis() as u64,
+                                    image_verification: verification,
+                                },
                             ),
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                            image_verification: verification,
-                        },
-                        None,
-                    ))
+                            None,
+                        ))
+                    }
+                };
+            }
+
+            let capture_kind = match request.kind {
+                WizardAuthoringKind::CaptureTextRegion => MacroCaptureKind::TextRegion,
+                WizardAuthoringKind::CaptureImageRegion => MacroCaptureKind::ImageSearchRegion,
+                WizardAuthoringKind::CaptureTemplate => MacroCaptureKind::TemplateCrop,
+                WizardAuthoringKind::CaptureClickPoint => MacroCaptureKind::ClickPoint,
+                WizardAuthoringKind::CaptureClickRegion => MacroCaptureKind::ClickRegion,
+                WizardAuthoringKind::CaptureTarget
+                | WizardAuthoringKind::TestDetector
+                | WizardAuthoringKind::CaptureImageNegative => unreachable!(),
+            };
+            let response = select_macro_capture(MacroCaptureRequest {
+                id: CaptureRequestId(request.id.0),
+                kind: capture_kind,
+                target_client: target,
+                min_size: if capture_kind == MacroCaptureKind::ClickPoint {
+                    1
+                } else {
+                    4
+                },
+            })?;
+            require_stable_authoring_client(
+                target,
+                target_binding
+                    .as_ref()
+                    .expect("target binding checked above")
+                    .validate_client_rect()?,
+            )?;
+            let outcome = match response.selection {
+                MacroCaptureSelection::Region(rect) => {
+                    NativeWizardAuthoringOutcome::Complete(WizardAuthoringOutcome::Region(rect))
+                }
+                MacroCaptureSelection::Point(point) => {
+                    NativeWizardAuthoringOutcome::Complete(WizardAuthoringOutcome::Point(point))
+                }
+                MacroCaptureSelection::TemplateCrop {
+                    region: _,
+                    screen_rect,
+                } => {
+                    let capture = XcapRegionCapture;
+                    let captured = RegionCapture::capture_region(&capture, screen_rect)?;
+                    require_stable_authoring_client(
+                        target,
+                        target_binding
+                            .as_ref()
+                            .expect("target binding checked above")
+                            .validate_client_rect()?,
+                    )?;
+                    let mut bytes = Vec::new();
+                    DynamicImage::ImageRgba8(captured.rgba)
+                        .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
+                    let previous = match &wizard.detector {
+                        WizardDetector::Image { template } if template.revision > 0 => {
+                            Some(template.clone())
+                        }
+                        _ => None,
+                    };
+                    NativeWizardAuthoringOutcome::CapturedTemplate(PendingTemplateCapture {
+                        bytes,
+                        previous,
+                    })
                 }
             };
-        }
-
-        let capture_kind = match request.kind {
-            WizardAuthoringKind::CaptureTextRegion => MacroCaptureKind::TextRegion,
-            WizardAuthoringKind::CaptureImageRegion => MacroCaptureKind::ImageSearchRegion,
-            WizardAuthoringKind::CaptureTemplate => MacroCaptureKind::TemplateCrop,
-            WizardAuthoringKind::CaptureClickPoint => MacroCaptureKind::ClickPoint,
-            WizardAuthoringKind::CaptureClickRegion => MacroCaptureKind::ClickRegion,
-            WizardAuthoringKind::CaptureTarget
-            | WizardAuthoringKind::TestDetector
-            | WizardAuthoringKind::CaptureImageNegative => unreachable!(),
+            Ok((outcome, None))
         };
-        let response = select_macro_capture(MacroCaptureRequest {
-            id: CaptureRequestId(request.id.0),
-            kind: capture_kind,
-            target_client: target,
-            min_size: if capture_kind == MacroCaptureKind::ClickPoint {
-                1
-            } else {
-                4
-            },
-        })?;
-        require_stable_authoring_client(
-            target,
-            target_binding
-                .as_ref()
-                .expect("target binding checked above")
-                .refresh_client_rect()?,
-        )?;
-        let outcome = match response.selection {
-            MacroCaptureSelection::Region(rect) => WizardAuthoringOutcome::Region(rect),
-            MacroCaptureSelection::Point(point) => WizardAuthoringOutcome::Point(point),
-            MacroCaptureSelection::TemplateCrop {
-                region: _,
-                screen_rect,
-            } => {
-                let store = assets
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
-                let capture = XcapRegionCapture;
-                let captured = RegionCapture::capture_region(&capture, screen_rect)?;
-                require_stable_authoring_client(
-                    target,
-                    target_binding
-                        .as_ref()
-                        .expect("target binding checked above")
-                        .refresh_client_rect()?,
-                )?;
-                let mut bytes = Vec::new();
-                DynamicImage::ImageRgba8(captured.rgba)
-                    .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
-                let asset = match &wizard.detector {
-                    WizardDetector::Image { template } if template.revision > 0 => {
-                        store.put_next_png_revision(template, &bytes)?
-                    }
-                    _ => store.put_png(&bytes)?,
-                };
-                WizardAuthoringOutcome::Template { asset }
-            }
-        };
-        Ok((outcome, None))
-    };
 
     match run() {
         Ok(result) => result,
-        Err(error) if error.to_string().to_ascii_lowercase().contains("cancel") => {
-            (WizardAuthoringOutcome::Cancelled, None)
-        }
-        Err(error) => (WizardAuthoringOutcome::Failed(error.to_string()), None),
+        Err(error) if error.to_string().to_ascii_lowercase().contains("cancel") => (
+            NativeWizardAuthoringOutcome::Complete(WizardAuthoringOutcome::Cancelled),
+            None,
+        ),
+        Err(error) => (
+            NativeWizardAuthoringOutcome::Complete(WizardAuthoringOutcome::Failed(
+                error.to_string(),
+            )),
+            None,
+        ),
     }
 }
 
@@ -1762,14 +1949,14 @@ fn run_editor_authoring_request(
     draft: &EditorDraft,
     target_binding: Option<CapturedTargetBinding>,
     assets: Option<AssetStore>,
-) -> EditorAuthoringOutcome {
-    let run = || -> anyhow::Result<EditorAuthoringOutcome> {
+) -> NativeEditorAuthoringOutcome {
+    let run = || -> anyhow::Result<NativeEditorAuthoringOutcome> {
         let target = target_binding
             .as_ref()
             .ok_or_else(|| {
                 anyhow::anyhow!("capture a concrete target for this authoring session first")
             })?
-            .refresh_client_rect()?;
+            .prepare_client_rect()?;
         match &request.kind {
             EditorAuthoringKind::RecaptureRegion { region_id } => {
                 let kind = if draft
@@ -1792,12 +1979,14 @@ fn run_editor_authoring_request(
                     target_binding
                         .as_ref()
                         .expect("target binding checked above")
-                        .refresh_client_rect()?,
+                        .validate_client_rect()?,
                 )?;
                 let MacroCaptureSelection::Region(rect) = response.selection else {
                     anyhow::bail!("region capture returned the wrong result type")
                 };
-                Ok(EditorAuthoringOutcome::Region(rect))
+                Ok(NativeEditorAuthoringOutcome::Complete(
+                    EditorAuthoringOutcome::Region(rect),
+                ))
             }
             EditorAuthoringKind::RecaptureTemplate { rule_id } => {
                 let rule = draft
@@ -1816,7 +2005,7 @@ fn run_editor_authoring_request(
                     target_binding
                         .as_ref()
                         .expect("target binding checked above")
-                        .refresh_client_rect()?,
+                        .validate_client_rect()?,
                 )?;
                 let MacroCaptureSelection::TemplateCrop { screen_rect, .. } = response.selection
                 else {
@@ -1828,16 +2017,17 @@ fn run_editor_authoring_request(
                     target_binding
                         .as_ref()
                         .expect("target binding checked above")
-                        .refresh_client_rect()?,
+                        .validate_client_rect()?,
                 )?;
                 let mut bytes = Vec::new();
                 DynamicImage::ImageRgba8(captured.rgba)
                     .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
-                let store = assets
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
-                let asset = store.put_next_png_revision(&rule.template, &bytes)?;
-                Ok(EditorAuthoringOutcome::Template { asset })
+                Ok(NativeEditorAuthoringOutcome::CapturedTemplate(
+                    PendingTemplateCapture {
+                        bytes,
+                        previous: Some(rule.template.clone()),
+                    },
+                ))
             }
             EditorAuthoringKind::TestOcr { block_id } => {
                 let condition = find_editor_condition(&draft.blocks, block_id)
@@ -1863,7 +2053,7 @@ fn run_editor_authoring_request(
                     target_binding
                         .as_ref()
                         .expect("target binding checked above")
-                        .refresh_client_rect()?,
+                        .validate_client_rect()?,
                 )?;
                 let tested = authoring_test_text_rule(&image, capture_rect, rule)?;
                 let evidence = tested
@@ -1872,13 +2062,15 @@ fn run_editor_authoring_request(
                     .map(|word| word.text.as_str())
                     .collect::<Vec<_>>()
                     .join(" ");
-                Ok(EditorAuthoringOutcome::DetectorTest {
-                    passed: tested.text_match.matched,
-                    evidence,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                    rule_id: None,
-                    image_verification: None,
-                })
+                Ok(NativeEditorAuthoringOutcome::Complete(
+                    EditorAuthoringOutcome::DetectorTest {
+                        passed: tested.text_match.matched,
+                        evidence,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                        rule_id: None,
+                        image_verification: None,
+                    },
+                ))
             }
             EditorAuthoringKind::TestImage { block_id }
             | EditorAuthoringKind::CaptureImageNegative { block_id } => {
@@ -1920,7 +2112,7 @@ fn run_editor_authoring_request(
                     target_binding
                         .as_ref()
                         .expect("target binding checked above")
-                        .refresh_client_rect()?,
+                        .validate_client_rect()?,
                 )?;
                 let (result, selected) =
                     match_authoring_image(&image, capture_rect, &template, mask.as_ref(), rule)?;
@@ -1935,20 +2127,22 @@ fn run_editor_authoring_request(
                     let mut png = Vec::new();
                     DynamicImage::ImageRgba8(image.rgba.clone())
                         .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)?;
-                    return Ok(EditorAuthoringOutcome::ImageNegativeSample {
-                        block_id: block_id.clone(),
-                        sample: NegativeCorpusSample {
-                            stable_id: format!("editor/{}/negative/{}", block_id, request.id.0),
-                            content_sha256: format!("{:x}", Sha256::digest(&png)),
-                            measured_score: result.best.score,
-                            evaluation: NegativeSampleEvaluationInputs::for_rule(
-                                rule,
-                                draft.target.captured_dpi,
-                                region.revision,
-                                (capture_rect.width, capture_rect.height),
-                            ),
+                    return Ok(NativeEditorAuthoringOutcome::Complete(
+                        EditorAuthoringOutcome::ImageNegativeSample {
+                            block_id: block_id.clone(),
+                            sample: NegativeCorpusSample {
+                                stable_id: format!("editor/{}/negative/{}", block_id, request.id.0),
+                                content_sha256: format!("{:x}", Sha256::digest(&png)),
+                                measured_score: result.best.score,
+                                evaluation: NegativeSampleEvaluationInputs::for_rule(
+                                    rule,
+                                    draft.target.captured_dpi,
+                                    region.revision,
+                                    (capture_rect.width, capture_rect.height),
+                                ),
+                            },
                         },
-                    });
+                    ));
                 }
                 let verification = if selected.matched && !request.image_negative_samples.is_empty()
                 {
@@ -1970,34 +2164,38 @@ fn run_editor_authoring_request(
                 } else {
                     None
                 };
-                Ok(EditorAuthoringOutcome::DetectorTest {
-                    passed: selected.matched && verification.is_some(),
-                    evidence: format!(
-                        "best {:.3}; {} candidate(s), {} cluster(s); {}",
-                        result.best.score,
-                        result.candidates.len(),
-                        selected.clusters.len(),
-                        if verification.is_some() {
-                            "local verification passed"
-                        } else if !selected.matched {
-                            "configured image selection policy did not select a match"
-                        } else {
-                            "capture a negative frame"
-                        }
-                    ),
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                    rule_id: Some(rule.id.clone()),
-                    image_verification: verification,
-                })
+                Ok(NativeEditorAuthoringOutcome::Complete(
+                    EditorAuthoringOutcome::DetectorTest {
+                        passed: selected.matched && verification.is_some(),
+                        evidence: format!(
+                            "best {:.3}; {} candidate(s), {} cluster(s); {}",
+                            result.best.score,
+                            result.candidates.len(),
+                            selected.clusters.len(),
+                            if verification.is_some() {
+                                "local verification passed"
+                            } else if !selected.matched {
+                                "configured image selection policy did not select a match"
+                            } else {
+                                "capture a negative frame"
+                            }
+                        ),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                        rule_id: Some(rule.id.clone()),
+                        image_verification: verification,
+                    },
+                ))
             }
         }
     };
     match run() {
         Ok(outcome) => outcome,
         Err(error) if error.to_string().to_ascii_lowercase().contains("cancel") => {
-            EditorAuthoringOutcome::Cancelled
+            NativeEditorAuthoringOutcome::Complete(EditorAuthoringOutcome::Cancelled)
         }
-        Err(error) => EditorAuthoringOutcome::Failed(error.to_string()),
+        Err(error) => NativeEditorAuthoringOutcome::Complete(EditorAuthoringOutcome::Failed(
+            error.to_string(),
+        )),
     }
 }
 
@@ -2196,6 +2394,98 @@ mod routing_tests {
         let error =
             require_stable_authoring_client(before, Rect::new(11, 20, 800, 600)).unwrap_err();
         assert!(error.to_string().contains("moved while"));
+    }
+
+    #[test]
+    fn stale_template_events_publish_neither_initial_identity_nor_successor() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let assets = store.assets();
+
+        assert!(
+            publish_pending_template_if_current(
+                false,
+                Some(assets),
+                PendingTemplateCapture {
+                    bytes: b"initial".to_vec(),
+                    previous: None,
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+        let initial = assets.put_png(b"initial").unwrap();
+        assert!(initial.id.ends_with("-1"));
+
+        assert!(
+            publish_pending_template_if_current(
+                false,
+                Some(assets),
+                PendingTemplateCapture {
+                    bytes: b"stale successor".to_vec(),
+                    previous: Some(initial.clone()),
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+        let successor = assets
+            .put_next_png_revision(&initial, b"accepted successor")
+            .unwrap();
+        assert_eq!(successor.revision, 2);
+    }
+
+    #[test]
+    fn durable_binding_profile_rejects_wrong_window_size_dpi_or_identity() {
+        let captured = CapturedTargetProfile {
+            process_path: r#"C:\games\Diablo IV.exe"#.into(),
+            window_class: "Diablo IV Main Window".into(),
+            title: "Diablo IV".into(),
+            client_rect: Rect::new(10, 20, 800, 600),
+            dpi: 144,
+        };
+        let target = TargetProfile {
+            process_path: r#"C:\games\Diablo IV.exe"#.into(),
+            window_class: "Diablo IV Main Window".into(),
+            title_contains: "Diablo IV".into(),
+            captured_client_width: 800,
+            captured_client_height: 600,
+            captured_dpi: 144,
+        };
+        assert!(captured_profile_matches_target(&captured, &target));
+
+        let mut wrong = target.clone();
+        wrong.captured_dpi = 96;
+        assert!(!captured_profile_matches_target(&captured, &wrong));
+        wrong = target.clone();
+        wrong.captured_client_width += 1;
+        assert!(!captured_profile_matches_target(&captured, &wrong));
+        wrong = target;
+        wrong.process_path = r#"C:\games\Other.exe"#.into();
+        assert!(!captured_profile_matches_target(&captured, &wrong));
+    }
+
+    #[test]
+    fn authoring_target_routing_never_falls_back_to_another_session() {
+        let draft_a = AuthoringSessionId(10);
+        let wizard_b = AuthoringSessionId(20);
+        let mut targets = HashMap::from([(draft_a, "draft-a"), (wizard_b, "wizard-b")]);
+
+        assert_eq!(
+            authoring_target_for_session(&targets, draft_a, |_| true),
+            Some(&"draft-a")
+        );
+        assert_eq!(
+            authoring_target_for_session(&targets, wizard_b, |_| true),
+            Some(&"wizard-b")
+        );
+        assert!(authoring_target_for_session(&targets, AuthoringSessionId(30), |_| true).is_none());
+        assert!(authoring_target_for_session(&targets, draft_a, |_| false).is_none());
+
+        prune_authoring_targets(&mut targets, &[draft_a]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets.get(&draft_a), Some(&"draft-a"));
+        assert!(!targets.contains_key(&wizard_b));
     }
 
     #[test]

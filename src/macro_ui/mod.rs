@@ -93,7 +93,8 @@ pub struct MacroPageState {
     pub active_wizard_request: Option<wizard::WizardAuthoringRequest>,
     wizard_request_dispatched: bool,
     next_wizard_request_id: u64,
-    authoring_session: wizard::AuthoringSessionId,
+    wizard_session: Option<wizard::AuthoringSessionId>,
+    draft_session: Option<wizard::AuthoringSessionId>,
     next_authoring_session_id: u64,
     pub active_editor_authoring_request: Option<EditorAuthoringRequest>,
     editor_authoring_dispatched: bool,
@@ -120,7 +121,8 @@ impl Default for MacroPageState {
             active_wizard_request: None,
             wizard_request_dispatched: false,
             next_wizard_request_id: 1,
-            authoring_session: wizard::AuthoringSessionId(0),
+            wizard_session: None,
+            draft_session: None,
             next_authoring_session_id: 1,
             active_editor_authoring_request: None,
             editor_authoring_dispatched: false,
@@ -131,10 +133,22 @@ impl Default for MacroPageState {
 }
 
 impl MacroPageState {
-    fn begin_authoring_session(&mut self) {
-        self.authoring_session = wizard::AuthoringSessionId(self.next_authoring_session_id);
+    fn allocate_authoring_session(&mut self) -> wizard::AuthoringSessionId {
+        let session = wizard::AuthoringSessionId(self.next_authoring_session_id);
         self.next_authoring_session_id = self.next_authoring_session_id.saturating_add(1);
+        session
+    }
+
+    fn begin_wizard_session(&mut self) {
+        self.wizard_session = Some(self.allocate_authoring_session());
         self.cancel_wizard_authoring();
+        self.active_editor_authoring_request = None;
+        self.editor_authoring_dispatched = false;
+        self.pending_inspector_intent = None;
+    }
+
+    fn begin_draft_session(&mut self) {
+        self.draft_session = Some(self.allocate_authoring_session());
         self.active_editor_authoring_request = None;
         self.editor_authoring_dispatched = false;
     }
@@ -143,6 +157,93 @@ impl MacroPageState {
         self.active_wizard_request = None;
         self.wizard_request_dispatched = false;
         self.pending_wizard_action = None;
+    }
+
+    pub fn active_wizard_session(&self) -> Option<wizard::AuthoringSessionId> {
+        self.wizard.as_ref().and(self.wizard_session)
+    }
+
+    pub fn active_draft_session(&self) -> Option<wizard::AuthoringSessionId> {
+        self.draft.as_ref().and(self.draft_session)
+    }
+
+    pub fn active_authoring_sessions(&self) -> Vec<wizard::AuthoringSessionId> {
+        [self.active_wizard_session(), self.active_draft_session()]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    pub fn target_profile_for_session(
+        &self,
+        session: wizard::AuthoringSessionId,
+    ) -> Option<&crate::engine::macro_engine::TargetProfile> {
+        if self.active_wizard_session() == Some(session) {
+            return self.wizard.as_ref().map(|wizard| &wizard.target);
+        }
+        (self.active_draft_session() == Some(session))
+            .then(|| self.draft.as_ref().map(|draft| &draft.definition.target))
+            .flatten()
+    }
+
+    pub fn wizard_request_envelope_is_current(
+        &self,
+        request: &wizard::WizardAuthoringRequest,
+        expected_kind: wizard::WizardAuthoringKind,
+    ) -> bool {
+        self.active_wizard_session() == Some(request.session)
+            && request.kind == expected_kind
+            && self.active_wizard_request.as_ref() == Some(request)
+            && self
+                .wizard
+                .as_ref()
+                .is_some_and(|wizard| wizard.review_fingerprint() == request.fingerprint)
+    }
+
+    pub fn discard_wizard_result_envelope(
+        &mut self,
+        request: &wizard::WizardAuthoringRequest,
+    ) -> bool {
+        if self.active_wizard_request.as_ref() != Some(request) {
+            return false;
+        }
+        self.cancel_wizard_authoring();
+        true
+    }
+
+    pub fn editor_request_envelope_is_current(
+        &self,
+        request: &EditorAuthoringRequest,
+        expected_kind: &EditorAuthoringKind,
+    ) -> bool {
+        self.active_draft_session() == Some(request.session)
+            && &request.kind == expected_kind
+            && self.active_editor_authoring_request.as_ref() == Some(request)
+            && self
+                .draft
+                .as_ref()
+                .is_some_and(|draft| editor_authoring_fingerprint(draft) == request.fingerprint)
+    }
+
+    pub fn discard_editor_result_envelope(&mut self, request: &EditorAuthoringRequest) -> bool {
+        if self.active_editor_authoring_request.as_ref() != Some(request) {
+            return false;
+        }
+        self.active_editor_authoring_request = None;
+        self.editor_authoring_dispatched = false;
+        self.pending_inspector_intent = None;
+        true
+    }
+
+    fn editor_mutations_allowed(&self) -> bool {
+        self.wizard.is_none()
+            && self.active_wizard_request.is_none()
+            && self.running_snapshot.is_none()
+            && self.active_editor_authoring_request.is_none()
+            && self
+                .draft
+                .as_ref()
+                .is_some_and(|draft| matches!(draft.editability, DraftEditability::Editable))
     }
 
     pub fn take_wizard_request(&mut self) -> Option<wizard::WizardAuthoringRequest> {
@@ -162,7 +263,7 @@ impl MacroPageState {
         let Some(request) = self.active_wizard_request.as_ref() else {
             return Err(wizard::WizardResultError::UnexpectedResult);
         };
-        if request.session != self.authoring_session
+        if Some(request.session) != self.wizard_session
             || result.session != request.session
             || request.id != result.id
             || request.fingerprint != result.fingerprint
@@ -297,7 +398,7 @@ impl MacroPageState {
         let Some(request) = self.active_editor_authoring_request.as_ref() else {
             return Err(EditorAuthoringError::UnexpectedResult);
         };
-        if request.session != self.authoring_session
+        if Some(request.session) != self.draft_session
             || result.session != request.session
             || request.id != result.id
             || request.fingerprint != result.fingerprint
@@ -425,7 +526,9 @@ impl MacroPageState {
                 if effective_passed {
                     draft.clear_detector_test_failure(&block_id);
                 } else {
-                    draft.record_detector_test_failure(&block_id, evidence.clone());
+                    let fingerprint = detector_fingerprint_for_block(&draft.definition, &block_id)
+                        .ok_or(EditorAuthoringError::OutcomeMismatch)?;
+                    draft.record_detector_test_failure(&block_id, fingerprint, evidence.clone());
                 }
                 self.editor_feedback = Some(format!(
                     "Detector test {} in {elapsed_ms} ms: {evidence}",
@@ -449,11 +552,18 @@ impl MacroPageState {
             }
             (kind, EditorAuthoringOutcome::Failed(message)) => {
                 match kind {
-                    EditorAuthoringKind::TestOcr { block_id } => self
-                        .draft
-                        .as_mut()
-                        .unwrap()
-                        .record_detector_test_failure(block_id, message.clone()),
+                    EditorAuthoringKind::TestOcr { block_id } => {
+                        let fingerprint = detector_fingerprint_for_block(
+                            &self.draft.as_ref().unwrap().definition,
+                            &block_id,
+                        )
+                        .ok_or(EditorAuthoringError::OutcomeMismatch)?;
+                        self.draft.as_mut().unwrap().record_detector_test_failure(
+                            block_id,
+                            fingerprint,
+                            message.clone(),
+                        );
+                    }
                     EditorAuthoringKind::TestImage { block_id } => {
                         let rule_id = match condition_for_block(
                             &self.draft.as_ref().unwrap().definition,
@@ -470,10 +580,16 @@ impl MacroPageState {
                                 EditorCommand::ClearImageVerification { rule_id },
                             );
                         }
-                        self.draft
-                            .as_mut()
-                            .unwrap()
-                            .record_detector_test_failure(block_id, message.clone());
+                        let fingerprint = detector_fingerprint_for_block(
+                            &self.draft.as_ref().unwrap().definition,
+                            &block_id,
+                        )
+                        .ok_or(EditorAuthoringError::OutcomeMismatch)?;
+                        self.draft.as_mut().unwrap().record_detector_test_failure(
+                            block_id,
+                            fingerprint,
+                            message.clone(),
+                        );
                     }
                     _ => {}
                 }
@@ -500,6 +616,17 @@ fn editor_authoring_fingerprint(draft: &EditorDraft) -> String {
 }
 
 fn begin_editor_authoring(state: &mut MacroPageState, kind: EditorAuthoringKind) {
+    if state.wizard.is_some() {
+        state.editor_feedback = Some("Close the guided wizard before detector authoring.".into());
+        return;
+    }
+    if state.active_editor_authoring_request.is_some() {
+        state.editor_feedback = Some("Wait for the current detector request to finish.".into());
+        return;
+    }
+    if state.draft_session.is_none() && state.draft.is_some() {
+        state.begin_draft_session();
+    }
     let Some(draft) = state.draft.as_ref() else {
         state.editor_feedback = Some("No draft is available for detector authoring.".into());
         return;
@@ -517,7 +644,9 @@ fn begin_editor_authoring(state: &mut MacroPageState, kind: EditorAuthoringKind)
         _ => Vec::new(),
     };
     state.active_editor_authoring_request = Some(EditorAuthoringRequest {
-        session: state.authoring_session,
+        session: state
+            .draft_session
+            .expect("draft session exists with draft"),
         id,
         fingerprint: editor_authoring_fingerprint(draft),
         kind,
@@ -654,7 +783,12 @@ fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAc
                 .blocks
                 .first()
                 .map(|block| block.id.clone());
+            let generated_session = state
+                .wizard_session
+                .take()
+                .unwrap_or_else(|| state.allocate_authoring_session());
             state.draft = Some(EditorDraft::new(output.definition));
+            state.draft_session = Some(generated_session);
             state.saved_revision = None;
             state.selected_block_id = selected.clone();
             state.selected_timeline = selected.map(TimelineSelection::Identity);
@@ -665,6 +799,9 @@ fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAc
             );
         }
         request => {
+            if state.wizard_session.is_none() && state.wizard.is_some() {
+                state.begin_wizard_session();
+            }
             let kind = match request {
                 wizard::WizardUiAction::CaptureTarget => wizard::WizardAuthoringKind::CaptureTarget,
                 wizard::WizardUiAction::CaptureRegion(wizard::WizardDetectorKind::Text) => {
@@ -694,7 +831,9 @@ fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAc
             let id = wizard::WizardRequestId(state.next_wizard_request_id);
             state.next_wizard_request_id = state.next_wizard_request_id.saturating_add(1);
             state.active_wizard_request = Some(wizard::WizardAuthoringRequest {
-                session: state.authoring_session,
+                session: state
+                    .wizard_session
+                    .expect("wizard session exists with wizard"),
                 id,
                 fingerprint: wizard_state.review_fingerprint(),
                 kind,
@@ -799,8 +938,15 @@ fn status_strip(
             });
             ui.add_space(9.0);
             ui.horizontal_wrapped(|ui| {
-                if state.draft.is_none() && ui.button("Create starter draft").clicked() {
-                    state.begin_authoring_session();
+                if state.draft.is_none()
+                    && ui
+                        .add_enabled(
+                            state.wizard.is_none() && state.active_wizard_request.is_none(),
+                            Button::new("Create starter draft"),
+                        )
+                        .clicked()
+                {
+                    state.begin_draft_session();
                     state.draft = Some(EditorDraft::new(starter_macro_definition()));
                     state.selected_block_id = Some("observe-1".into());
                     state.selected_timeline = Some(TimelineSelection::Identity("observe-1".into()));
@@ -810,10 +956,13 @@ fn status_strip(
                 let wizard_pending = state.active_wizard_request.is_some();
                 if state.wizard.is_none()
                     && ui
-                        .add_enabled(!wizard_pending, Button::new("Guided wizard"))
+                        .add_enabled(
+                            !wizard_pending && state.active_editor_authoring_request.is_none(),
+                            Button::new("Guided wizard"),
+                        )
                         .clicked()
                 {
-                    state.begin_authoring_session();
+                    state.begin_wizard_session();
                     state.wizard = Some(wizard::WizardState::default());
                 } else if state.wizard.is_some()
                     && ui
@@ -821,12 +970,10 @@ fn status_strip(
                         .clicked()
                 {
                     state.wizard = None;
+                    state.wizard_session = None;
                     state.cancel_wizard_authoring();
                 }
-                let can_edit = state
-                    .draft
-                    .as_ref()
-                    .is_some_and(|draft| matches!(draft.editability, DraftEditability::Editable));
+                let can_edit = state.editor_mutations_allowed();
                 if ui.add_enabled(can_edit, Button::new("Validate")).clicked() {
                     let _ = dispatch_editor_command(state, EditorCommand::MarkValidated);
                 }
@@ -977,7 +1124,7 @@ fn workspace(
             selected.map(|id| inspector::project_inspector(definition, id, problems))
         })
         .unwrap_or(inspector::InspectorProjection::Empty);
-    let editable = state.running_snapshot.is_none();
+    let editable = state.editor_mutations_allowed();
     if ui.available_width() >= 900.0 {
         ui.columns(3, |columns| {
             section(&mut columns[0], "LIBRARY", |ui| {
@@ -1040,6 +1187,11 @@ fn dispatch_editor_command(
     state: &mut MacroPageState,
     command: EditorCommand,
 ) -> Result<EditOutcome, EditorError> {
+    if !state.editor_mutations_allowed() {
+        state.editor_feedback =
+            Some("Edit rejected: RunInProgress (finish pending authoring first).".into());
+        return Err(EditorError::RunInProgress);
+    }
     let clears_image_samples = matches!(&command, EditorCommand::ReplaceImageRule { .. });
     let result = state
         .draft
@@ -1059,6 +1211,10 @@ fn dispatch_editor_command(
 }
 
 fn handle_inspector_intent(state: &mut MacroPageState, intent: inspector::InspectorIntent) {
+    if state.wizard.is_some() {
+        state.editor_feedback = Some("Close the guided wizard before editing this draft.".into());
+        return;
+    }
     match &intent {
         inspector::InspectorIntent::TestOcr { block_id } => {
             begin_editor_authoring(
@@ -1177,10 +1333,7 @@ fn inspector_editor_command(
 }
 
 fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
-    let editable = state
-        .draft
-        .as_ref()
-        .is_some_and(|draft| matches!(draft.editability, DraftEditability::Editable));
+    let editable = state.editor_mutations_allowed();
     let selected = state.selected_block_id.clone();
     let selected_timeline = current_timeline_selection(state);
     if let Some(feedback) = &state.editor_feedback {
@@ -3351,16 +3504,17 @@ mod tests {
     #[test]
     fn wizard_session_rejects_results_after_close_reopen_and_finish_cancels_pending() {
         let mut state = MacroPageState::default();
-        state.begin_authoring_session();
+        state.begin_wizard_session();
         state.wizard = Some(wizard::WizardState::default());
         apply_wizard_ui_action(&mut state, wizard::WizardUiAction::CaptureTarget);
         let old = state.take_wizard_request().unwrap();
 
         state.wizard = None;
+        state.wizard_session = None;
         state.cancel_wizard_authoring();
-        state.begin_authoring_session();
+        state.begin_wizard_session();
         state.wizard = Some(wizard::WizardState::default());
-        assert_ne!(state.authoring_session, old.session);
+        assert_ne!(state.active_wizard_session(), Some(old.session));
         assert_eq!(
             state.apply_wizard_result(wizard::WizardAuthoringResult {
                 session: old.session,
@@ -3386,6 +3540,124 @@ mod tests {
         apply_wizard_ui_action(&mut state, wizard::WizardUiAction::Finish(output));
         assert!(state.active_wizard_request.is_none());
         assert!(state.wizard.is_none());
+    }
+
+    #[test]
+    fn wizard_session_isolated_from_existing_draft_and_finish_transfers_ownership() {
+        let original = EditorDraft::new(starter_macro_definition());
+        let mut state = MacroPageState {
+            draft: Some(original.clone()),
+            ..MacroPageState::default()
+        };
+        state.begin_draft_session();
+        let original_session = state.active_draft_session().unwrap();
+
+        state.begin_wizard_session();
+        state.wizard = Some(wizard::WizardState::default());
+        let wizard_session = state.active_wizard_session().unwrap();
+        assert_ne!(wizard_session, original_session);
+        assert_eq!(state.active_draft_session(), Some(original_session));
+        assert_eq!(state.draft.as_ref(), Some(&original));
+        assert_eq!(
+            dispatch_editor_command(&mut state, EditorCommand::MarkValidated),
+            Err(EditorError::RunInProgress)
+        );
+        handle_inspector_intent(
+            &mut state,
+            inspector::InspectorIntent::TestOcr {
+                block_id: "observe-1".into(),
+            },
+        );
+        assert!(state.active_editor_authoring_request.is_none());
+
+        state.wizard = None;
+        state.wizard_session = None;
+        state.cancel_wizard_authoring();
+        assert_eq!(state.active_draft_session(), Some(original_session));
+        assert_eq!(state.draft.as_ref(), Some(&original));
+
+        state.begin_wizard_session();
+        let mut completed = wizard::WizardState::default();
+        completed.step = wizard::WizardStep::Finish;
+        completed.target_bound = true;
+        completed.target_generation = 1;
+        completed.region_capture_generation = Some(1);
+        completed.text_expected = "Ancestral".into();
+        completed.record_detector_test(true, "matched", 1);
+        completed.mark_dry_run_reviewed();
+        let output = completed.finish().unwrap();
+        state.wizard = Some(completed);
+        let generated_session = state.active_wizard_session().unwrap();
+        apply_wizard_ui_action(&mut state, wizard::WizardUiAction::Finish(output));
+        assert_eq!(state.active_draft_session(), Some(generated_session));
+        assert_ne!(state.active_draft_session(), Some(original_session));
+    }
+
+    #[test]
+    fn request_envelopes_are_read_only_stale_safe_and_exact_discard_preserves_newer() {
+        let mut state = MacroPageState::default();
+        state.begin_wizard_session();
+        state.wizard = Some(wizard::WizardState::default());
+        apply_wizard_ui_action(&mut state, wizard::WizardUiAction::CaptureTarget);
+        let old_wizard = state.take_wizard_request().unwrap();
+        assert!(state.wizard_request_envelope_is_current(
+            &old_wizard,
+            wizard::WizardAuthoringKind::CaptureTarget
+        ));
+        state.wizard.as_mut().unwrap().text_expected = "edited".into();
+        assert!(!state.wizard_request_envelope_is_current(
+            &old_wizard,
+            wizard::WizardAuthoringKind::CaptureTarget
+        ));
+        assert!(state.discard_wizard_result_envelope(&old_wizard));
+        apply_wizard_ui_action(&mut state, wizard::WizardUiAction::CaptureTarget);
+        let newer_wizard = state.active_wizard_request.clone().unwrap();
+        assert!(!state.discard_wizard_result_envelope(&old_wizard));
+        assert_eq!(state.active_wizard_request.as_ref(), Some(&newer_wizard));
+        state.wizard = None;
+        state.wizard_session = None;
+        assert!(!state.wizard_request_envelope_is_current(
+            &newer_wizard,
+            wizard::WizardAuthoringKind::CaptureTarget
+        ));
+
+        let mut state = MacroPageState {
+            draft: Some(EditorDraft::new(starter_macro_definition())),
+            ..MacroPageState::default()
+        };
+        state.begin_draft_session();
+        let kind = EditorAuthoringKind::TestOcr {
+            block_id: "observe-1".into(),
+        };
+        begin_editor_authoring(&mut state, kind.clone());
+        let old_editor = state.take_editor_authoring_request().unwrap();
+        assert!(state.editor_request_envelope_is_current(&old_editor, &kind));
+        apply_editor_command(
+            state.draft.as_mut().unwrap(),
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+                block: Block {
+                    id: "edited".into(),
+                    enabled: true,
+                    kind: BlockKind::Comment {
+                        text: "stale request".into(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        assert!(!state.editor_request_envelope_is_current(&old_editor, &kind));
+        assert!(state.discard_editor_result_envelope(&old_editor));
+        begin_editor_authoring(&mut state, kind.clone());
+        let newer_editor = state.active_editor_authoring_request.clone().unwrap();
+        assert!(!state.discard_editor_result_envelope(&old_editor));
+        assert_eq!(
+            state.active_editor_authoring_request.as_ref(),
+            Some(&newer_editor)
+        );
     }
 
     #[test]
@@ -3498,7 +3770,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_ocr_test_is_revision_bound_and_blocks_validation_until_success() {
+    fn failed_ocr_test_tracks_detector_fingerprint_until_success_or_detector_edit() {
         let mut state = MacroPageState {
             draft: Some(EditorDraft::new(starter_macro_definition())),
             ..MacroPageState::default()
@@ -3534,6 +3806,33 @@ mod tests {
             Err(EditorError::ValidationFailed)
         );
 
+        apply_editor_command(
+            state.draft.as_mut().unwrap(),
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+                block: Block {
+                    id: "unrelated-comment".into(),
+                    enabled: true,
+                    kind: BlockKind::Comment {
+                        text: "does not change OCR".into(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
+        assert_eq!(
+            apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,),
+            Err(EditorError::ValidationFailed)
+        );
+
         handle_inspector_intent(
             &mut state,
             inspector::InspectorIntent::TestOcr {
@@ -3555,6 +3854,44 @@ mod tests {
                 },
             })
             .unwrap();
+        assert!(
+            !editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
+        assert!(
+            apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,)
+                .is_ok()
+        );
+
+        handle_inspector_intent(
+            &mut state,
+            inspector::InspectorIntent::TestOcr {
+                block_id: "observe-1".into(),
+            },
+        );
+        let failed_again = state.take_editor_authoring_request().unwrap();
+        state
+            .apply_editor_authoring_result(EditorAuthoringResult {
+                session: failed_again.session,
+                id: failed_again.id,
+                fingerprint: failed_again.fingerprint,
+                outcome: EditorAuthoringOutcome::DetectorTest {
+                    passed: false,
+                    evidence: "expected text not found".into(),
+                    elapsed_ms: 5,
+                    rule_id: None,
+                    image_verification: None,
+                },
+            })
+            .unwrap();
+        let mut edited_rule = state.draft.as_ref().unwrap().text_rules[0].clone();
+        edited_rule.expected = "different detector input".into();
+        apply_editor_command(
+            state.draft.as_mut().unwrap(),
+            EditorCommand::ReplaceTextRule { rule: edited_rule },
+        )
+        .unwrap();
         assert!(
             !editor_validation_problems(state.draft.as_ref().unwrap())
                 .iter()

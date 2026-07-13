@@ -40,7 +40,7 @@ pub struct EditorDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DetectorTestFailure {
-    definition_revision: u64,
+    detector_fingerprint: String,
     message: String,
 }
 
@@ -78,12 +78,13 @@ impl EditorDraft {
     pub fn record_detector_test_failure(
         &mut self,
         block_id: impl Into<String>,
+        detector_fingerprint: impl Into<String>,
         message: impl Into<String>,
     ) {
         self.detector_test_failures.insert(
             block_id.into(),
             DetectorTestFailure {
-                definition_revision: self.definition.revision,
+                detector_fingerprint: detector_fingerprint.into(),
                 message: message.into(),
             },
         );
@@ -96,8 +97,19 @@ impl EditorDraft {
 
     fn has_current_detector_test_failure(&self) -> bool {
         self.detector_test_failures
-            .values()
-            .any(|failure| failure.definition_revision == self.definition.revision)
+            .iter()
+            .any(|(block_id, failure)| {
+                detector_fingerprint_for_block(&self.definition, block_id).as_deref()
+                    == Some(failure.detector_fingerprint.as_str())
+            })
+    }
+
+    fn prune_superseded_detector_test_failures(&mut self) {
+        let definition = &self.definition;
+        self.detector_test_failures.retain(|block_id, failure| {
+            detector_fingerprint_for_block(definition, block_id).as_deref()
+                == Some(failure.detector_fingerprint.as_str())
+        });
     }
 }
 
@@ -445,6 +457,7 @@ pub fn apply_editor_command(
         draft.definition = previous.definition;
         draft.definition.revision = revision;
         draft.invalidated_source_ids = previous.invalidated_source_ids;
+        draft.prune_superseded_detector_test_failures();
         draft.status = DraftStatus::NeedsValidation;
         return Ok(EditOutcome::Changed);
     }
@@ -474,6 +487,7 @@ pub fn apply_editor_command(
     draft.undo.push_back(before);
     draft.definition = candidate;
     draft.invalidated_source_ids = invalidated;
+    draft.prune_superseded_detector_test_failures();
     draft.status = DraftStatus::NeedsValidation;
     Ok(EditOutcome::Changed)
 }
@@ -511,12 +525,12 @@ pub fn editor_validation_problems(draft: &EditorDraft) -> Vec<ValidationProblem>
             .detector_test_failures
             .iter()
             .filter_map(|(block_id, failure)| {
-                (failure.definition_revision == draft.definition.revision).then(|| {
-                    ValidationProblem {
-                        code: "editor.detector_test_failed".to_string(),
-                        message: format!("latest detector test failed: {}", failure.message),
-                        block_id: Some(block_id.clone()),
-                    }
+                (detector_fingerprint_for_block(&draft.definition, block_id).as_deref()
+                    == Some(failure.detector_fingerprint.as_str()))
+                .then(|| ValidationProblem {
+                    code: "editor.detector_test_failed".to_string(),
+                    message: format!("latest detector test failed: {}", failure.message),
+                    block_id: Some(block_id.clone()),
                 })
             }),
     );
@@ -1399,6 +1413,46 @@ pub fn condition_for_block<'a>(definition: &'a MacroDefinition, id: &str) -> Opt
         | BlockKind::If { condition, .. }
         | BlockKind::RepeatUntil { condition, .. } => Some(condition),
         _ => None,
+    }
+}
+
+/// Fingerprint only the detector inputs selected by an observation block. Canonical definition
+/// revision, actions/comments, and an image verification artifact are deliberately excluded.
+pub fn detector_fingerprint_for_block(
+    definition: &MacroDefinition,
+    block_id: &str,
+) -> Option<String> {
+    match condition_for_block(definition, block_id)? {
+        Condition::Text { rule_id, .. } => {
+            let rule = definition
+                .text_rules
+                .iter()
+                .find(|rule| rule.id == *rule_id)?;
+            let region = definition
+                .regions
+                .iter()
+                .find(|region| region.id == rule.region_id)?;
+            Some(format!(
+                "text|{:?}|{:?}|{:?}",
+                definition.target, region, rule
+            ))
+        }
+        Condition::Image { rule_id, .. } => {
+            let mut rule = definition
+                .image_rules
+                .iter()
+                .find(|rule| rule.id == *rule_id)?
+                .clone();
+            rule.verification = None;
+            let region = definition
+                .regions
+                .iter()
+                .find(|region| region.id == rule.region_id)?;
+            Some(format!(
+                "image|{:?}|{:?}|{:?}",
+                definition.target, region, rule
+            ))
+        }
     }
 }
 fn find_block_mut<'a>(blocks: &'a mut Vec<Block>, id: &str) -> Option<&'a mut Block> {

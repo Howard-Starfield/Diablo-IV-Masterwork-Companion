@@ -4841,6 +4841,9 @@ mod tests {
         },
         types::{PointRatio, Rect, RectRatio, ScreenImage},
     };
+    use crate::macro_ui::{
+        WizardActionTarget, WizardFailure, WizardRepetition, WizardState, WizardStep,
+    };
     use image::{DynamicImage, GrayImage, ImageFormat, Luma};
     use std::{collections::VecDeque, io::Cursor, thread};
 
@@ -5443,6 +5446,36 @@ mod tests {
         )
     }
 
+    fn generated_wizard_definition(
+        action_target: WizardActionTarget,
+        observe_mode: ObserveMode,
+        repetition: WizardRepetition,
+    ) -> MacroDefinition {
+        let mut wizard = WizardState::default();
+        wizard.step = WizardStep::Finish;
+        wizard.target_bound = true;
+        wizard.target_generation = 1;
+        wizard.region_capture_generation = Some(1);
+        wizard.text_expected = "ready".into();
+        wizard.observe_mode = observe_mode;
+        wizard.failure = WizardFailure::Continue;
+        wizard.action_target = action_target;
+        if !matches!(wizard.action_target, WizardActionTarget::MatchedResult) {
+            wizard.action_capture_generation = Some(1);
+        }
+        wizard.repetition = repetition;
+        wizard.record_detector_test(true, "authoring proof", 1);
+        wizard.mark_dry_run_reviewed();
+        wizard.finish().unwrap().definition
+    }
+
+    fn planned_actions(events: &[RunEvent]) -> Vec<&RunEvent> {
+        events
+            .iter()
+            .filter(|event| matches!(event, RunEvent::ActionPlanned { .. }))
+            .collect()
+    }
+
     fn text_condition(source_block_id: &str, mode: ObserveMode) -> Condition {
         Condition::Text {
             source_block_id: source_block_id.to_string(),
@@ -5537,6 +5570,113 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, RunEvent::ActionPlanned { .. }))
         );
+    }
+
+    #[test]
+    fn generated_wizard_false_check_now_plans_no_action_for_any_target_family() {
+        for target in [
+            WizardActionTarget::MatchedResult,
+            WizardActionTarget::SavedPoint {
+                id: "click-point".into(),
+                point: PointRatio { x: 0.4, y: 0.6 },
+            },
+            WizardActionTarget::SavedRegion {
+                id: "click-region".into(),
+                rect: RectRatio {
+                    x: 0.2,
+                    y: 0.2,
+                    width: 0.1,
+                    height: 0.1,
+                },
+            },
+        ] {
+            let definition = generated_wizard_definition(
+                target,
+                ObserveMode::CheckNow,
+                WizardRepetition::RunOnce,
+            );
+            let events = fixture_runtime_with_detector(FakeDetector::returning([false]))
+                .run(saved(definition), RunMode::DryRun)
+                .unwrap();
+            assert!(planned_actions(&events).is_empty(), "{events:#?}");
+        }
+    }
+
+    #[test]
+    fn generated_wizard_timeout_continue_plans_no_action_for_any_target_family() {
+        for target in [
+            WizardActionTarget::MatchedResult,
+            WizardActionTarget::SavedPoint {
+                id: "click-point".into(),
+                point: PointRatio { x: 0.4, y: 0.6 },
+            },
+            WizardActionTarget::SavedRegion {
+                id: "click-region".into(),
+                rect: RectRatio {
+                    x: 0.2,
+                    y: 0.2,
+                    width: 0.1,
+                    height: 0.1,
+                },
+            },
+        ] {
+            let definition = generated_wizard_definition(
+                target,
+                ObserveMode::WaitForTrue {
+                    timeout_ms: Limit::Finite(1),
+                    timeout_outcome: TimeoutOutcome::Continue,
+                },
+                WizardRepetition::RunOnce,
+            );
+            let runtime = MacroRuntime::new(
+                Arc::new(FakeCapture),
+                Arc::new(FakeDetector::returning([false, false])),
+                Arc::new(StepClock::default()),
+            );
+            let events = runtime.run(saved(definition), RunMode::DryRun).unwrap();
+            assert!(planned_actions(&events).is_empty(), "{events:#?}");
+        }
+    }
+
+    #[test]
+    fn generated_wizard_repeat_until_exhaustion_plans_no_action() {
+        let definition = generated_wizard_definition(
+            WizardActionTarget::MatchedResult,
+            ObserveMode::CheckNow,
+            WizardRepetition::Until {
+                max_iterations: Limit::Finite(2),
+            },
+        );
+        let events =
+            fixture_runtime_with_detector(FakeDetector::returning([false, false, false, false]))
+                .run(saved(definition), RunMode::DryRun)
+                .unwrap();
+        assert!(planned_actions(&events).is_empty(), "{events:#?}");
+    }
+
+    #[test]
+    fn generated_wizard_repeat_until_fresh_true_gate_plans_one_matched_action() {
+        let definition = generated_wizard_definition(
+            WizardActionTarget::MatchedResult,
+            ObserveMode::CheckNow,
+            WizardRepetition::Until {
+                max_iterations: Limit::Finite(2),
+            },
+        );
+        let events = fixture_runtime_with_detector(FakeDetector::returning([false, true, true]))
+            .run(saved(definition), RunMode::DryRun)
+            .unwrap();
+        let planned = planned_actions(&events);
+        assert_eq!(planned.len(), 1, "{events:#?}");
+        assert!(matches!(
+            planned[0],
+            RunEvent::ActionPlanned {
+                action: Action::ClickTextMatch { source_block_id, .. },
+                token: Some(token),
+                ..
+            } if source_block_id == "repeat-until-action-gate"
+                && token.source_block_id == "repeat-until-action-gate"
+        ));
     }
 
     #[test]

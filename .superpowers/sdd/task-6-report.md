@@ -140,3 +140,27 @@ All four Task 6 review findings were fixed in `ffd0d301876ea8a452da0ec5f7d28128a
 - `cargo clippy --all-targets -- -D warnings -A dead_code -A clippy::collapsible-if -A clippy::too-many-arguments -A clippy::default-constructed-unit-structs -A clippy::ptr-arg` - exit 0.
 
 The live-language-pack/corpus, saved-sample persistence/UI, image detector, input, Watch Group, and frontend limitations above remain unchanged.
+
+## Low-Severity Reusable-Buffer Follow-Up
+
+Commit `6b4061a67c9e58695166a7cb76b7255646dea8f8` (`fix: reserve reusable OCR buffers from current length`) fixes the remaining shrink-then-grow allocation-accounting issue.
+
+- `Vec::reserve_exact` takes an additional count relative to the current length, not current capacity. Both retained buffers now request `target_len - current_len` whenever capacity is below the target.
+- Test instrumentation compares capacity immediately before and after both `reserve_exact` and `resize`. Reserve growth and any unexpected resize-time growth are counted separately, so instrumentation cannot attribute a hidden resize allocation to the reserve call.
+- Frame and Small Text scratch regressions first establish capacity, shrink length below capacity, then grow to a target guaranteed to exceed the retained capacity. Each proves one accounted reserve growth, zero resize-time growth, sufficient resulting capacity, and stable pointer/capacity/growth counts on the repeated target size.
+
+### TDD evidence
+
+- RED command: `cargo test shrink_then_growth -- --nocapture`
+- RED result: compilation failed because the required reserve-versus-resize allocation accounting and scratch-capacity instrumentation did not exist.
+- GREEN command: `cargo test shrink_then_growth -- --nocapture`
+- GREEN result: 2 passed, 0 failed.
+
+### Final verification
+
+- `cargo test macro_engine::text` - 27 passed, 0 failed, 134 filtered out.
+- `cargo test windows_ocr` - 11 passed, 0 failed, 150 filtered out.
+- `cargo test` - 161 passed, 0 failed, 0 ignored.
+- `rustfmt --edition 2024 --check --config skip_children=true src/engine/macro_engine/text.rs` - exit 0, no output.
+- `git diff --check 3bfd9fb2e43df3fe8b7f6d266b643b9390903e18` - exit 0, no output.
+- `cargo clippy --all-targets -- -D warnings -A dead_code -A clippy::collapsible-if -A clippy::too-many-arguments -A clippy::default-constructed-unit-structs -A clippy::ptr-arg` - exit 0.

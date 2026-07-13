@@ -13,6 +13,7 @@ use crate::engine::{
 };
 
 pub const ARBITRATION_WINDOW_MS: u64 = 25;
+pub const MAX_WATCH_GROUP_LANES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneState {
@@ -320,6 +321,13 @@ impl WatchGroupRunner {
 
     pub fn has_candidates(&self) -> bool {
         !self.candidates.is_empty()
+    }
+
+    pub(crate) fn candidate_lane_ids(&self) -> Vec<String> {
+        self.candidates
+            .iter()
+            .map(|candidate| candidate.lane_id.clone())
+            .collect()
     }
 
     pub fn arbitrate(&mut self, safety: Option<SafetyBypass>) -> ArbitrationResult {

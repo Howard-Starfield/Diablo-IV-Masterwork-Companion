@@ -498,6 +498,17 @@ fn validate_blocks(
                 );
             }
             BlockKind::WatchGroup { group } => {
+                if group.lanes.len() > MAX_WATCH_GROUP_LANES {
+                    push_problem(
+                        problems,
+                        "watch_group.too_many_lanes",
+                        format!(
+                            "Watch Group supports at most {MAX_WATCH_GROUP_LANES} lanes; found {}",
+                            group.lanes.len()
+                        ),
+                        Some(&block.id),
+                    );
+                }
                 if inside_watch_group {
                     push_problem(
                         problems,
@@ -1234,6 +1245,46 @@ mod tests {
             &validate_macro(&definition),
             "watch_group.no_enabled_lanes"
         ));
+    }
+
+    #[test]
+    fn watch_group_lane_limit_counts_disabled_lanes_and_accepts_exact_boundary() {
+        let lanes = |count: usize| {
+            (0..count)
+                .map(|lane| WatchLane {
+                    id: format!("lane-{lane}"),
+                    enabled: lane < 256,
+                    condition: passive_text_condition(&format!("lane-{lane}"), "text-present"),
+                    then_body: vec![],
+                })
+                .collect()
+        };
+        let definition = |count| {
+            fixture_macro(vec![block(
+                "watch",
+                BlockKind::WatchGroup {
+                    group: WatchGroup {
+                        lanes: lanes(count),
+                        timeout_ms: Limit::Finite(1_000),
+                        timeout_outcome: TimeoutOutcome::Continue,
+                        cooldown_ms: 0,
+                    },
+                },
+            )])
+        };
+
+        assert!(!has_code(
+            &validate_macro(&definition(256)),
+            "watch_group.too_many_lanes"
+        ));
+        let problems = validate_macro(&definition(257));
+        let problem = problems
+            .iter()
+            .find(|problem| problem.code == "watch_group.too_many_lanes")
+            .expect("257th disabled lane must count toward the persisted group limit");
+        assert_eq!(problem.block_id.as_deref(), Some("watch"));
+        assert!(problem.message.contains("at most 256 lanes"));
+        assert!(problem.message.contains("found 257"));
     }
 
     #[test]

@@ -35,6 +35,8 @@ static NEXT_WATCH_JOB_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_SYNCHRONOUS_EVENT_CAPACITY: usize = 4_096;
 const FINAL_EVENT_RESERVE: usize = 16;
 const MAX_GLOBAL_WATCH_LANES: usize = 256;
+const MAX_DELAYED_WATCH_LANES: usize = 256;
+const WATCH_BODY_GENERATION_CHANGED: &str = "Watch winner generation changed before body commit";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WatchJobKey {
@@ -98,6 +100,7 @@ struct PendingWatchJob {
 struct WatchPoolState {
     active: HashMap<WatchJobKey, (u64, super::DetectorFamily)>,
     pending: HashMap<WatchJobKey, PendingWatchJob>,
+    delayed: HashMap<WatchJobKey, PendingWatchJob>,
     cleanups: HashMap<String, WatchRunCleanup>,
     run_failures: HashMap<String, String>,
     global_failure: Option<String>,
@@ -168,11 +171,24 @@ impl WatchDetectorPool {
             pending.newest = job;
             return Ok(super::SubmitOutcome::ReplacedPending { dropped_frame_id });
         }
-        let active_same_lane = state.active.contains_key(&job.key);
-        let known_lanes = state.active.len().saturating_add(state.pending.len());
-        if !active_same_lane && known_lanes >= MAX_GLOBAL_WATCH_LANES {
-            return Ok(super::SubmitOutcome::PollingDelayed);
+        if let Some(delayed) = state.delayed.get_mut(&job.key) {
+            let dropped_frame_id = delayed.newest.capture.frame_id();
+            delayed.newest = job;
+            return Ok(super::SubmitOutcome::ReplacedPending { dropped_frame_id });
         }
+        let active_same_lane = state.active.contains_key(&job.key);
+        rebalance_watch_admission(&mut state);
+        let enqueue_sequence = self
+            .inner
+            .next_enqueue_sequence
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
+                sequence.checked_add(1)
+            })
+            .map_err(|_| {
+                let message = "global enqueue sequence exhausted".to_string();
+                state.global_failure = Some(message.clone());
+                WatchPoolUnavailable { message }
+            })?;
         let active_family = state
             .active
             .values()
@@ -193,24 +209,24 @@ impl WatchDetectorPool {
         } else {
             super::SubmitOutcome::Started
         };
-        let enqueue_sequence = self
-            .inner
-            .next_enqueue_sequence
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
-                sequence.checked_add(1)
-            })
-            .map_err(|_| {
-                let message = "global enqueue sequence exhausted".to_string();
-                state.global_failure = Some(message.clone());
-                WatchPoolUnavailable { message }
-            })?;
-        state.pending.insert(
-            job.key.clone(),
-            PendingWatchJob {
-                newest: job,
-                enqueue_sequence,
-            },
-        );
+        let key = job.key.clone();
+        let queued = PendingWatchJob {
+            newest: job,
+            enqueue_sequence,
+        };
+        let outcome = if active_same_lane || resident_lane_count(&state) < MAX_GLOBAL_WATCH_LANES {
+            state.pending.insert(key, queued);
+            outcome
+        } else if state.delayed.len() < MAX_DELAYED_WATCH_LANES {
+            state.delayed.insert(key, queued);
+            super::SubmitOutcome::PollingDelayed
+        } else {
+            let message = format!(
+                "Watch lane capacity exhausted: {} resident and {} delayed lanes",
+                MAX_GLOBAL_WATCH_LANES, MAX_DELAYED_WATCH_LANES
+            );
+            return Err(WatchPoolUnavailable { message });
+        };
         drop(state);
         self.inner.ready.notify_all();
         Ok(outcome)
@@ -252,23 +268,39 @@ impl WatchDetectorPool {
     }
 
     fn cancel_scope(&self, run_id: &str, entry_id: u64) {
-        lock_watch_pool_state(&self.inner)
+        let mut state = lock_watch_pool_state(&self.inner);
+        state
             .pending
             .retain(|key, _| key.run_id != run_id || key.entry_id != entry_id);
+        state
+            .delayed
+            .retain(|key, _| key.run_id != run_id || key.entry_id != entry_id);
+        rebalance_watch_admission(&mut state);
+        drop(state);
+        self.inner.ready.notify_all();
     }
 
     fn cancel_old_epoch(&self, run_id: &str, current_epoch: u64) {
-        lock_watch_pool_state(&self.inner)
-            .pending
-            .retain(|key, pending| {
-                key.run_id != run_id || pending.newest.side_effect_epoch == current_epoch
-            });
+        let mut state = lock_watch_pool_state(&self.inner);
+        state.pending.retain(|key, pending| {
+            key.run_id != run_id || pending.newest.side_effect_epoch == current_epoch
+        });
+        state.delayed.retain(|key, delayed| {
+            key.run_id != run_id || delayed.newest.side_effect_epoch == current_epoch
+        });
+        rebalance_watch_admission(&mut state);
+        drop(state);
+        self.inner.ready.notify_all();
     }
 
     fn cancel_run(&self, run_id: &str) {
         let mut state = lock_watch_pool_state(&self.inner);
         state.pending.retain(|key, _| key.run_id != run_id);
+        state.delayed.retain(|key, _| key.run_id != run_id);
         state.run_failures.remove(run_id);
+        rebalance_watch_admission(&mut state);
+        drop(state);
+        self.inner.ready.notify_all();
     }
 
     fn finish_run(
@@ -280,7 +312,8 @@ impl WatchDetectorPool {
         let cleanup = {
             let mut state = lock_watch_pool_state(&self.inner);
             let still_active = state.active.keys().any(|key| key.run_id == run_id)
-                || state.pending.keys().any(|key| key.run_id == run_id);
+                || state.pending.keys().any(|key| key.run_id == run_id)
+                || state.delayed.keys().any(|key| key.run_id == run_id);
             if still_active {
                 state.cleanups.insert(
                     run_id.to_string(),
@@ -372,9 +405,14 @@ impl Drop for ActiveWatchJobLease {
             if state.active.get(&self.key).map(|(job_id, _)| *job_id) == Some(self.job_id) {
                 state.active.remove(&self.key);
             }
+            rebalance_watch_admission(&mut state);
             let run_still_active = state.active.keys().any(|key| key.run_id == self.key.run_id)
                 || state
                     .pending
+                    .keys()
+                    .any(|key| key.run_id == self.key.run_id)
+                || state
+                    .delayed
                     .keys()
                     .any(|key| key.run_id == self.key.run_id);
             if run_still_active {
@@ -432,6 +470,79 @@ fn run_cleanup_contained(inner: &WatchPoolInner, run_id: &str, cleanup: WatchRun
         state
             .cleanup_failures
             .push_back(format!("detector cleanup panicked for run {run_id}"));
+    }
+}
+
+fn resident_lane_count(state: &WatchPoolState) -> usize {
+    state.active.len().saturating_add(
+        state
+            .pending
+            .keys()
+            .filter(|key| !state.active.contains_key(*key))
+            .count(),
+    )
+}
+
+fn oldest_delayed_key(state: &WatchPoolState) -> Option<WatchJobKey> {
+    state
+        .delayed
+        .iter()
+        .min_by(|(left_key, left), (right_key, right)| {
+            left.enqueue_sequence
+                .cmp(&right.enqueue_sequence)
+                .then_with(|| left_key.run_id.cmp(&right_key.run_id))
+                .then_with(|| left_key.entry_id.cmp(&right_key.entry_id))
+                .then_with(|| left_key.lane_id.cmp(&right_key.lane_id))
+        })
+        .map(|(key, _)| key.clone())
+}
+
+fn newest_evictable_pending_key(state: &WatchPoolState) -> Option<WatchJobKey> {
+    state
+        .pending
+        .iter()
+        .filter(|(key, _)| !state.active.contains_key(*key))
+        .max_by(|(left_key, left), (right_key, right)| {
+            left.enqueue_sequence
+                .cmp(&right.enqueue_sequence)
+                .then_with(|| left_key.run_id.cmp(&right_key.run_id))
+                .then_with(|| left_key.entry_id.cmp(&right_key.entry_id))
+                .then_with(|| left_key.lane_id.cmp(&right_key.lane_id))
+        })
+        .map(|(key, _)| key.clone())
+}
+
+fn rebalance_watch_admission(state: &mut WatchPoolState) {
+    loop {
+        let Some(delayed_key) = oldest_delayed_key(state) else {
+            return;
+        };
+        if resident_lane_count(state) < MAX_GLOBAL_WATCH_LANES {
+            let delayed = state
+                .delayed
+                .remove(&delayed_key)
+                .expect("selected delayed Watch lane disappeared");
+            state.pending.insert(delayed_key, delayed);
+            continue;
+        }
+        let Some(evicted_key) = newest_evictable_pending_key(state) else {
+            return;
+        };
+        let delayed_ticket = state.delayed[&delayed_key].enqueue_sequence;
+        let evicted_ticket = state.pending[&evicted_key].enqueue_sequence;
+        if delayed_ticket >= evicted_ticket {
+            return;
+        }
+        let delayed = state
+            .delayed
+            .remove(&delayed_key)
+            .expect("selected delayed Watch lane disappeared");
+        let evicted = state
+            .pending
+            .remove(&evicted_key)
+            .expect("selected pending Watch lane disappeared");
+        state.pending.insert(delayed_key, delayed);
+        state.delayed.insert(evicted_key, evicted);
     }
 }
 
@@ -591,6 +702,12 @@ pub enum RunStatus {
     Paused,
     Stopping,
     Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArbitrationDiscardReason {
+    GenerationChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1931,6 +2048,8 @@ pub enum RunEvent {
         winner_lane_id: Option<String>,
         discarded_lane_ids: Vec<String>,
         safety_bypassed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        discard_reason: Option<ArbitrationDiscardReason>,
     },
     PollingDelayed {
         sequence: u64,
@@ -2553,6 +2672,8 @@ impl MacroRuntime {
             paused_event_emitted: false,
             detector_generations: HashSet::new(),
             watch_groups: HashMap::new(),
+            watch_body_generation: None,
+            watch_body_generation_changed: false,
         };
         let reason = execution
             .execute_blocks(&blocks)
@@ -2674,6 +2795,8 @@ struct RunExecution<'a, 'clock> {
     paused_event_emitted: bool,
     detector_generations: HashSet<u64>,
     watch_groups: HashMap<String, WatchGroupRunner>,
+    watch_body_generation: Option<u64>,
+    watch_body_generation_changed: bool,
 }
 
 impl RunExecution<'_, '_> {
@@ -2682,10 +2805,31 @@ impl RunExecution<'_, '_> {
             if let Some(reason) = self.check_control() {
                 return Some(reason);
             }
+            if let Some(reason) = self.check_watch_body_generation() {
+                return Some(reason);
+            }
             if !block.enabled {
                 continue;
             }
-            self.emitter.block_entered(&block.id);
+            let entered = if let Some(expected_generation) = self.watch_body_generation {
+                self.emitter.block_entered_if_generation(
+                    &block.id,
+                    &self.runtime.control_handle(),
+                    expected_generation,
+                )
+            } else {
+                self.emitter.block_entered(&block.id);
+                true
+            };
+            if !entered {
+                self.watch_body_generation_changed = true;
+                return Some(StopReason::TechnicalFailure {
+                    message: WATCH_BODY_GENERATION_CHANGED.to_string(),
+                });
+            }
+            if let Some(reason) = self.check_watch_body_generation() {
+                return Some(reason);
+            }
             if let Some(reason) = self.execute_block(block) {
                 return Some(reason);
             }
@@ -2860,6 +3004,22 @@ impl RunExecution<'_, '_> {
             }
             let generation = self.runtime.control_handle().generation();
             if generation != runner_generation {
+                if runner.has_candidates() {
+                    let discarded_lane_ids = runner.candidate_lane_ids();
+                    self.reobserve_watch_after_generation_change(
+                        block_id,
+                        entry_id,
+                        &mut runner,
+                        &mut runner_generation,
+                        &mut arbitration_deadline,
+                        &mut candidate_cycles,
+                        &mut completed_job_ids,
+                        &mut next_poll_at,
+                        &mut lane_due_at,
+                        discarded_lane_ids,
+                    );
+                    continue;
+                }
                 runner.invalidate(generation);
                 runner_generation = generation;
                 arbitration_deadline = None;
@@ -3050,11 +3210,30 @@ impl RunExecution<'_, '_> {
                     self.watch_groups.insert(block_id.to_string(), runner);
                     return Some(reason);
                 }
+                let pre_validation_generation = self.runtime.control_handle().generation();
+                if runner_generation != pre_validation_generation
+                    || winner.token.generation != pre_validation_generation
+                {
+                    self.reobserve_watch_after_generation_change(
+                        block_id,
+                        entry_id,
+                        &mut runner,
+                        &mut runner_generation,
+                        &mut arbitration_deadline,
+                        &mut candidate_cycles,
+                        &mut completed_job_ids,
+                        &mut next_poll_at,
+                        &mut lane_due_at,
+                        std::iter::once(winner.lane_id)
+                            .chain(arbitration.discarded_lane_ids)
+                            .collect(),
+                    );
+                    continue;
+                }
                 let fresh_winner = self
                     .observations
                     .get(&winner.lane_id)
                     .is_some_and(|token| winner.matches_observation(token))
-                    && winner.token.generation == self.runtime.control_handle().generation()
                     && winner.token.side_effect_epoch == self.side_effect_epoch;
                 if !fresh_winner {
                     self.observations.clear();
@@ -3076,9 +3255,31 @@ impl RunExecution<'_, '_> {
                         ),
                     });
                 };
-                if let Err(error) = winner_cycle.validate_fresh() {
+                let validation = winner_cycle.validate_fresh();
+                let after_validation_generation = self.runtime.control_handle().generation();
+                if runner_generation != after_validation_generation
+                    || winner.token.generation != after_validation_generation
+                {
+                    drop(winner_cycle);
+                    self.reobserve_watch_after_generation_change(
+                        block_id,
+                        entry_id,
+                        &mut runner,
+                        &mut runner_generation,
+                        &mut arbitration_deadline,
+                        &mut candidate_cycles,
+                        &mut completed_job_ids,
+                        &mut next_poll_at,
+                        &mut lane_due_at,
+                        std::iter::once(winner.lane_id)
+                            .chain(arbitration.discarded_lane_ids)
+                            .collect(),
+                    );
+                    continue;
+                }
+                if let Err(error) = validation {
                     self.observations.clear();
-                    runner.invalidate(self.runtime.control_handle().generation());
+                    runner.invalidate(after_validation_generation);
                     self.emitter.arbitration_completed(
                         block_id,
                         None,
@@ -3107,20 +3308,85 @@ impl RunExecution<'_, '_> {
                     self.watch_groups.insert(block_id.to_string(), runner);
                     return Some(reason);
                 }
+                let post_validation_generation = self.runtime.control_handle().generation();
+                if runner_generation != post_validation_generation
+                    || winner.token.generation != post_validation_generation
+                {
+                    drop(winner_cycle);
+                    self.reobserve_watch_after_generation_change(
+                        block_id,
+                        entry_id,
+                        &mut runner,
+                        &mut runner_generation,
+                        &mut arbitration_deadline,
+                        &mut candidate_cycles,
+                        &mut completed_job_ids,
+                        &mut next_poll_at,
+                        &mut lane_due_at,
+                        std::iter::once(winner.lane_id)
+                            .chain(arbitration.discarded_lane_ids)
+                            .collect(),
+                    );
+                    continue;
+                }
                 if deadline.is_some_and(|deadline| self.runtime.clock.now_ms() >= deadline) {
                     drop(winner_cycle);
                     candidate_cycles.clear();
                     self.observations.clear();
                     return self.resolve_watch_timeout(block_id, group, runner);
                 }
+                let body_generation = self.runtime.control_handle().generation();
+                if runner_generation != body_generation
+                    || winner.token.generation != body_generation
+                {
+                    drop(winner_cycle);
+                    self.reobserve_watch_after_generation_change(
+                        block_id,
+                        entry_id,
+                        &mut runner,
+                        &mut runner_generation,
+                        &mut arbitration_deadline,
+                        &mut candidate_cycles,
+                        &mut completed_job_ids,
+                        &mut next_poll_at,
+                        &mut lane_due_at,
+                        std::iter::once(winner.lane_id)
+                            .chain(arbitration.discarded_lane_ids)
+                            .collect(),
+                    );
+                    continue;
+                }
                 drop(winner_cycle);
                 candidate_cycles.clear();
-                self.emitter.arbitration_completed(
+                self.watch_body_generation = Some(body_generation);
+                self.watch_body_generation_changed = false;
+                let control = self.runtime.control_handle();
+                if !self.emitter.arbitration_completed_if_generation(
                     block_id,
-                    Some(winner.lane_id.clone()),
+                    winner.lane_id.clone(),
                     arbitration.discarded_lane_ids.clone(),
-                    false,
-                );
+                    &control,
+                    body_generation,
+                ) || self.check_watch_body_generation().is_some()
+                {
+                    self.watch_body_generation = None;
+                    self.watch_body_generation_changed = false;
+                    self.reobserve_watch_after_generation_change(
+                        block_id,
+                        entry_id,
+                        &mut runner,
+                        &mut runner_generation,
+                        &mut arbitration_deadline,
+                        &mut candidate_cycles,
+                        &mut completed_job_ids,
+                        &mut next_poll_at,
+                        &mut lane_due_at,
+                        std::iter::once(winner.lane_id.clone())
+                            .chain(arbitration.discarded_lane_ids.clone())
+                            .collect(),
+                    );
+                    continue;
+                }
                 let losing: HashSet<_> = arbitration.discarded_lane_ids.iter().collect();
                 self.observations
                     .retain(|source, _| !losing.contains(source));
@@ -3132,6 +3398,25 @@ impl RunExecution<'_, '_> {
                     .unwrap_or_default();
                 runner.begin_execution();
                 let body_reason = self.execute_blocks(&winner_body);
+                self.watch_body_generation = None;
+                if self.watch_body_generation_changed {
+                    self.watch_body_generation_changed = false;
+                    self.reobserve_watch_after_generation_change(
+                        block_id,
+                        entry_id,
+                        &mut runner,
+                        &mut runner_generation,
+                        &mut arbitration_deadline,
+                        &mut candidate_cycles,
+                        &mut completed_job_ids,
+                        &mut next_poll_at,
+                        &mut lane_due_at,
+                        std::iter::once(winner.lane_id)
+                            .chain(arbitration.discarded_lane_ids)
+                            .collect(),
+                    );
+                    continue;
+                }
                 runner.settle_and_exit();
                 self.observations.clear();
                 self.watch_groups.insert(block_id.to_string(), runner);
@@ -3285,6 +3570,44 @@ impl RunExecution<'_, '_> {
 
             self.runtime.emergency_stop.wait(Duration::from_millis(1));
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reobserve_watch_after_generation_change(
+        &mut self,
+        block_id: &str,
+        entry_id: u64,
+        runner: &mut WatchGroupRunner,
+        runner_generation: &mut u64,
+        arbitration_deadline: &mut Option<u64>,
+        candidate_cycles: &mut HashMap<String, Arc<super::CapturedCycle>>,
+        completed_job_ids: &mut HashMap<String, u64>,
+        next_poll_at: &mut u64,
+        lane_due_at: &mut HashMap<String, u64>,
+        discarded_lane_ids: Vec<String>,
+    ) {
+        let generation = self.runtime.control_handle().generation();
+        let now = self.runtime.clock.now_ms();
+        self.runtime
+            .watch_pool
+            .cancel_scope(self.emitter.run_id(), entry_id);
+        self.observations.clear();
+        candidate_cycles.clear();
+        completed_job_ids.clear();
+        *arbitration_deadline = None;
+        *runner_generation = generation;
+        *next_poll_at = now;
+        for due_at in lane_due_at.values_mut() {
+            *due_at = now;
+        }
+        runner.invalidate(generation);
+        self.emitter.arbitration_completed_with_reason(
+            block_id,
+            None,
+            discarded_lane_ids,
+            true,
+            Some(ArbitrationDiscardReason::GenerationChanged),
+        );
     }
 
     fn resolve_watch_timeout(
@@ -3621,6 +3944,9 @@ impl RunExecution<'_, '_> {
     }
 
     fn plan_action(&mut self, block_id: &str, action: &Action) -> Option<StopReason> {
+        if let Some(reason) = self.check_watch_body_generation() {
+            return Some(reason);
+        }
         let token = match action_source(action) {
             Some(source_block_id) => {
                 let generation = self.runtime.control_handle().generation();
@@ -3649,7 +3975,8 @@ impl RunExecution<'_, '_> {
             }
             None => None,
         };
-        if is_click_action(action) {
+        let click_action = is_click_action(action);
+        if click_action {
             if matches!(
                 self.compiled.definition().safety.max_clicks,
                 Limit::Finite(maximum)
@@ -3659,12 +3986,35 @@ impl RunExecution<'_, '_> {
                     message: "maximum click count exceeded".to_string(),
                 });
             }
-            self.non_authoritative_planned_clicks =
-                self.non_authoritative_planned_clicks.saturating_add(1);
         }
         // This run-local simulation count gates planning only. The live `ActionCommitter`
         // remains the sole owner of actual click consumption at the first SendInput boundary.
-        self.emitter.action_planned(block_id, action.clone(), token);
+        if let Some(reason) = self.check_watch_body_generation() {
+            return Some(reason);
+        }
+        let planned = if let Some(expected_generation) = self.watch_body_generation {
+            self.emitter.action_planned_if_generation(
+                block_id,
+                action.clone(),
+                token,
+                &self.runtime.control_handle(),
+                expected_generation,
+            )
+        } else {
+            self.emitter.action_planned(block_id, action.clone(), token);
+            true
+        };
+        if !planned {
+            self.watch_body_generation_changed = true;
+            return Some(StopReason::TechnicalFailure {
+                message: WATCH_BODY_GENERATION_CHANGED.to_string(),
+            });
+        }
+        if click_action {
+            self.non_authoritative_planned_clicks =
+                self.non_authoritative_planned_clicks.saturating_add(1);
+        }
+        self.watch_body_generation = None;
         if is_side_effect_action(action) {
             self.invalidate_after_side_effect();
         }
@@ -3754,6 +4104,17 @@ impl RunExecution<'_, '_> {
         }
 
         None
+    }
+
+    fn check_watch_body_generation(&mut self) -> Option<StopReason> {
+        let expected = self.watch_body_generation?;
+        if self.runtime.control_handle().generation() == expected {
+            return None;
+        }
+        self.watch_body_generation_changed = true;
+        Some(StopReason::TechnicalFailure {
+            message: WATCH_BODY_GENERATION_CHANGED.to_string(),
+        })
     }
 }
 
@@ -4155,6 +4516,25 @@ impl<'a> EventEmitter<'a> {
         (sequence, self.last_elapsed_ms, self.run_id.clone())
     }
 
+    fn push_critical_if_generation(
+        &mut self,
+        control: &RuntimeControlHandle,
+        expected_generation: u64,
+        event: impl FnOnce(u64, u64, String) -> RunEvent,
+    ) -> bool {
+        let elapsed = self.clock.now_ms().saturating_sub(self.started_at);
+        self.last_elapsed_ms = self.last_elapsed_ms.max(elapsed);
+        let control_state = control.control.lock().expect("runtime control poisoned");
+        if control_state.generation != expected_generation {
+            return false;
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.push_critical(event(sequence, self.last_elapsed_ms, self.run_id.clone()));
+        drop(control_state);
+        true
+    }
+
     fn run_id(&self) -> &str {
         &self.run_id
     }
@@ -4198,6 +4578,24 @@ impl<'a> EventEmitter<'a> {
         });
     }
 
+    fn block_entered_if_generation(
+        &mut self,
+        block_id: &str,
+        control: &RuntimeControlHandle,
+        expected_generation: u64,
+    ) -> bool {
+        self.push_critical_if_generation(
+            control,
+            expected_generation,
+            |sequence, elapsed_ms, run_id| RunEvent::BlockEntered {
+                sequence,
+                elapsed_ms,
+                run_id,
+                block_id: block_id.to_string(),
+            },
+        )
+    }
+
     fn action_planned(&mut self, block_id: &str, action: Action, token: Option<ObservationToken>) {
         let (sequence, elapsed_ms, run_id) = self.metadata();
         self.push_critical(RunEvent::ActionPlanned {
@@ -4209,6 +4607,29 @@ impl<'a> EventEmitter<'a> {
             state: ActionState::Planned,
             token,
         });
+    }
+
+    fn action_planned_if_generation(
+        &mut self,
+        block_id: &str,
+        action: Action,
+        token: Option<ObservationToken>,
+        control: &RuntimeControlHandle,
+        expected_generation: u64,
+    ) -> bool {
+        self.push_critical_if_generation(
+            control,
+            expected_generation,
+            |sequence, elapsed_ms, run_id| RunEvent::ActionPlanned {
+                sequence,
+                elapsed_ms,
+                run_id,
+                block_id: block_id.to_string(),
+                action,
+                state: ActionState::Planned,
+                token,
+            },
+        )
     }
 
     fn action_blocked(&mut self, block_id: &str, action: Action, reason: String) {
@@ -4302,6 +4723,47 @@ impl<'a> EventEmitter<'a> {
         discarded_lane_ids: Vec<String>,
         safety_bypassed: bool,
     ) {
+        self.arbitration_completed_with_reason(
+            block_id,
+            winner_lane_id,
+            discarded_lane_ids,
+            safety_bypassed,
+            None,
+        );
+    }
+
+    fn arbitration_completed_if_generation(
+        &mut self,
+        block_id: &str,
+        winner_lane_id: String,
+        discarded_lane_ids: Vec<String>,
+        control: &RuntimeControlHandle,
+        expected_generation: u64,
+    ) -> bool {
+        self.push_critical_if_generation(
+            control,
+            expected_generation,
+            |sequence, elapsed_ms, run_id| RunEvent::ArbitrationCompleted {
+                sequence,
+                elapsed_ms,
+                run_id,
+                block_id: block_id.to_string(),
+                winner_lane_id: Some(winner_lane_id),
+                discarded_lane_ids,
+                safety_bypassed: false,
+                discard_reason: None,
+            },
+        )
+    }
+
+    fn arbitration_completed_with_reason(
+        &mut self,
+        block_id: &str,
+        winner_lane_id: Option<String>,
+        discarded_lane_ids: Vec<String>,
+        safety_bypassed: bool,
+        discard_reason: Option<ArbitrationDiscardReason>,
+    ) {
         let (sequence, elapsed_ms, run_id) = self.metadata();
         self.push_critical(RunEvent::ArbitrationCompleted {
             sequence,
@@ -4311,6 +4773,7 @@ impl<'a> EventEmitter<'a> {
             winner_lane_id,
             discarded_lane_ids,
             safety_bypassed,
+            discard_reason,
         });
     }
 
@@ -6637,6 +7100,34 @@ mod tests {
         control: Mutex<Option<RuntimeControlHandle>>,
     }
 
+    #[derive(Default)]
+    struct GenerationChangeDuringValidationCapture {
+        inner: WatchCountingCapture,
+        control: Mutex<Option<RuntimeControlHandle>>,
+        changed: AtomicBool,
+    }
+
+    #[derive(Default)]
+    struct GenerationChangeAndDriftDuringValidationCapture {
+        inner: WatchCountingCapture,
+        control: Mutex<Option<RuntimeControlHandle>>,
+        changed: AtomicBool,
+    }
+
+    #[derive(Default)]
+    struct DelayedGenerationChangeClock {
+        now: AtomicU64,
+        remaining_calls: AtomicU64,
+        control: Mutex<Option<RuntimeControlHandle>>,
+    }
+
+    struct ArmGenerationChangeDuringValidationCapture {
+        inner: WatchCountingCapture,
+        clock: Arc<DelayedGenerationChangeClock>,
+        calls_after_validation: u64,
+        armed: AtomicBool,
+    }
+
     impl CaptureSource for WatchCountingCapture {
         fn capture(&self, rect: Rect) -> Result<ScreenImage> {
             Ok(ScreenImage::new(image::RgbaImage::new(
@@ -6770,6 +7261,106 @@ mod tests {
         ) -> Result<()> {
             self.inner.validate_frame(rect, metadata)?;
             self.control.lock().unwrap().as_ref().unwrap().stop();
+            Ok(())
+        }
+    }
+
+    impl CaptureSource for GenerationChangeDuringValidationCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            self.inner.capture(rect)
+        }
+
+        fn capture_frame(
+            &self,
+            rect: Rect,
+        ) -> Result<crate::engine::automation::CapturedScreenFrame> {
+            self.inner.capture_frame(rect)
+        }
+
+        fn validate_frame(
+            &self,
+            rect: Rect,
+            metadata: &crate::engine::automation::CaptureFrameMetadata,
+        ) -> Result<()> {
+            self.inner.validate_frame(rect, metadata)?;
+            if !self.changed.swap(true, Ordering::AcqRel) {
+                let control = self.control.lock().unwrap().as_ref().unwrap().clone();
+                control.pause();
+                control.resume();
+            }
+            Ok(())
+        }
+    }
+
+    impl CaptureSource for GenerationChangeAndDriftDuringValidationCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            self.inner.capture(rect)
+        }
+
+        fn capture_frame(
+            &self,
+            rect: Rect,
+        ) -> Result<crate::engine::automation::CapturedScreenFrame> {
+            self.inner.capture_frame(rect)
+        }
+
+        fn validate_frame(
+            &self,
+            rect: Rect,
+            metadata: &crate::engine::automation::CaptureFrameMetadata,
+        ) -> Result<()> {
+            self.inner.validate_frame(rect, metadata)?;
+            if !self.changed.swap(true, Ordering::AcqRel) {
+                let control = self.control.lock().unwrap().as_ref().unwrap().clone();
+                control.pause();
+                control.resume();
+                return Err(crate::engine::automation::StaleCapturedFrameError.into());
+            }
+            Ok(())
+        }
+    }
+
+    impl Clock for DelayedGenerationChangeClock {
+        fn now_ms(&self) -> u64 {
+            let now = self.now.fetch_add(1, Ordering::Relaxed);
+            if self
+                .remaining_calls
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                == Ok(1)
+            {
+                let control = self.control.lock().unwrap().as_ref().unwrap().clone();
+                control.pause();
+                control.resume();
+            }
+            now
+        }
+    }
+
+    impl CaptureSource for ArmGenerationChangeDuringValidationCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            self.inner.capture(rect)
+        }
+
+        fn capture_frame(
+            &self,
+            rect: Rect,
+        ) -> Result<crate::engine::automation::CapturedScreenFrame> {
+            self.inner.capture_frame(rect)
+        }
+
+        fn validate_frame(
+            &self,
+            rect: Rect,
+            metadata: &crate::engine::automation::CaptureFrameMetadata,
+        ) -> Result<()> {
+            self.inner.validate_frame(rect, metadata)?;
+            if !self.armed.swap(true, Ordering::AcqRel) {
+                self.clock
+                    .remaining_calls
+                    .store(self.calls_after_validation, Ordering::Release);
+            }
             Ok(())
         }
     }
@@ -7200,6 +7791,322 @@ mod tests {
     }
 
     #[test]
+    fn pause_resume_during_winner_validation_discards_old_generation_and_reobserves() {
+        let capture = Arc::new(GenerationChangeDuringValidationCapture::default());
+        let runtime = MacroRuntime::new(
+            capture.clone(),
+            Arc::new(WatchSequenceDetector::with([(
+                "lane-1",
+                vec![true, false, true],
+            )])),
+            Arc::new(FakeClock::default()),
+        );
+        *capture.control.lock().unwrap() = Some(runtime.control_handle());
+        let revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane(
+                "lane-1",
+                vec![matched_text_action("winner-click", "lane-1")],
+            )],
+            2_000,
+            TimeoutOutcome::Continue,
+        )]));
+
+        let events = runtime.run(revision, RunMode::DryRun).unwrap();
+        let current_generation = runtime.control_handle().generation();
+
+        assert!(capture.inner.0.load(Ordering::Relaxed) >= 3, "{events:#?}");
+        let old_observation = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RunEvent::ObservationCompleted {
+                        block_id,
+                        token: Some(token),
+                        ..
+                    } if block_id == "lane-1" && token.generation != current_generation
+                )
+            })
+            .unwrap_or_else(|| panic!("old-generation candidate observation: {events:#?}"));
+        let discarded = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RunEvent::ArbitrationCompleted {
+                        winner_lane_id: None,
+                        safety_bypassed: true,
+                        discard_reason: Some(ArbitrationDiscardReason::GenerationChanged),
+                        ..
+                    }
+                )
+            })
+            .expect("generation-change arbitration discard");
+        let new_observation = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RunEvent::ObservationCompleted {
+                        block_id,
+                        token: Some(token),
+                        ..
+                    } if block_id == "lane-1" && token.generation == current_generation
+                )
+            })
+            .expect("current-generation candidate observation");
+        let winning_arbitration = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RunEvent::ArbitrationCompleted {
+                        winner_lane_id: Some(lane_id),
+                        ..
+                    } if lane_id == "lane-1"
+                )
+            })
+            .expect("current-generation winning arbitration");
+        let body = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RunEvent::BlockEntered { block_id, .. } if block_id == "winner-click"
+                )
+            })
+            .expect("winner body");
+        assert!(
+            old_observation < discarded
+                && discarded < new_observation
+                && new_observation < winning_arbitration
+                && winning_arbitration < body,
+            "{events:#?}"
+        );
+        let planned: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::ActionPlanned {
+                    block_id,
+                    token: Some(token),
+                    ..
+                } if block_id == "winner-click" => Some(token),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(planned.len(), 1, "{events:#?}");
+        assert_eq!(planned[0].generation, current_generation);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                RunEvent::RunStopped {
+                    reason: StopReason::TechnicalFailure { .. },
+                    ..
+                }
+            )),
+            "{events:#?}"
+        );
+    }
+
+    #[test]
+    fn generation_change_during_failed_validation_takes_precedence_and_reobserves() {
+        let capture = Arc::new(GenerationChangeAndDriftDuringValidationCapture::default());
+        let runtime = MacroRuntime::new(
+            capture.clone(),
+            Arc::new(WatchSequenceDetector::with([(
+                "lane-1",
+                vec![true, false, true],
+            )])),
+            Arc::new(FakeClock::default()),
+        );
+        *capture.control.lock().unwrap() = Some(runtime.control_handle());
+        let revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane(
+                "lane-1",
+                vec![matched_text_action("winner-click", "lane-1")],
+            )],
+            2_000,
+            TimeoutOutcome::Continue,
+        )]));
+
+        let events = runtime.run(revision, RunMode::DryRun).unwrap();
+        let current_generation = runtime.control_handle().generation();
+
+        assert!(capture.inner.0.load(Ordering::Relaxed) >= 3, "{events:#?}");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RunEvent::ArbitrationCompleted {
+                    discard_reason: Some(ArbitrationDiscardReason::GenerationChanged),
+                    ..
+                }
+            )),
+            "{events:#?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RunEvent::ActionPlanned {
+                    block_id,
+                    token: Some(token),
+                    ..
+                } if block_id == "winner-click" && token.generation == current_generation
+            )),
+            "{events:#?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                RunEvent::RunStopped {
+                    reason: StopReason::TechnicalFailure { .. },
+                    ..
+                }
+            )),
+            "{events:#?}"
+        );
+    }
+
+    #[test]
+    fn generation_change_after_validation_before_body_reobserves_without_old_body() {
+        let clock = Arc::new(DelayedGenerationChangeClock::default());
+        let capture = Arc::new(ArmGenerationChangeDuringValidationCapture {
+            inner: WatchCountingCapture::default(),
+            clock: Arc::clone(&clock),
+            calls_after_validation: 2,
+            armed: AtomicBool::new(false),
+        });
+        let runtime = MacroRuntime::new(
+            capture.clone(),
+            Arc::new(WatchSequenceDetector::with([(
+                "lane-1",
+                vec![true, false, true],
+            )])),
+            clock.clone(),
+        );
+        *clock.control.lock().unwrap() = Some(runtime.control_handle());
+        let revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![point_action("winner-body")])],
+            2_000,
+            TimeoutOutcome::Continue,
+        )]));
+
+        let events = runtime.run(revision, RunMode::DryRun).unwrap();
+
+        assert!(capture.inner.0.load(Ordering::Relaxed) >= 3, "{events:#?}");
+        let discard = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RunEvent::ArbitrationCompleted {
+                        discard_reason: Some(ArbitrationDiscardReason::GenerationChanged),
+                        ..
+                    }
+                )
+            })
+            .expect("generation discard before body");
+        let body = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RunEvent::BlockEntered { block_id, .. } if block_id == "winner-body"
+                )
+            })
+            .expect("new-generation winner body");
+        assert!(discard < body, "{events:#?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RunEvent::ActionPlanned { block_id, .. } if block_id == "winner-body"
+                ))
+                .count(),
+            1,
+            "{events:#?}"
+        );
+    }
+
+    #[test]
+    fn winner_generation_guard_blocks_change_during_first_point_action_entry() {
+        for calls_after_validation in [5, 6] {
+            let clock = Arc::new(DelayedGenerationChangeClock::default());
+            let capture = Arc::new(ArmGenerationChangeDuringValidationCapture {
+                inner: WatchCountingCapture::default(),
+                clock: Arc::clone(&clock),
+                calls_after_validation,
+                armed: AtomicBool::new(false),
+            });
+            let runtime = MacroRuntime::new(
+                capture.clone(),
+                Arc::new(WatchSequenceDetector::with([(
+                    "lane-1",
+                    vec![true, false, true],
+                )])),
+                clock.clone(),
+            );
+            *clock.control.lock().unwrap() = Some(runtime.control_handle());
+            let revision = saved(fixture_definition(vec![watch_group(
+                vec![watch_lane("lane-1", vec![point_action("winner-body")])],
+                2_000,
+                TimeoutOutcome::Continue,
+            )]));
+
+            let events = runtime.run(revision, RunMode::DryRun).unwrap();
+
+            assert!(capture.inner.0.load(Ordering::Relaxed) >= 3, "{events:#?}");
+            let discard = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        RunEvent::ArbitrationCompleted {
+                            discard_reason: Some(ArbitrationDiscardReason::GenerationChanged),
+                            ..
+                        }
+                    )
+                })
+                .expect("generation discard before point action commit");
+            let planned: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    matches!(
+                        event,
+                        RunEvent::ActionPlanned { block_id, .. } if block_id == "winner-body"
+                    )
+                })
+                .collect();
+            assert_eq!(planned.len(), 1, "{events:#?}");
+            assert!(discard < planned[0].0, "{events:#?}");
+            if calls_after_validation == 5 {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(
+                            event,
+                            RunEvent::BlockEntered { block_id, .. } if block_id == "winner-body"
+                        ))
+                        .count(),
+                    1,
+                    "{events:#?}"
+                );
+            }
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    RunEvent::RunStopped {
+                        reason: StopReason::TechnicalFailure { message },
+                        ..
+                    } if message == WATCH_BODY_GENERATION_CHANGED
+                )),
+                "{events:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn winning_body_side_effect_invalidates_watch_observation_before_later_action() {
         let watch = watch_group(
             vec![watch_lane("lane-1", vec![point_action("body-click")])],
@@ -7510,6 +8417,11 @@ mod tests {
         release: Arc<(Mutex<bool>, Condvar)>,
     }
 
+    struct GateAllWatchDetector {
+        started: mpsc::Sender<String>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
     struct FirstGatedSequenceDetector {
         started: mpsc::Sender<()>,
         release: Arc<(Mutex<bool>, Condvar)>,
@@ -7640,6 +8552,27 @@ mod tests {
         }
     }
 
+    impl ConditionDetector for GateAllWatchDetector {
+        fn observe(
+            &self,
+            request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            let _ = self
+                .started
+                .send(condition_source_id(request.condition).to_string());
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Ok(super::super::DetectorEvidence::unmatched(
+                request.observed_at_ms,
+                request.observed_at_ms,
+            ))
+        }
+    }
+
     fn direct_watch_job(
         run_id: &str,
         entry_id: u64,
@@ -7700,12 +8633,26 @@ mod tests {
         pool
     }
 
+    fn isolated_unstarted_watch_pool() -> &'static WatchDetectorPool {
+        Box::leak(Box::new(WatchDetectorPool {
+            inner: Arc::new(WatchPoolInner {
+                state: Mutex::new(WatchPoolState::default()),
+                ready: Condvar::new(),
+                started_workers: AtomicU64::new(0),
+                next_enqueue_sequence: AtomicU64::new(1),
+                live_text_workers: AtomicU64::new(0),
+                live_image_workers: AtomicU64::new(0),
+                enforce_health: false,
+            }),
+        }))
+    }
+
     fn wait_for_pool_idle(pool: &WatchDetectorPool) {
         let started = std::time::Instant::now();
         loop {
             let idle = {
                 let state = lock_watch_pool_state(&pool.inner);
-                state.active.is_empty() && state.pending.is_empty()
+                state.active.is_empty() && state.pending.is_empty() && state.delayed.is_empty()
             };
             if idle {
                 return;
@@ -8084,6 +9031,292 @@ mod tests {
     }
 
     #[test]
+    fn pool_retains_lane_257_and_replacement_as_bounded_delayed_newest_only() {
+        let pool = isolated_unstarted_watch_pool();
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let (completion_tx, _completion_rx) = mpsc::sync_channel(1);
+        let detector: Arc<dyn ConditionDetector> = Arc::new(CountingUnmatchedDetector::default());
+        for lane in 0..MAX_GLOBAL_WATCH_LANES {
+            pool.submit(direct_watch_job(
+                "fair-cap",
+                1,
+                &format!("lane-{lane}"),
+                super::super::DetectorFamily::Text,
+                Arc::clone(&detector),
+                &compiled,
+                &capture,
+                &completion_tx,
+            ))
+            .unwrap();
+        }
+        let delayed = direct_watch_job(
+            "fair-cap",
+            1,
+            "lane-256",
+            super::super::DetectorFamily::Text,
+            Arc::clone(&detector),
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        assert_eq!(
+            pool.submit(delayed).unwrap(),
+            super::super::SubmitOutcome::PollingDelayed
+        );
+        let delayed_key = WatchJobKey {
+            run_id: "fair-cap".to_string(),
+            block_id: "direct-watch".to_string(),
+            entry_id: 1,
+            lane_id: "lane-256".to_string(),
+        };
+        let (original_ticket, original_job_id) = {
+            let state = lock_watch_pool_state(&pool.inner);
+            assert_eq!(resident_lane_count(&state), MAX_GLOBAL_WATCH_LANES);
+            assert_eq!(state.delayed.len(), 1);
+            let delayed = &state.delayed[&delayed_key];
+            (delayed.enqueue_sequence, delayed.newest.job_id)
+        };
+        let replacement = direct_watch_job(
+            "fair-cap",
+            1,
+            "lane-256",
+            super::super::DetectorFamily::Text,
+            detector,
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        let replacement_job_id = replacement.job_id;
+        assert_eq!(
+            pool.submit(replacement).unwrap(),
+            super::super::SubmitOutcome::ReplacedPending {
+                dropped_frame_id: capture.frame_id(),
+            }
+        );
+        let state = lock_watch_pool_state(&pool.inner);
+        assert_eq!(state.delayed.len(), 1);
+        assert_eq!(
+            state.delayed[&delayed_key].enqueue_sequence,
+            original_ticket
+        );
+        assert_eq!(
+            state.delayed[&delayed_key].newest.job_id,
+            replacement_job_id
+        );
+        assert_ne!(original_job_id, replacement_job_id);
+    }
+
+    #[test]
+    fn oldest_delayed_lane_rotates_a_completed_incumbent_retry_without_evicting_active() {
+        let pool = isolated_unstarted_watch_pool();
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let (completion_tx, _completion_rx) = mpsc::sync_channel(1);
+        let detector: Arc<dyn ConditionDetector> = Arc::new(CountingUnmatchedDetector::default());
+        let active_job = direct_watch_job(
+            "fair-rotation",
+            1,
+            "incumbent",
+            super::super::DetectorFamily::Text,
+            Arc::clone(&detector),
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        let active_key = active_job.key.clone();
+        let active_job_id = active_job.job_id;
+        pool.submit(active_job).unwrap();
+        {
+            let mut state = lock_watch_pool_state(&pool.inner);
+            let queued = state.pending.remove(&active_key).unwrap();
+            state.active.insert(
+                active_key.clone(),
+                (queued.newest.job_id, queued.newest.family),
+            );
+        }
+        let lease = ActiveWatchJobLease {
+            inner: Arc::clone(&pool.inner),
+            key: active_key.clone(),
+            job_id: active_job_id,
+        };
+        for lane in 0..(MAX_GLOBAL_WATCH_LANES - 1) {
+            pool.submit(direct_watch_job(
+                "fair-rotation",
+                1,
+                &format!("resident-{lane}"),
+                super::super::DetectorFamily::Text,
+                Arc::clone(&detector),
+                &compiled,
+                &capture,
+                &completion_tx,
+            ))
+            .unwrap();
+        }
+        pool.submit(direct_watch_job(
+            "fair-rotation",
+            1,
+            "waiting",
+            super::super::DetectorFamily::Text,
+            Arc::clone(&detector),
+            &compiled,
+            &capture,
+            &completion_tx,
+        ))
+        .unwrap();
+        pool.submit(direct_watch_job(
+            "fair-rotation",
+            1,
+            "incumbent",
+            super::super::DetectorFamily::Text,
+            detector,
+            &compiled,
+            &capture,
+            &completion_tx,
+        ))
+        .unwrap();
+        {
+            let state = lock_watch_pool_state(&pool.inner);
+            assert_eq!(state.active[&active_key].0, active_job_id);
+            assert!(state.delayed.keys().any(|key| key.lane_id == "waiting"));
+            assert!(state.pending.contains_key(&active_key));
+            assert_eq!(resident_lane_count(&state), MAX_GLOBAL_WATCH_LANES);
+        }
+
+        drop(lease);
+
+        let state = lock_watch_pool_state(&pool.inner);
+        assert!(!state.active.contains_key(&active_key));
+        assert!(state.pending.keys().any(|key| key.lane_id == "waiting"));
+        assert!(state.delayed.contains_key(&active_key));
+        assert_eq!(resident_lane_count(&state), MAX_GLOBAL_WATCH_LANES);
+    }
+
+    #[test]
+    fn pool_caps_retained_lanes_and_checks_ticket_wrap_before_capacity_rejection() {
+        let pool = isolated_unstarted_watch_pool();
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let (completion_tx, _completion_rx) = mpsc::sync_channel(1);
+        let detector: Arc<dyn ConditionDetector> = Arc::new(CountingUnmatchedDetector::default());
+        for lane in 0..(MAX_GLOBAL_WATCH_LANES + MAX_DELAYED_WATCH_LANES) {
+            pool.submit(direct_watch_job(
+                "bounded-admission",
+                1,
+                &format!("lane-{lane}"),
+                super::super::DetectorFamily::Text,
+                Arc::clone(&detector),
+                &compiled,
+                &capture,
+                &completion_tx,
+            ))
+            .unwrap();
+        }
+        let overflow = direct_watch_job(
+            "bounded-admission",
+            1,
+            "overflow",
+            super::super::DetectorFamily::Text,
+            Arc::clone(&detector),
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        assert!(
+            pool.submit(overflow)
+                .unwrap_err()
+                .message
+                .contains("capacity")
+        );
+        {
+            let state = lock_watch_pool_state(&pool.inner);
+            assert_eq!(resident_lane_count(&state), MAX_GLOBAL_WATCH_LANES);
+            assert_eq!(state.delayed.len(), MAX_DELAYED_WATCH_LANES);
+        }
+
+        pool.inner
+            .next_enqueue_sequence
+            .store(u64::MAX, Ordering::Release);
+        let wrap = direct_watch_job(
+            "bounded-admission",
+            1,
+            "wrap-before-cap",
+            super::super::DetectorFamily::Text,
+            detector,
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        assert!(pool.submit(wrap).unwrap_err().message.contains("exhausted"));
+        let state = lock_watch_pool_state(&pool.inner);
+        assert_eq!(resident_lane_count(&state), MAX_GLOBAL_WATCH_LANES);
+        assert_eq!(state.delayed.len(), MAX_DELAYED_WATCH_LANES);
+    }
+
+    #[test]
+    fn cancelling_delayed_scope_removes_it_and_next_waiter_promotes_into_vacancy() {
+        let pool = isolated_unstarted_watch_pool();
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let (completion_tx, _completion_rx) = mpsc::sync_channel(1);
+        let detector: Arc<dyn ConditionDetector> = Arc::new(CountingUnmatchedDetector::default());
+        for lane in 0..MAX_GLOBAL_WATCH_LANES {
+            pool.submit(direct_watch_job(
+                "cancel-delayed",
+                u64::try_from(lane).unwrap() + 1,
+                &format!("resident-{lane}"),
+                super::super::DetectorFamily::Text,
+                Arc::clone(&detector),
+                &compiled,
+                &capture,
+                &completion_tx,
+            ))
+            .unwrap();
+        }
+        for (entry_id, lane_id) in [(1_000, "cancel-me"), (1_001, "promote-me")] {
+            pool.submit(direct_watch_job(
+                "cancel-delayed",
+                entry_id,
+                lane_id,
+                super::super::DetectorFamily::Text,
+                Arc::clone(&detector),
+                &compiled,
+                &capture,
+                &completion_tx,
+            ))
+            .unwrap();
+        }
+
+        pool.cancel_scope("cancel-delayed", 1_000);
+        {
+            let state = lock_watch_pool_state(&pool.inner);
+            assert!(!state.delayed.keys().any(|key| key.lane_id == "cancel-me"));
+            assert!(state.delayed.keys().any(|key| key.lane_id == "promote-me"));
+        }
+        pool.cancel_scope("cancel-delayed", 1);
+        let state = lock_watch_pool_state(&pool.inner);
+        assert!(state.pending.keys().any(|key| key.lane_id == "promote-me"));
+        assert!(!state.delayed.keys().any(|key| key.lane_id == "promote-me"));
+        assert_eq!(resident_lane_count(&state), MAX_GLOBAL_WATCH_LANES);
+    }
+
+    #[test]
     fn degraded_worker_topology_and_enqueue_wrap_fail_closed() {
         let pool = Box::leak(Box::new(WatchDetectorPool {
             inner: Arc::new(WatchPoolInner {
@@ -8260,6 +9493,74 @@ mod tests {
         wake.notify_all();
         let slow_completion = completion_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(slow_completion.key.lane_id, "slow");
+    }
+
+    #[test]
+    fn delayed_ocr_lane_progresses_after_image_resident_completion() {
+        let pool = isolated_full_watch_pool();
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let detector: Arc<dyn ConditionDetector> = Arc::new(GateAllWatchDetector {
+            started: started_tx,
+            release: Arc::clone(&release),
+        });
+        let (completion_tx, completion_rx) = mpsc::sync_channel(MAX_GLOBAL_WATCH_LANES + 1);
+        for lane in 0..MAX_GLOBAL_WATCH_LANES {
+            pool.submit(direct_watch_job(
+                "cross-family-fairness",
+                1,
+                &format!("image-{lane}"),
+                super::super::DetectorFamily::Image,
+                Arc::clone(&detector),
+                &compiled,
+                &capture,
+                &completion_tx,
+            ))
+            .unwrap();
+        }
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            pool.submit(direct_watch_job(
+                "cross-family-fairness",
+                1,
+                "ocr-waiter",
+                super::super::DetectorFamily::Text,
+                Arc::clone(&detector),
+                &compiled,
+                &capture,
+                &completion_tx,
+            ))
+            .unwrap(),
+            super::super::SubmitOutcome::PollingDelayed
+        );
+        {
+            let state = lock_watch_pool_state(&pool.inner);
+            assert!(state.delayed.keys().any(|key| key.lane_id == "ocr-waiter"));
+            assert_eq!(resident_lane_count(&state), MAX_GLOBAL_WATCH_LANES);
+        }
+
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let completion = completion_rx
+                .recv_timeout(remaining)
+                .expect("delayed OCR lane did not progress after image completion");
+            if completion.key.lane_id == "ocr-waiter" {
+                break;
+            }
+        }
+        wait_for_pool_idle(pool);
     }
 
     #[test]

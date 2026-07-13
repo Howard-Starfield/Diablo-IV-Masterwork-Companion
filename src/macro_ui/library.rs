@@ -2,7 +2,7 @@ use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui};
 
 use crate::engine::macro_engine::{MacroDefinition, RunStatus, ValidationProblem};
 
-use super::monitor::MonitorProjection;
+use super::monitor::{MonitorProjection, StopOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacroLibraryStatus {
@@ -45,6 +45,7 @@ pub fn project_definition(
     enabled: bool,
     problems: &[ValidationProblem],
     monitor: &MonitorProjection,
+    last_completion: Option<&StopOutcome>,
 ) -> MacroLibraryRow {
     let status = if !enabled {
         MacroLibraryStatus::Disabled
@@ -54,11 +55,7 @@ pub fn project_definition(
     ) && monitor.running_revision.is_some()
     {
         MacroLibraryStatus::Running
-    } else if monitor.error.is_some()
-        || monitor.stop_reason.as_deref().is_some_and(|reason| {
-            reason.contains("failure") || reason.contains("error") || reason.contains("Safety")
-        })
-    {
+    } else if monitor.error.is_some() || last_completion.is_some_and(StopOutcome::is_error) {
         MacroLibraryStatus::StoppedWithError
     } else if !problems.is_empty() {
         MacroLibraryStatus::NeedsRevalidation
@@ -83,9 +80,8 @@ pub fn project_definition(
         } else {
             format!("{} issues", problems.len())
         },
-        last_run: monitor
-            .stop_reason
-            .clone()
+        last_run: last_completion
+            .map(StopOutcome::label)
             .unwrap_or_else(|| "No completed run".to_string()),
     }
 }
@@ -173,5 +169,90 @@ fn status_color(status: MacroLibraryStatus) -> Color32 {
             Color32::from_rgb(226, 105, 77)
         }
         MacroLibraryStatus::Disabled => Color32::from_gray(105),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::macro_engine::{
+        FocusLossPolicy, Limit, MACRO_SCHEMA_VERSION, SafetyPolicy, StopReason, TargetProfile,
+    };
+
+    use super::*;
+    use crate::macro_ui::monitor::{StopClassification, StopOutcome};
+
+    fn definition() -> MacroDefinition {
+        MacroDefinition {
+            schema_version: MACRO_SCHEMA_VERSION,
+            id: "alpha".to_string(),
+            name: "Alpha".to_string(),
+            revision: 2,
+            target: TargetProfile {
+                process_path: "Diablo IV.exe".to_string(),
+                window_class: "Diablo".to_string(),
+                title_contains: "Diablo IV".to_string(),
+                captured_client_width: 1920,
+                captured_client_height: 1080,
+                captured_dpi: 96,
+            },
+            regions: Vec::new(),
+            points: Vec::new(),
+            text_rules: Vec::new(),
+            image_rules: Vec::new(),
+            blocks: Vec::new(),
+            safety: SafetyPolicy {
+                max_runtime_ms: Limit::Unlimited,
+                max_clicks: Limit::Unlimited,
+                max_observation_retries: Limit::Unlimited,
+                max_observations_per_second: 10,
+                minimum_click_interval_ms: 100,
+                focus_loss: FocusLossPolicy::Stop,
+            },
+        }
+    }
+
+    #[test]
+    fn current_running_status_keeps_previous_completed_result() {
+        let mut monitor = MonitorProjection::default();
+        monitor.status = RunStatus::Running;
+        monitor.running_revision = Some(2);
+        let completion = StopOutcome {
+            reason: StopReason::Completed,
+            classification: StopClassification::Success,
+        };
+
+        let row = project_definition(
+            &definition(),
+            Some(2),
+            true,
+            &[],
+            &monitor,
+            Some(&completion),
+        );
+
+        assert_eq!(row.status, MacroLibraryStatus::Running);
+        assert_eq!(row.last_run, "Macro completed");
+    }
+
+    #[test]
+    fn typed_unsupported_block_outcome_is_an_error_without_string_matching() {
+        let completion = StopOutcome {
+            reason: StopReason::UnsupportedBlock {
+                block_id: "future".to_string(),
+            },
+            classification: StopClassification::Error,
+        };
+
+        let row = project_definition(
+            &definition(),
+            Some(2),
+            true,
+            &[],
+            &MonitorProjection::default(),
+            Some(&completion),
+        );
+
+        assert_eq!(row.status, MacroLibraryStatus::StoppedWithError);
+        assert_eq!(row.last_run, "Unsupported block: future");
     }
 }

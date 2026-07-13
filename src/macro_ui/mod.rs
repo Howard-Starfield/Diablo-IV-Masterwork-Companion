@@ -7,7 +7,7 @@ use eframe::egui::{self, Align, Button, Color32, Frame, Layout, RichText, Stroke
 use crate::engine::macro_engine::{MacroDefinition, RunEvent, ValidationProblem, validate_macro};
 
 use library::{MacroLibraryRow, project_definition};
-use monitor::{MonitorProjection, project_monitor};
+use monitor::{MonitorProjection, RunDefinitionSnapshot, project_last_completion, project_monitor};
 use timeline::{TimelineRow, project_timeline};
 
 /// Read-only data accepted by the Macro page. It intentionally owns no runtime command sender,
@@ -17,6 +17,7 @@ pub struct MacroPageState {
     pub definition: Option<MacroDefinition>,
     pub saved_revision: Option<u64>,
     pub enabled: bool,
+    pub running_snapshot: Option<RunDefinitionSnapshot>,
     pub runtime_events: Vec<RunEvent>,
 }
 
@@ -26,6 +27,7 @@ impl Default for MacroPageState {
             definition: None,
             saved_revision: None,
             enabled: true,
+            running_snapshot: None,
             runtime_events: Vec::new(),
         }
     }
@@ -35,8 +37,20 @@ impl Default for MacroPageState {
 pub struct MacroPage;
 
 impl MacroPage {
+    pub const MONITOR_HEIGHT: f32 = 176.0;
+
     pub fn show(ui: &mut Ui, state: &MacroPageState) {
-        let monitor = project_monitor(state.definition.as_ref(), &state.runtime_events);
+        let selected_macro_id = state
+            .definition
+            .as_ref()
+            .map(|definition| definition.id.as_str());
+        let monitor = project_monitor(
+            selected_macro_id,
+            state.running_snapshot.as_ref(),
+            &state.runtime_events,
+        );
+        let last_completion = selected_macro_id
+            .and_then(|macro_id| project_last_completion(&state.runtime_events, macro_id));
         let problems = state
             .definition
             .as_ref()
@@ -52,6 +66,7 @@ impl MacroPage {
                     state.enabled,
                     &problems,
                     &monitor,
+                    last_completion.as_ref(),
                 )]
             })
             .unwrap_or_default();
@@ -68,9 +83,20 @@ impl MacroPage {
             status_strip(ui, state, &monitor, &problems);
             ui.add_space(8.0);
             workspace(ui, state, &library_rows, &timeline_rows, &monitor);
-            ui.add_space(8.0);
-            monitor::show(ui, &monitor);
         });
+    }
+
+    pub fn show_monitor(ui: &mut Ui, state: &MacroPageState) {
+        let selected_macro_id = state
+            .definition
+            .as_ref()
+            .map(|definition| definition.id.as_str());
+        let monitor = project_monitor(
+            selected_macro_id,
+            state.running_snapshot.as_ref(),
+            &state.runtime_events,
+        );
+        monitor::show(ui, &monitor);
     }
 }
 

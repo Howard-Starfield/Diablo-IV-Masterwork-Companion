@@ -236,6 +236,19 @@ pub enum AppPage {
     Macro,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BottomSurface {
+    EnchantActions,
+    MacroMonitor,
+}
+
+fn bottom_surface(page: AppPage) -> BottomSurface {
+    match page {
+        AppPage::Enchant => BottomSurface::EnchantActions,
+        AppPage::Macro => BottomSurface::MacroMonitor,
+    }
+}
+
 impl BotState {
     fn label(self) -> &'static str {
         match self {
@@ -719,12 +732,21 @@ impl App for NativeApp {
                 });
             });
 
-        if self.page == AppPage::Enchant {
-            TopBottomPanel::bottom("action_bar")
-                .exact_height(112.0)
-                .show(ctx, |ui| {
-                    self.bottom_bar(ui);
-                });
+        match bottom_surface(self.page) {
+            BottomSurface::EnchantActions => {
+                TopBottomPanel::bottom("action_bar")
+                    .exact_height(112.0)
+                    .show(ctx, |ui| {
+                        self.bottom_bar(ui);
+                    });
+            }
+            BottomSurface::MacroMonitor => {
+                TopBottomPanel::bottom("macro_run_monitor")
+                    .exact_height(MacroPage::MONITOR_HEIGHT)
+                    .show(ctx, |ui| {
+                        MacroPage::show_monitor(ui, &self.macro_state);
+                    });
+            }
         }
 
         CentralPanel::default()
@@ -1381,4 +1403,22 @@ fn save_native_config(path: &PathBuf, config: &NativeConfig) -> anyhow::Result<(
     }
     fs::write(path, serde_json::to_string_pretty(config)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn each_page_owns_one_distinct_fixed_bottom_surface() {
+        assert_eq!(
+            bottom_surface(AppPage::Enchant),
+            BottomSurface::EnchantActions
+        );
+        assert_eq!(
+            bottom_surface(AppPage::Macro),
+            BottomSurface::MacroMonitor
+        );
+        assert!(MacroPage::MONITOR_HEIGHT < APP_HEIGHT / 3.0);
+    }
 }

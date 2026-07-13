@@ -8,10 +8,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use image::Pixel;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{
-    platform::{OcrFrame, PositionedOcrWord},
+    platform::{OcrFrame, OcrPixelFormat, PositionedOcrWord},
     types::{Rect, ScreenImage},
 };
 
@@ -371,58 +372,177 @@ fn normalized_chars(text: &str, case_sensitive: bool) -> Vec<char> {
         .collect()
 }
 
-#[derive(Debug, Clone)]
-struct PreparedOcrFrame {
-    frame: OcrFrame,
+#[derive(Debug, Clone, Copy)]
+struct PreparedOcrFrame<'a> {
+    frame: &'a OcrFrame,
     coordinate_scale: u32,
 }
 
-fn preprocess_frame(image: &ScreenImage, profile: PreprocessProfile) -> PreparedOcrFrame {
-    match profile {
-        PreprocessProfile::Original => PreparedOcrFrame {
-            frame: OcrFrame::from_bgra_screen_image(image),
-            coordinate_scale: 1,
-        },
-        PreprocessProfile::Grayscale => {
-            let gray = image::DynamicImage::ImageRgba8(image.rgba.clone()).into_luma8();
-            PreparedOcrFrame {
-                frame: OcrFrame::from_gray_image(&gray),
-                coordinate_scale: 1,
-            }
-        }
-        PreprocessProfile::HighContrast => {
-            let mut gray = image::DynamicImage::ImageRgba8(image.rgba.clone()).into_luma8();
-            let threshold = otsu_threshold(&gray);
-            for pixel in gray.pixels_mut() {
-                pixel[0] = if pixel[0] > threshold { 255 } else { 0 };
-            }
-            PreparedOcrFrame {
-                frame: OcrFrame::from_gray_image(&gray),
-                coordinate_scale: 1,
-            }
-        }
-        PreprocessProfile::SmallText => {
-            let gray = image::DynamicImage::ImageRgba8(image.rgba.clone()).into_luma8();
-            let enlarged = image::imageops::resize(
-                &gray,
-                gray.width().saturating_mul(2),
-                gray.height().saturating_mul(2),
-                image::imageops::FilterType::Triangle,
-            );
-            PreparedOcrFrame {
-                frame: OcrFrame::from_gray_image(&enlarged),
-                coordinate_scale: 2,
-            }
+#[derive(Debug)]
+struct TextPreprocessWorker {
+    frame: OcrFrame,
+    gray_scratch: Vec<u8>,
+    #[cfg(test)]
+    frame_growths: usize,
+    #[cfg(test)]
+    scratch_growths: usize,
+}
+
+impl Default for TextPreprocessWorker {
+    fn default() -> Self {
+        Self {
+            frame: OcrFrame {
+                pixels: Vec::new(),
+                width: 0,
+                height: 0,
+                pixel_format: OcrPixelFormat::Gray8,
+            },
+            gray_scratch: Vec::new(),
+            #[cfg(test)]
+            frame_growths: 0,
+            #[cfg(test)]
+            scratch_growths: 0,
         }
     }
 }
 
-fn otsu_threshold(image: &image::GrayImage) -> u8 {
-    let mut histogram = [0u64; 256];
-    for pixel in image.pixels() {
-        histogram[pixel[0] as usize] += 1;
+impl TextPreprocessWorker {
+    fn prepare(
+        &mut self,
+        image: &ScreenImage,
+        profile: PreprocessProfile,
+    ) -> Result<PreparedOcrFrame<'_>> {
+        let width = image.rgba.width();
+        let height = image.rgba.height();
+        let pixel_count = checked_buffer_len(width, height, 1)?;
+        let coordinate_scale = match profile {
+            PreprocessProfile::Original => {
+                self.ensure_frame_len(checked_buffer_len(width, height, 4)?);
+                for (destination, pixel) in self
+                    .frame
+                    .pixels
+                    .chunks_exact_mut(4)
+                    .zip(image.rgba.pixels())
+                {
+                    destination.copy_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                }
+                self.frame.width = width;
+                self.frame.height = height;
+                self.frame.pixel_format = OcrPixelFormat::Bgra8;
+                1
+            }
+            PreprocessProfile::Grayscale | PreprocessProfile::HighContrast => {
+                self.ensure_frame_len(pixel_count);
+                write_luminance(&mut self.frame.pixels, image);
+                if profile == PreprocessProfile::HighContrast {
+                    let threshold = otsu_threshold(&self.frame.pixels);
+                    for pixel in &mut self.frame.pixels {
+                        *pixel = if *pixel > threshold { 255 } else { 0 };
+                    }
+                }
+                self.frame.width = width;
+                self.frame.height = height;
+                self.frame.pixel_format = OcrPixelFormat::Gray8;
+                1
+            }
+            PreprocessProfile::SmallText => {
+                self.ensure_scratch_len(pixel_count);
+                write_luminance(&mut self.gray_scratch, image);
+                let enlarged_width = width
+                    .checked_mul(2)
+                    .context("Small Text OCR width exceeds u32")?;
+                let enlarged_height = height
+                    .checked_mul(2)
+                    .context("Small Text OCR height exceeds u32")?;
+                self.ensure_frame_len(checked_buffer_len(enlarged_width, enlarged_height, 1)?);
+                let source_width = width as usize;
+                let destination_width = enlarged_width as usize;
+                for y in 0..enlarged_height as usize {
+                    for x in 0..destination_width {
+                        self.frame.pixels[y * destination_width + x] =
+                            self.gray_scratch[(y / 2) * source_width + x / 2];
+                    }
+                }
+                self.frame.width = enlarged_width;
+                self.frame.height = enlarged_height;
+                self.frame.pixel_format = OcrPixelFormat::Gray8;
+                2
+            }
+        };
+        Ok(PreparedOcrFrame {
+            frame: &self.frame,
+            coordinate_scale,
+        })
     }
-    let total = u64::from(image.width()) * u64::from(image.height());
+
+    fn ensure_frame_len(&mut self, len: usize) {
+        if self.frame.pixels.capacity() < len {
+            self.frame
+                .pixels
+                .reserve_exact(len - self.frame.pixels.capacity());
+            #[cfg(test)]
+            {
+                self.frame_growths += 1;
+            }
+        }
+        self.frame.pixels.resize(len, 0);
+    }
+
+    fn ensure_scratch_len(&mut self, len: usize) {
+        if self.gray_scratch.capacity() < len {
+            self.gray_scratch
+                .reserve_exact(len - self.gray_scratch.capacity());
+            #[cfg(test)]
+            {
+                self.scratch_growths += 1;
+            }
+        }
+        self.gray_scratch.resize(len, 0);
+    }
+
+    #[cfg(test)]
+    fn buffer_stats(&self) -> PreprocessBufferStats {
+        PreprocessBufferStats {
+            frame_ptr: self.frame.pixels.as_ptr() as usize,
+            frame_len: self.frame.pixels.len(),
+            frame_capacity: self.frame.pixels.capacity(),
+            frame_growths: self.frame_growths,
+            scratch_ptr: self.gray_scratch.as_ptr() as usize,
+            scratch_growths: self.scratch_growths,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct PreprocessBufferStats {
+    frame_ptr: usize,
+    frame_len: usize,
+    frame_capacity: usize,
+    frame_growths: usize,
+    scratch_ptr: usize,
+    scratch_growths: usize,
+}
+
+fn checked_buffer_len(width: u32, height: u32, bytes_per_pixel: usize) -> Result<usize> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+        .context("OCR preprocessing buffer length overflows usize")
+}
+
+fn write_luminance(destination: &mut [u8], image: &ScreenImage) {
+    for (destination, pixel) in destination.iter_mut().zip(image.rgba.pixels()) {
+        *destination = pixel.to_luma()[0];
+    }
+}
+
+fn otsu_threshold(pixels: &[u8]) -> u8 {
+    let mut histogram = [0u64; 256];
+    for pixel in pixels {
+        histogram[*pixel as usize] += 1;
+    }
+    let total = pixels.len() as u64;
     if total == 0 {
         return 0;
     }
@@ -460,8 +580,7 @@ fn otsu_threshold(image: &image::GrayImage) -> u8 {
 fn map_processed_rect_to_capture(
     rect: Rect,
     coordinate_scale: u32,
-    capture_x: i32,
-    capture_y: i32,
+    capture_rect: Rect,
 ) -> Result<Rect> {
     if coordinate_scale == 0 {
         bail!("OCR coordinate scale must be non-zero");
@@ -473,11 +592,22 @@ fn map_processed_rect_to_capture(
     let bottom_scaled = i64::from(rect.y) + i64::from(rect.height);
     let right = right_scaled.div_euclid(scale) + i64::from(right_scaled.rem_euclid(scale) != 0);
     let bottom = bottom_scaled.div_euclid(scale) + i64::from(bottom_scaled.rem_euclid(scale) != 0);
+    let capture_left = i64::from(capture_rect.x);
+    let capture_top = i64::from(capture_rect.y);
+    let capture_right = capture_left + i64::from(capture_rect.width);
+    let capture_bottom = capture_top + i64::from(capture_rect.height);
+    let intersect_left = (capture_left + left).max(capture_left);
+    let intersect_top = (capture_top + top).max(capture_top);
+    let intersect_right = (capture_left + right).min(capture_right);
+    let intersect_bottom = (capture_top + bottom).min(capture_bottom);
+    if intersect_right <= intersect_left || intersect_bottom <= intersect_top {
+        bail!("OCR word bounds do not intersect the captured region");
+    }
     Ok(Rect::new(
-        i32::try_from(i64::from(capture_x) + left)?,
-        i32::try_from(i64::from(capture_y) + top)?,
-        u32::try_from(right - left)?,
-        u32::try_from(bottom - top)?,
+        i32::try_from(intersect_left)?,
+        i32::try_from(intersect_top)?,
+        u32::try_from(intersect_right - intersect_left)?,
+        u32::try_from(intersect_bottom - intersect_top)?,
     ))
 }
 
@@ -521,6 +651,7 @@ struct StabilityState {
 
 pub struct TextDetector {
     recognizer: Arc<dyn PositionedTextRecognizer>,
+    preprocess: Mutex<TextPreprocessWorker>,
     next_frame_id: AtomicU64,
     stability: Mutex<HashMap<StabilityKey, StabilityState>>,
 }
@@ -535,6 +666,7 @@ impl TextDetector {
     pub fn with_recognizer(recognizer: Arc<dyn PositionedTextRecognizer>) -> Self {
         Self {
             recognizer,
+            preprocess: Mutex::new(TextPreprocessWorker::default()),
             next_frame_id: AtomicU64::new(1),
             stability: Mutex::new(HashMap::new()),
         }
@@ -566,10 +698,14 @@ impl TextDetector {
         );
         let capture_rect = client.rect_from_ratio(region.rect);
         let image = capture.capture(capture_rect)?;
-        let prepared = preprocess_frame(&image, rule.preprocess);
+        let mut preprocess = self
+            .preprocess
+            .lock()
+            .map_err(|_| anyhow::anyhow!("text detector preprocessing lock is poisoned"))?;
+        let prepared = preprocess.prepare(&image, rule.preprocess)?;
         let relative_words = self
             .recognizer
-            .recognize_words(&prepared.frame, &rule.language)?;
+            .recognize_words(prepared.frame, &rule.language)?;
         let words = relative_words
             .into_iter()
             .map(|word| {
@@ -577,8 +713,7 @@ impl TextDetector {
                     rect: map_processed_rect_to_capture(
                         word.rect,
                         prepared.coordinate_scale,
-                        capture_rect.x,
-                        capture_rect.y,
+                        capture_rect,
                     )?,
                     ..word
                 })
@@ -679,7 +814,7 @@ pub struct TextProfileBenchmark {
     pub profile: PreprocessProfile,
     pub correct: usize,
     pub total: usize,
-    pub elapsed_nanos: u128,
+    pub median_elapsed_nanos: u128,
 }
 
 impl TextProfileBenchmark {
@@ -703,60 +838,135 @@ pub fn benchmark_text_profiles(
     samples: &[SavedTextProfileSample],
     accuracy_gate: f64,
 ) -> Result<TextProfileBenchmarkResult> {
+    let clock = SystemTextBenchmarkClock::default();
+    benchmark_text_profiles_with_clock(recognizer, samples, accuracy_gate, &clock, 5)
+}
+
+trait TextBenchmarkClock {
+    fn now_nanos(&self) -> u128;
+}
+
+struct SystemTextBenchmarkClock {
+    started: Instant,
+}
+
+impl Default for SystemTextBenchmarkClock {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl TextBenchmarkClock for SystemTextBenchmarkClock {
+    fn now_nanos(&self) -> u128 {
+        self.started.elapsed().as_nanos()
+    }
+}
+
+const BENCHMARK_PROFILES: [PreprocessProfile; 4] = [
+    PreprocessProfile::Original,
+    PreprocessProfile::Grayscale,
+    PreprocessProfile::HighContrast,
+    PreprocessProfile::SmallText,
+];
+
+fn benchmark_text_profiles_with_clock(
+    recognizer: &dyn PositionedTextRecognizer,
+    samples: &[SavedTextProfileSample],
+    accuracy_gate: f64,
+    clock: &dyn TextBenchmarkClock,
+    rounds: usize,
+) -> Result<TextProfileBenchmarkResult> {
     if samples.is_empty() {
         bail!("text profile benchmark requires at least one saved sample");
     }
     if !(0.0..=1.0).contains(&accuracy_gate) {
         bail!("text profile benchmark accuracy gate must be between 0 and 1");
     }
-    let mut profiles = Vec::new();
-    for profile in [
-        PreprocessProfile::Original,
-        PreprocessProfile::Grayscale,
-        PreprocessProfile::HighContrast,
-        PreprocessProfile::SmallText,
-    ] {
-        let started = Instant::now();
-        let mut correct = 0;
-        for sample in samples {
-            let prepared = preprocess_frame(&sample.image, profile);
-            let words = recognizer
-                .recognize_words(&prepared.frame, &sample.rule.language)
-                .with_context(|| format!("OCR failed for saved text sample {:?}", sample.name))?;
-            let words = words
-                .into_iter()
-                .map(|word| {
-                    Ok(OcrWord {
-                        rect: map_processed_rect_to_capture(
-                            word.rect,
-                            prepared.coordinate_scale,
-                            0,
-                            0,
-                        )?,
-                        ..word
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if match_text(&words, &sample.rule)?.matched == sample.expected_match {
-                correct += 1;
-            }
-        }
-        profiles.push(TextProfileBenchmark {
-            profile,
-            correct,
-            total: samples.len(),
-            elapsed_nanos: started.elapsed().as_nanos(),
-        });
+    if rounds == 0 {
+        bail!("text profile benchmark requires at least one measurement round");
     }
+
+    let mut preprocess = TextPreprocessWorker::default();
+    let warm = preprocess.prepare(&samples[0].image, PreprocessProfile::Original)?;
+    recognizer
+        .recognize_words(warm.frame, &samples[0].rule.language)
+        .with_context(|| {
+            format!(
+                "OCR warm-up failed for saved text sample {:?}",
+                samples[0].name
+            )
+        })?;
+
+    let mut correct = [0usize; 4];
+    let mut elapsed = std::array::from_fn::<Vec<u128>, 4, _>(|_| Vec::with_capacity(rounds));
+    for round in 0..rounds {
+        for offset in 0..BENCHMARK_PROFILES.len() {
+            let profile_index = (round + offset) % BENCHMARK_PROFILES.len();
+            let profile = BENCHMARK_PROFILES[profile_index];
+            let started = clock.now_nanos();
+            for sample in samples {
+                let matched =
+                    evaluate_profile_sample(recognizer, &mut preprocess, sample, profile)?;
+                if matched == sample.expected_match {
+                    correct[profile_index] += 1;
+                }
+            }
+            elapsed[profile_index].push(clock.now_nanos().saturating_sub(started));
+        }
+    }
+
+    let profiles = BENCHMARK_PROFILES
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, profile)| {
+            elapsed[index].sort_unstable();
+            TextProfileBenchmark {
+                profile,
+                correct: correct[index],
+                total: samples.len() * rounds,
+                median_elapsed_nanos: elapsed[index][elapsed[index].len() / 2],
+            }
+        })
+        .collect::<Vec<_>>();
     let recommended = profiles
         .iter()
-        .filter(|profile| profile.accuracy() >= accuracy_gate)
-        .min_by_key(|profile| profile.elapsed_nanos)
-        .map(|profile| profile.profile);
+        .enumerate()
+        .filter(|(_, profile)| profile.accuracy() >= accuracy_gate)
+        .min_by_key(|(profile_index, profile)| (profile.median_elapsed_nanos, *profile_index))
+        .map(|(_, profile)| profile.profile);
     Ok(TextProfileBenchmarkResult {
         profiles,
         recommended,
     })
+}
+
+fn evaluate_profile_sample(
+    recognizer: &dyn PositionedTextRecognizer,
+    preprocess: &mut TextPreprocessWorker,
+    sample: &SavedTextProfileSample,
+    profile: PreprocessProfile,
+) -> Result<bool> {
+    let prepared = preprocess.prepare(&sample.image, profile)?;
+    let words = recognizer
+        .recognize_words(prepared.frame, &sample.rule.language)
+        .with_context(|| format!("OCR failed for saved text sample {:?}", sample.name))?;
+    let words = words
+        .into_iter()
+        .map(|word| {
+            Ok(OcrWord {
+                rect: map_processed_rect_to_capture(
+                    word.rect,
+                    prepared.coordinate_scale,
+                    Rect::new(0, 0, sample.image.rgba.width(), sample.image.rgba.height()),
+                )?,
+                ..word
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(match_text(&words, &sample.rule)?.matched)
 }
 
 #[cfg(test)]
@@ -960,8 +1170,9 @@ mod tests {
     #[test]
     fn original_profile_preserves_color_in_bgra_memory_order() {
         let image = ScreenImage::new(RgbaImage::from_pixel(1, 1, Rgba([10, 20, 30, 255])));
+        let mut worker = TextPreprocessWorker::default();
 
-        let prepared = preprocess_frame(&image, PreprocessProfile::Original);
+        let prepared = worker.prepare(&image, PreprocessProfile::Original).unwrap();
 
         assert_eq!(prepared.frame.pixel_format, OcrPixelFormat::Bgra8);
         assert_eq!(prepared.frame.pixels, vec![30, 20, 10, 255]);
@@ -971,8 +1182,11 @@ mod tests {
     #[test]
     fn grayscale_profile_only_converts_luminance() {
         let image = ScreenImage::new(RgbaImage::from_pixel(2, 1, Rgba([255, 0, 0, 255])));
+        let mut worker = TextPreprocessWorker::default();
 
-        let prepared = preprocess_frame(&image, PreprocessProfile::Grayscale);
+        let prepared = worker
+            .prepare(&image, PreprocessProfile::Grayscale)
+            .unwrap();
 
         assert_eq!(prepared.frame.pixel_format, OcrPixelFormat::Gray8);
         assert_eq!((prepared.frame.width, prepared.frame.height), (2, 1));
@@ -986,8 +1200,11 @@ mod tests {
             let value = [10, 20, 220, 240][x as usize];
             Rgba([value, value, value, 255])
         }));
+        let mut worker = TextPreprocessWorker::default();
 
-        let prepared = preprocess_frame(&image, PreprocessProfile::HighContrast);
+        let prepared = worker
+            .prepare(&image, PreprocessProfile::HighContrast)
+            .unwrap();
 
         assert_eq!(prepared.frame.pixel_format, OcrPixelFormat::Gray8);
         assert_eq!(prepared.frame.pixels, vec![0, 0, 255, 255]);
@@ -997,8 +1214,11 @@ mod tests {
     #[test]
     fn small_text_profile_enlarges_grayscale_exactly_two_times() {
         let image = ScreenImage::new(RgbaImage::from_pixel(3, 2, Rgba([255, 255, 255, 255])));
+        let mut worker = TextPreprocessWorker::default();
 
-        let prepared = preprocess_frame(&image, PreprocessProfile::SmallText);
+        let prepared = worker
+            .prepare(&image, PreprocessProfile::SmallText)
+            .unwrap();
 
         assert_eq!(prepared.frame.pixel_format, OcrPixelFormat::Gray8);
         assert_eq!((prepared.frame.width, prepared.frame.height), (6, 4));
@@ -1007,9 +1227,90 @@ mod tests {
 
     #[test]
     fn small_text_boxes_map_back_to_capture_relative_integer_geometry() {
-        let rect = map_processed_rect_to_capture(Rect::new(21, 11, 59, 25), 2, 100, 50).unwrap();
+        let rect = map_processed_rect_to_capture(
+            Rect::new(21, 11, 59, 25),
+            2,
+            Rect::new(100, 50, 100, 50),
+        )
+        .unwrap();
 
         assert_eq!(rect, Rect::new(110, 55, 30, 13));
+    }
+
+    #[test]
+    fn inverse_scaled_geometry_is_intersected_with_capture_rect() {
+        let capture = Rect::new(100, 50, 20, 10);
+
+        assert_eq!(
+            map_processed_rect_to_capture(Rect::new(30, 12, 20, 16), 2, capture).unwrap(),
+            Rect::new(115, 56, 5, 4)
+        );
+        assert!(map_processed_rect_to_capture(Rect::new(50, 0, 4, 4), 2, capture).is_err());
+    }
+
+    #[test]
+    fn small_text_inverse_bounds_never_escape_odd_sized_capture() {
+        let capture = Rect::new(7, 9, 5, 3);
+
+        let rect = map_processed_rect_to_capture(Rect::new(8, 4, 4, 4), 2, capture).unwrap();
+
+        assert_eq!(rect, Rect::new(11, 11, 1, 1));
+    }
+
+    #[test]
+    fn preprocess_worker_reuses_frame_allocation_for_same_size_polls() {
+        let image = ScreenImage::new(RgbaImage::from_pixel(32, 16, Rgba([40, 50, 60, 255])));
+        let mut worker = TextPreprocessWorker::default();
+
+        worker
+            .prepare(&image, PreprocessProfile::Grayscale)
+            .unwrap();
+        let first = worker.buffer_stats();
+        worker
+            .prepare(&image, PreprocessProfile::Grayscale)
+            .unwrap();
+        let second = worker.buffer_stats();
+
+        assert_eq!(first.frame_ptr, second.frame_ptr);
+        assert_eq!(first.frame_capacity, second.frame_capacity);
+        assert_eq!(first.frame_growths, second.frame_growths);
+        assert_eq!(second.frame_len, 32 * 16);
+    }
+
+    #[test]
+    fn preprocess_worker_resizes_for_dimensions_and_profile_then_reuses_scratch() {
+        let small = ScreenImage::new(RgbaImage::from_pixel(3, 2, Rgba([40, 50, 60, 255])));
+        let color = ScreenImage::new(RgbaImage::from_pixel(4, 3, Rgba([10, 20, 30, 255])));
+        let mut worker = TextPreprocessWorker::default();
+
+        let grayscale = worker
+            .prepare(&small, PreprocessProfile::Grayscale)
+            .unwrap();
+        assert_eq!((grayscale.frame.width, grayscale.frame.height), (3, 2));
+        assert_eq!(grayscale.frame.pixel_format, OcrPixelFormat::Gray8);
+        let enlarged = worker
+            .prepare(&small, PreprocessProfile::SmallText)
+            .unwrap();
+        assert_eq!((enlarged.frame.width, enlarged.frame.height), (6, 4));
+        assert_eq!(enlarged.frame.pixels.len(), 24);
+        let small_text_stats = worker.buffer_stats();
+        worker
+            .prepare(&small, PreprocessProfile::SmallText)
+            .unwrap();
+        let repeated_small_text_stats = worker.buffer_stats();
+        assert_eq!(
+            small_text_stats.scratch_growths,
+            repeated_small_text_stats.scratch_growths
+        );
+        assert_eq!(
+            small_text_stats.scratch_ptr,
+            repeated_small_text_stats.scratch_ptr
+        );
+
+        let original = worker.prepare(&color, PreprocessProfile::Original).unwrap();
+        assert_eq!((original.frame.width, original.frame.height), (4, 3));
+        assert_eq!(original.frame.pixel_format, OcrPixelFormat::Bgra8);
+        assert_eq!(original.frame.pixels.len(), 4 * 3 * 4);
     }
 
     #[derive(Default)]
@@ -1216,8 +1517,77 @@ mod tests {
         let result = benchmark_text_profiles(&recognizer, &[sample], 1.0).unwrap();
 
         assert_eq!(result.profiles.len(), 4);
-        assert!(result.profiles.iter().all(|profile| profile.correct == 1));
+        assert!(
+            result
+                .profiles
+                .iter()
+                .all(|profile| profile.correct == 5 && profile.total == 5)
+        );
         assert!(result.recommended.is_some());
-        assert_eq!(recognizer.calls.lock().unwrap().len(), 4);
+        assert_eq!(recognizer.calls.lock().unwrap().len(), 21);
+    }
+
+    #[derive(Default)]
+    struct FakeBenchmarkClock {
+        now: std::sync::atomic::AtomicU64,
+    }
+
+    impl FakeBenchmarkClock {
+        fn advance(&self, nanos: u64) {
+            self.now.fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    impl TextBenchmarkClock for FakeBenchmarkClock {
+        fn now_nanos(&self) -> u128 {
+            u128::from(self.now.load(Ordering::Relaxed))
+        }
+    }
+
+    struct TimedFakeRecognizer {
+        clock: Arc<FakeBenchmarkClock>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PositionedTextRecognizer for TimedFakeRecognizer {
+        fn recognize_words(&self, frame: &OcrFrame, _language_tag: &str) -> Result<Vec<OcrWord>> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            let steady_nanos = match (frame.pixel_format, frame.width) {
+                (OcrPixelFormat::Bgra8, _) => 1,
+                (OcrPixelFormat::Gray8, 20) => 8,
+                (OcrPixelFormat::Gray8, _) => 4,
+            };
+            self.clock
+                .advance(if call == 0 { 1_000 } else { steady_nanos });
+            Ok(vec![OcrWord::new("Ready", Rect::new(1, 1, 5, 2), 0, 0)])
+        }
+    }
+
+    #[test]
+    fn benchmark_warms_ocr_and_uses_interleaved_medians_not_first_call_order() {
+        let clock = Arc::new(FakeBenchmarkClock::default());
+        let recognizer = TimedFakeRecognizer {
+            clock: clock.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let compiled = compiled_text_macro(PreprocessProfile::Original, 1);
+        let sample = SavedTextProfileSample {
+            name: "positive-ready".to_string(),
+            image: ScreenImage::new(RgbaImage::from_pixel(10, 5, Rgba([255, 255, 255, 255]))),
+            rule: compiled.definition().text_rules[0].clone(),
+            expected_match: true,
+        };
+
+        let result =
+            benchmark_text_profiles_with_clock(&recognizer, &[sample], 1.0, &*clock, 3).unwrap();
+
+        assert_eq!(result.recommended, Some(PreprocessProfile::Original));
+        assert_eq!(recognizer.calls.load(Ordering::Relaxed), 13);
+        let original = result
+            .profiles
+            .iter()
+            .find(|profile| profile.profile == PreprocessProfile::Original)
+            .unwrap();
+        assert_eq!(original.median_elapsed_nanos, 1);
     }
 }

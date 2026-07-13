@@ -96,7 +96,14 @@ impl WindowsTextRecognizer {
                 let bounds = word.BoundingRect()?;
                 positioned.push(PositionedOcrWord {
                     text: word.Text()?.to_string_lossy(),
-                    rect: enclosing_integer_rect(bounds.X, bounds.Y, bounds.Width, bounds.Height)?,
+                    rect: enclosing_integer_rect(
+                        bounds.X,
+                        bounds.Y,
+                        bounds.Width,
+                        bounds.Height,
+                        frame.width,
+                        frame.height,
+                    )?,
                     line_index,
                     word_index,
                 });
@@ -184,25 +191,47 @@ fn validated_dimensions(
     Ok((winrt_width, winrt_height))
 }
 
-fn enclosing_integer_rect(x: f32, y: f32, width: f32, height: f32) -> Result<Rect> {
+fn enclosing_integer_rect(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<Rect> {
     if ![x, y, width, height].iter().all(|value| value.is_finite()) {
         bail!("OCR word bounds must be finite");
     }
-    if width < 0.0 || height < 0.0 {
-        bail!("OCR word bounds must have non-negative size");
+    if width <= 0.0 || height <= 0.0 {
+        bail!("OCR word bounds must have positive size");
     }
-    let left = x.floor() as f64;
-    let top = y.floor() as f64;
-    let right = (x + width).ceil() as f64;
-    let bottom = (y + height).ceil() as f64;
-    if left < i32::MIN as f64
-        || left > i32::MAX as f64
-        || top < i32::MIN as f64
-        || top > i32::MAX as f64
-        || right - left > u32::MAX as f64
-        || bottom - top > u32::MAX as f64
+    if frame_width == 0
+        || frame_height == 0
+        || frame_width > i32::MAX as u32
+        || frame_height > i32::MAX as u32
+    {
+        bail!("OCR frame bounds exceed capture-relative integer limits");
+    }
+    let x = f64::from(x);
+    let y = f64::from(y);
+    let width = f64::from(width);
+    let height = f64::from(height);
+    let raw_left = x.floor();
+    let raw_top = y.floor();
+    let raw_right = (x + width).ceil();
+    let raw_bottom = (y + height).ceil();
+    if [raw_left, raw_top, raw_right, raw_bottom]
+        .iter()
+        .any(|edge| *edge < i64::MIN as f64 || *edge > i64::MAX as f64)
     {
         bail!("OCR word bounds exceed capture-relative integer limits");
+    }
+    let left = raw_left.clamp(0.0, f64::from(frame_width));
+    let top = raw_top.clamp(0.0, f64::from(frame_height));
+    let right = raw_right.clamp(0.0, f64::from(frame_width));
+    let bottom = raw_bottom.clamp(0.0, f64::from(frame_height));
+    if right <= left || bottom <= top {
+        bail!("OCR word bounds do not intersect the processed frame");
     }
     Ok(Rect::new(
         left as i32,
@@ -278,8 +307,50 @@ mod tests {
 
     #[test]
     fn fractional_winrt_bounds_become_enclosing_integer_rectangle() {
-        let rect = enclosing_integer_rect(10.75, 5.25, 30.5, 12.5).unwrap();
+        let rect = enclosing_integer_rect(10.75, 5.25, 30.5, 12.5, 100, 100).unwrap();
 
         assert_eq!(rect, crate::engine::types::Rect::new(10, 5, 32, 13));
+    }
+
+    #[test]
+    fn negative_and_beyond_frame_word_bounds_are_clamped() {
+        assert_eq!(
+            enclosing_integer_rect(-2.25, -1.5, 5.0, 4.0, 10, 10).unwrap(),
+            Rect::new(0, 0, 3, 3)
+        );
+        assert_eq!(
+            enclosing_integer_rect(8.25, 8.5, 5.0, 5.0, 10, 10).unwrap(),
+            Rect::new(8, 8, 2, 2)
+        );
+    }
+
+    #[test]
+    fn wholly_outside_word_bounds_are_rejected() {
+        assert!(enclosing_integer_rect(-5.0, 1.0, 2.0, 2.0, 10, 10).is_err());
+        assert!(enclosing_integer_rect(11.0, 1.0, 2.0, 2.0, 10, 10).is_err());
+        assert!(enclosing_integer_rect(1.0, 11.0, 2.0, 2.0, 10, 10).is_err());
+    }
+
+    #[test]
+    fn zero_sized_fractional_word_bounds_are_rejected() {
+        assert!(enclosing_integer_rect(0.5, 1.0, 0.0, 2.0, 10, 10).is_err());
+        assert!(enclosing_integer_rect(1.0, 0.5, 2.0, 0.0, 10, 10).is_err());
+    }
+
+    #[test]
+    fn represented_f32_edges_are_added_in_f64_before_ceiling() {
+        let x = f32::from_bits(0x4281_000d); // 64.5000991821289f32
+        let width = f32::from_bits(0x4280_fff4); // 64.49990844726562f32
+
+        let rect = enclosing_integer_rect(x, 5.0, width, 10.0, 200, 100).unwrap();
+
+        assert_eq!(rect, Rect::new(64, 5, 66, 10));
+    }
+
+    #[test]
+    fn nonfinite_and_unrepresentable_word_bounds_are_rejected() {
+        assert!(enclosing_integer_rect(f32::NAN, 0.0, 1.0, 1.0, 10, 10).is_err());
+        assert!(enclosing_integer_rect(0.0, f32::INFINITY, 1.0, 1.0, 10, 10).is_err());
+        assert!(enclosing_integer_rect(f32::MAX, 0.0, f32::MAX, 1.0, 10, 10).is_err());
     }
 }

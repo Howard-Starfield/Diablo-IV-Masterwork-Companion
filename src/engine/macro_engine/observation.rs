@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -167,6 +169,44 @@ pub trait ConditionDetector: Send + Sync {
     fn side_effect_boundary(&self, _run_id: &str, _generation: u64, _next_epoch: u64) {}
 }
 
+/// Routes typed conditions to the detector that owns that evidence family while forwarding
+/// lifecycle invalidation to both stateful engines.
+pub struct ConditionDetectorRouter {
+    text: Arc<dyn ConditionDetector>,
+    image: Arc<dyn ConditionDetector>,
+}
+
+impl ConditionDetectorRouter {
+    pub fn new(text: Arc<dyn ConditionDetector>, image: Arc<dyn ConditionDetector>) -> Self {
+        Self { text, image }
+    }
+}
+
+impl ConditionDetector for ConditionDetectorRouter {
+    fn observe(
+        &self,
+        request: &ObservationRequest<'_>,
+        capture: &(dyn CaptureSource + Send + Sync),
+    ) -> Result<DetectorEvidence> {
+        match request.condition {
+            Condition::Text { .. } => self.text.observe(request, capture),
+            Condition::Image { .. } => self.image.observe(request, capture),
+        }
+    }
+
+    fn run_finished(&self, run_id: &str, generations: &[u64]) {
+        self.text.run_finished(run_id, generations);
+        self.image.run_finished(run_id, generations);
+    }
+
+    fn side_effect_boundary(&self, run_id: &str, generation: u64, next_epoch: u64) {
+        self.text
+            .side_effect_boundary(run_id, generation, next_epoch);
+        self.image
+            .side_effect_boundary(run_id, generation, next_epoch);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct UnavailableDetector;
 
@@ -192,7 +232,166 @@ impl CaptureSource for UnavailableCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::macro_engine::ImageFrameMetadata;
+    use crate::engine::{
+        automation::CaptureSource,
+        macro_engine::{
+            Block, BlockKind, FocusLossPolicy, ImageFrameMetadata, Limit, MACRO_SCHEMA_VERSION,
+            MacroDefinition, ObserveMode, SafetyPolicy, SavedRevision, TargetProfile,
+        },
+    };
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct TaggedDetector {
+        tag: &'static str,
+        observed: Mutex<Vec<&'static str>>,
+        finished: Mutex<Vec<String>>,
+        boundaries: Mutex<Vec<(String, u64, u64)>>,
+    }
+
+    impl TaggedDetector {
+        fn new(tag: &'static str) -> Self {
+            Self {
+                tag,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl ConditionDetector for TaggedDetector {
+        fn observe(
+            &self,
+            request: &ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<DetectorEvidence> {
+            self.observed.lock().unwrap().push(self.tag);
+            Ok(DetectorEvidence::new(
+                true,
+                request.observed_at_ms,
+                request.observed_at_ms,
+                Some(Rect::new(1, 2, 3, 4)),
+                Some(if self.tag == "text" { 0.9 } else { 0.8 }),
+                1,
+                1,
+                serde_json::json!({"tag": self.tag}),
+            ))
+        }
+
+        fn run_finished(&self, run_id: &str, _generations: &[u64]) {
+            self.finished.lock().unwrap().push(run_id.to_string());
+        }
+
+        fn side_effect_boundary(&self, run_id: &str, generation: u64, next_epoch: u64) {
+            self.boundaries
+                .lock()
+                .unwrap()
+                .push((run_id.to_string(), generation, next_epoch));
+        }
+    }
+
+    #[derive(Default)]
+    struct EmptyCapture;
+
+    impl CaptureSource for EmptyCapture {
+        fn capture(&self, _rect: Rect) -> Result<ScreenImage> {
+            anyhow::bail!("router test detector must not capture")
+        }
+    }
+
+    fn compiled_for_router_test() -> CompiledMacro {
+        let definition = MacroDefinition {
+            schema_version: MACRO_SCHEMA_VERSION,
+            id: "router".to_string(),
+            name: "Router".to_string(),
+            revision: 1,
+            target: TargetProfile {
+                process_path: "game.exe".to_string(),
+                window_class: "game".to_string(),
+                title_contains: "Diablo".to_string(),
+                captured_client_width: 64,
+                captured_client_height: 48,
+                captured_dpi: 96,
+            },
+            regions: vec![],
+            points: vec![],
+            text_rules: vec![],
+            image_rules: vec![],
+            blocks: vec![Block {
+                id: "comment".to_string(),
+                enabled: true,
+                kind: BlockKind::Comment {
+                    text: "router fixture".to_string(),
+                },
+            }],
+            safety: SafetyPolicy {
+                max_runtime_ms: Limit::Finite(1_000),
+                max_clicks: Limit::Finite(1),
+                max_observation_retries: Limit::Finite(1),
+                max_observations_per_second: 1,
+                minimum_click_interval_ms: 1,
+                focus_loss: FocusLossPolicy::Stop,
+            },
+        };
+        let bytes = serde_json::to_vec_pretty(&definition).unwrap();
+        CompiledMacro::compile(SavedRevision {
+            definition,
+            definition_hash: format!("{:x}", Sha256::digest(bytes)),
+            pinned_assets: vec![],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn detector_router_routes_by_typed_condition_and_forwards_lifecycle() {
+        let text = Arc::new(TaggedDetector::new("text"));
+        let image = Arc::new(TaggedDetector::new("image"));
+        let router = ConditionDetectorRouter::new(text.clone(), image.clone());
+        let compiled = compiled_for_router_test();
+        let capture = EmptyCapture;
+        let text_condition = Condition::Text {
+            source_block_id: "observe-text".to_string(),
+            rule_id: "text".to_string(),
+            mode: ObserveMode::CheckNow,
+        };
+        let image_condition = Condition::Image {
+            source_block_id: "observe-image".to_string(),
+            rule_id: "image".to_string(),
+            mode: ObserveMode::CheckNow,
+        };
+
+        for (condition, expected) in [(&text_condition, "text"), (&image_condition, "image")] {
+            let evidence = router
+                .observe(
+                    &ObservationRequest {
+                        run_id: "run",
+                        generation: 2,
+                        side_effect_epoch: 3,
+                        condition,
+                        compiled: &compiled,
+                        observed_at_ms: 4,
+                    },
+                    &capture,
+                )
+                .unwrap();
+            assert_eq!(evidence.details["tag"], expected);
+        }
+        router.side_effect_boundary("run", 2, 4);
+        router.run_finished("run", &[2]);
+
+        assert_eq!(*text.observed.lock().unwrap(), vec!["text"]);
+        assert_eq!(*image.observed.lock().unwrap(), vec!["image"]);
+        assert_eq!(*text.finished.lock().unwrap(), vec!["run"]);
+        assert_eq!(*image.finished.lock().unwrap(), vec!["run"]);
+        assert_eq!(
+            *text.boundaries.lock().unwrap(),
+            vec![("run".to_string(), 2, 4)]
+        );
+        assert_eq!(
+            *image.boundaries.lock().unwrap(),
+            vec![("run".to_string(), 2, 4)]
+        );
+    }
 
     #[test]
     fn negative_evidence_cannot_retain_click_geometry() {

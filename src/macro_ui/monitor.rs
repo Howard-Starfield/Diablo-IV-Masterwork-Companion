@@ -187,6 +187,9 @@ pub fn project_monitor(
             }
             | RunEvent::ActionBlocked {
                 block_id, state, ..
+            }
+            | RunEvent::ActionStateChanged {
+                block_id, state, ..
             } => {
                 projection.action_state = Some(*state);
                 projection.action_block_id = Some(block_id.clone());
@@ -298,6 +301,7 @@ fn event_run_id(event: &RunEvent) -> &str {
         | RunEvent::BlockEntered { run_id, .. }
         | RunEvent::ActionPlanned { run_id, .. }
         | RunEvent::ActionBlocked { run_id, .. }
+        | RunEvent::ActionStateChanged { run_id, .. }
         | RunEvent::ObservationCompleted { run_id, .. }
         | RunEvent::ConditionEvaluated { run_id, .. }
         | RunEvent::ObservationProgress { run_id, .. }
@@ -584,9 +588,9 @@ mod tests {
     use serde_json::json;
 
     use crate::engine::macro_engine::{
-        Action, ActionState, Block, BlockKind, Condition, DetectorEvidence, FocusLossPolicy, Limit,
-        MACRO_SCHEMA_VERSION, MouseButton, ObserveMode, RunEvent, RunMode, RunStatus, SafetyPolicy,
-        StopReason, TargetProfile,
+        Action, ActionAttemptId, ActionState, Block, BlockKind, Condition, DetectorEvidence,
+        FocusLossPolicy, Limit, MACRO_SCHEMA_VERSION, MouseButton, ObserveMode, RunEvent, RunMode,
+        RunStatus, SafetyPolicy, StopReason, TargetProfile,
     };
 
     use super::*;
@@ -727,7 +731,7 @@ mod tests {
                 ),
                 token: None,
             },
-            RunEvent::ActionPlanned {
+            RunEvent::ActionStateChanged {
                 sequence: 4,
                 elapsed_ms: 25,
                 run_id: "run-1".to_string(),
@@ -736,8 +740,8 @@ mod tests {
                     source_block_id: "find-icon".to_string(),
                     button: MouseButton::Left,
                 },
+                attempt_id: ActionAttemptId::for_test("run-1", 1),
                 state: ActionState::Prepared,
-                token: None,
             },
             RunEvent::RunStopped {
                 sequence: 5,

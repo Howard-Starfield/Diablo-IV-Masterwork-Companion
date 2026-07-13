@@ -1710,6 +1710,7 @@ mod tests {
         let committer = committer_with_limits(vec![target()], input, Limit::Unlimited, 1);
         let mut first = request();
         first.set_minimum_click_interval_for_test(0);
+        let first_replay = first.clone();
         let prepared = committer.prepare(first).unwrap();
         assert!(matches!(
             committer.finish_run(),
@@ -1724,9 +1725,21 @@ mod tests {
             ActionOutcome::Dispatched { .. }
         ));
         assert!(matches!(
-            committer.prepare(request()),
-            Err(BlockReason::AttemptLedgerFull)
+            committer.prepare(first_replay),
+            Err(BlockReason::AttemptReplay)
         ));
+        let mut next = request();
+        next.set_minimum_click_interval_for_test(0);
+        let prepared = committer.prepare(next).unwrap();
+        assert!(matches!(
+            committer.commit(
+                prepared,
+                &Stop::default(),
+                CommitContext::new("run-1", 4, Some(token()))
+            ),
+            ActionOutcome::Dispatched { .. }
+        ));
+        assert!(committer.retained_attempt_count_for_test() <= 1);
         committer.finish_run().unwrap();
         assert!(matches!(
             committer.prepare(request()),

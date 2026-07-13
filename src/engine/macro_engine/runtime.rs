@@ -692,6 +692,7 @@ fn failed_watch_completion(
 pub enum RunMode {
     ObservationOnly,
     DryRun,
+    Live,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -849,7 +850,7 @@ pub trait LiveActionInput: Send + Sync {
     ) -> InputDispatchOutcome;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActionAttemptId {
     run_id: String,
     action_instance_id: u64,
@@ -1112,6 +1113,22 @@ impl LiveActionSession {
         })
     }
 
+    pub fn suspend(&self) {
+        self.resume
+            .lock()
+            .expect("live resume gate poisoned")
+            .current = None;
+    }
+
+    fn current_authorization(&self) -> Option<ResumeAuthorization> {
+        let state = self.resume.lock().expect("live resume gate poisoned");
+        state.current.clone().map(|target| ResumeAuthorization {
+            session_id: self.id,
+            epoch: state.epoch,
+            target,
+        })
+    }
+
     fn validate_resume(&self, authorization: &ResumeAuthorization) -> bool {
         let state = self.resume.lock().expect("live resume gate poisoned");
         (authorization.session_id == self.id || cfg!(test) && authorization.session_id == 0)
@@ -1189,6 +1206,8 @@ struct CommitLedger {
     last_click_at_ms: Option<u64>,
     active: Option<ActionAttemptId>,
     attempts: HashMap<ActionAttemptId, AttemptRecord>,
+    terminal_order: VecDeque<ActionAttemptId>,
+    highest_admitted_action_instance_id: Option<u64>,
     finished: bool,
 }
 
@@ -1198,6 +1217,29 @@ impl CommitLedger {
             self.maximum_clicks,
             Limit::Finite(maximum) if self.committed_clicks >= maximum
         )
+    }
+
+    fn prune_terminal_attempts_for_admission(&mut self) {
+        while self.attempts.len() >= self.maximum_attempts {
+            let Some(oldest) = self.terminal_order.pop_front() else {
+                break;
+            };
+            if self.active.as_ref() != Some(&oldest) {
+                self.attempts.remove(&oldest);
+            }
+        }
+    }
+
+    fn record_terminal(&mut self, attempt_id: &ActionAttemptId) {
+        self.terminal_order.push_back(attempt_id.clone());
+        while self.attempts.len() > self.maximum_attempts {
+            let Some(oldest) = self.terminal_order.pop_front() else {
+                break;
+            };
+            if self.active.as_ref() != Some(&oldest) {
+                self.attempts.remove(&oldest);
+            }
+        }
     }
 }
 
@@ -1226,6 +1268,7 @@ impl Drop for PreparedAction {
     fn drop(&mut self) {
         let attempt_id = &self.request.authorization.attempt_id;
         let mut ledger = self.ledger.lock().expect("action attempt ledger poisoned");
+        let mut became_terminal = false;
         if let Some(record) = ledger.attempts.get_mut(attempt_id)
             && record.owner_id == self.owner_id
             && record.status == AttemptStatus::Prepared
@@ -1233,9 +1276,13 @@ impl Drop for PreparedAction {
             // Admission to the run ledger is permanent. Even a cancelled/abandoned prepared
             // action cannot reuse its once-only ID; bounded cleanup happens only at run finish.
             record.status = AttemptStatus::Blocked;
+            became_terminal = true;
         }
         if ledger.active.as_ref() == Some(attempt_id) {
             ledger.active = None;
+        }
+        if became_terminal {
+            ledger.record_terminal(attempt_id);
         }
     }
 }
@@ -1280,6 +1327,8 @@ impl ActionCommitter {
                 last_click_at_ms: None,
                 active: None,
                 attempts: HashMap::new(),
+                terminal_order: VecDeque::new(),
+                highest_admitted_action_instance_id: None,
                 finished: false,
             })),
         })
@@ -1311,15 +1360,21 @@ impl ActionCommitter {
         if attempt_id.run_id != ledger.run_id {
             return Err(BlockReason::CrossCommitter);
         }
-        if ledger.attempts.contains_key(&attempt_id) {
+        if ledger
+            .highest_admitted_action_instance_id
+            .is_some_and(|highest| attempt_id.action_instance_id <= highest)
+            || ledger.attempts.contains_key(&attempt_id)
+        {
             return Err(BlockReason::AttemptReplay);
         }
         if ledger.active.is_some() {
             return Err(BlockReason::ActionLockBusy);
         }
+        ledger.prune_terminal_attempts_for_admission();
         if ledger.attempts.len() >= ledger.maximum_attempts {
             return Err(BlockReason::AttemptLedgerFull);
         }
+        ledger.highest_admitted_action_instance_id = Some(attempt_id.action_instance_id);
         ledger.active = Some(attempt_id.clone());
         ledger.attempts.insert(
             attempt_id,
@@ -1342,7 +1397,22 @@ impl ActionCommitter {
         stop: &dyn StopSource,
         context: CommitContext,
     ) -> ActionOutcome {
+        self.commit_observed(prepared, stop, context, |_| {})
+    }
+
+    /// Commits one prepared action while synchronously exposing the authoritative transition
+    /// boundary. In particular, `Committed` is observed inside the commit closure before the
+    /// input adapter can issue its first `SendInput` call.
+    pub fn commit_observed(
+        &self,
+        prepared: PreparedAction,
+        stop: &dyn StopSource,
+        context: CommitContext,
+        mut observe: impl FnMut(ActionState),
+    ) -> ActionOutcome {
+        observe(ActionState::Prepared);
         if prepared.owner_id != self.owner_id || !Arc::ptr_eq(&prepared.ledger, &self.ledger) {
+            observe(ActionState::Blocked);
             return ActionOutcome::Blocked {
                 reason: BlockReason::CrossCommitter,
                 transitions: vec![ActionState::Prepared, ActionState::Blocked],
@@ -1360,6 +1430,7 @@ impl ActionCommitter {
                     self.session
                         .apply_takeover(prepared.request.takeover_policy);
                 }
+                observe(ActionState::Blocked);
                 return blocked(reason);
             }
         };
@@ -1401,6 +1472,7 @@ impl ActionCommitter {
                 .expect("prepared attempt disappeared")
                 .status = AttemptStatus::Committed;
             committed.set(true);
+            observe(ActionState::Committed);
             Ok(())
         };
 
@@ -1438,18 +1510,24 @@ impl ActionCommitter {
             &mut commit_boundary,
             &mut validate_after_movement,
         );
+        drop(commit_boundary);
         match (committed.get(), dispatch) {
             (false, InputDispatchOutcome::PreCommitBlocked(block_reason)) => {
+                observe(ActionState::Blocked);
                 self.map_precommit_block(block_reason, request.takeover_policy)
             }
-            (false, InputDispatchOutcome::Committed(_)) => blocked(BlockReason::InputFailure {
-                message: "input adapter reported a committed outcome before commit".to_string(),
-            }),
+            (false, InputDispatchOutcome::Committed(_)) => {
+                observe(ActionState::Blocked);
+                blocked(BlockReason::InputFailure {
+                    message: "input adapter reported a committed outcome before commit".to_string(),
+                })
+            }
             (true, InputDispatchOutcome::PreCommitBlocked(block_reason)) => {
                 if matches!(block_reason, PreCommitInputBlock::ManualTakeover) {
                     self.session.apply_takeover(request.takeover_policy);
                 }
                 self.finish_attempt(&attempt_id, AttemptStatus::Uncertain);
+                observe(ActionState::UncertainDispatch);
                 ActionOutcome::UncertainDispatch {
                     message: format!(
                         "input adapter returned a precommit block after commit: {block_reason:?}"
@@ -1463,6 +1541,7 @@ impl ActionCommitter {
             }
             (true, InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)) => {
                 self.finish_attempt(&attempt_id, AttemptStatus::Dispatched);
+                observe(ActionState::Dispatched);
                 ActionOutcome::Dispatched {
                     transitions: vec![
                         ActionState::Prepared,
@@ -1481,6 +1560,7 @@ impl ActionCommitter {
                     self.session.apply_takeover(request.takeover_policy);
                 }
                 self.finish_attempt(&attempt_id, AttemptStatus::Uncertain);
+                observe(ActionState::UncertainDispatch);
                 ActionOutcome::UncertainDispatch {
                     message: failure.to_string(),
                     transitions: vec![
@@ -1579,14 +1659,19 @@ impl ActionCommitter {
 
     fn finish_attempt(&self, attempt_id: &ActionAttemptId, status: AttemptStatus) {
         let mut ledger = self.ledger.lock().expect("action attempt ledger poisoned");
+        let mut became_terminal = false;
         if let Some(record) = ledger.attempts.get_mut(attempt_id)
             && record.owner_id == self.owner_id
             && record.status == AttemptStatus::Committed
         {
             record.status = status;
+            became_terminal = true;
         }
         if ledger.active.as_ref() == Some(attempt_id) {
             ledger.active = None;
+        }
+        if became_terminal {
+            ledger.record_terminal(attempt_id);
         }
     }
 
@@ -1600,6 +1685,7 @@ impl ActionCommitter {
                 return Ok(());
             }
             ledger.attempts.clear();
+            ledger.terminal_order.clear();
             ledger.finished = true;
             ledger.run_id.clone()
         };
@@ -1612,6 +1698,15 @@ impl ActionCommitter {
             .lock()
             .expect("action attempt ledger poisoned")
             .committed_clicks
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_attempt_count_for_test(&self) -> usize {
+        self.ledger
+            .lock()
+            .expect("action attempt ledger poisoned")
+            .attempts
+            .len()
     }
 }
 
@@ -2012,6 +2107,15 @@ pub enum RunEvent {
         state: ActionState,
         reason: String,
     },
+    ActionStateChanged {
+        sequence: u64,
+        elapsed_ms: u64,
+        run_id: String,
+        block_id: String,
+        action: Action,
+        attempt_id: ActionAttemptId,
+        state: ActionState,
+    },
     ObservationCompleted {
         sequence: u64,
         elapsed_ms: u64,
@@ -2084,6 +2188,7 @@ impl RunEvent {
             | Self::BlockEntered { sequence, .. }
             | Self::ActionPlanned { sequence, .. }
             | Self::ActionBlocked { sequence, .. }
+            | Self::ActionStateChanged { sequence, .. }
             | Self::ObservationCompleted { sequence, .. }
             | Self::ConditionEvaluated { sequence, .. }
             | Self::ObservationProgress { sequence, .. }
@@ -2102,6 +2207,7 @@ impl RunEvent {
             | Self::BlockEntered { elapsed_ms, .. }
             | Self::ActionPlanned { elapsed_ms, .. }
             | Self::ActionBlocked { elapsed_ms, .. }
+            | Self::ActionStateChanged { elapsed_ms, .. }
             | Self::ObservationCompleted { elapsed_ms, .. }
             | Self::ConditionEvaluated { elapsed_ms, .. }
             | Self::ObservationProgress { elapsed_ms, .. }
@@ -2131,6 +2237,17 @@ impl From<RunEvent> for JournalRecord {
             RunEvent::BlockEntered { .. } => (JournalKind::StateChange, "block entered"),
             RunEvent::ActionPlanned { .. } => (JournalKind::Action, "action planned"),
             RunEvent::ActionBlocked { .. } => (JournalKind::Action, "action blocked"),
+            RunEvent::ActionStateChanged { state, .. } => (
+                JournalKind::Action,
+                match state {
+                    ActionState::Prepared => "action prepared",
+                    ActionState::Committed => "action committed",
+                    ActionState::Dispatched => "action dispatched",
+                    ActionState::UncertainDispatch => "action dispatch uncertain",
+                    ActionState::Planned => "action planned",
+                    ActionState::Blocked => "action blocked",
+                },
+            ),
             RunEvent::ObservationCompleted { .. } => {
                 (JournalKind::Candidate, "observation completed")
             }
@@ -2594,6 +2711,33 @@ impl RuntimeControlHandle {
     }
 }
 
+impl StopSource for RuntimeControlHandle {
+    fn is_stopped(&self) -> bool {
+        self.emergency_stop.requested()
+            || self
+                .control
+                .lock()
+                .expect("runtime control poisoned")
+                .stop
+                .is_some()
+    }
+}
+
+impl LiveControlSink for RuntimeControlHandle {
+    fn pause_for_manual_takeover(&self) {
+        self.pause();
+    }
+
+    fn stop_for_manual_takeover(&self) {
+        self.stop();
+    }
+}
+
+#[derive(Clone)]
+struct LiveRuntimeConfig {
+    session: Arc<LiveActionSession>,
+}
+
 pub struct MacroRuntime {
     capture: Arc<dyn CaptureSource + Send + Sync>,
     detector: Arc<dyn ConditionDetector>,
@@ -2603,6 +2747,7 @@ pub struct MacroRuntime {
     active: Arc<Mutex<bool>>,
     event_capacity: usize,
     watch_pool: &'static WatchDetectorPool,
+    live: Option<LiveRuntimeConfig>,
 }
 
 impl Clone for MacroRuntime {
@@ -2616,6 +2761,7 @@ impl Clone for MacroRuntime {
             active: Arc::clone(&self.active),
             event_capacity: self.event_capacity,
             watch_pool: self.watch_pool,
+            live: self.live.clone(),
         }
     }
 }
@@ -2648,6 +2794,28 @@ impl MacroRuntime {
             active: Arc::new(Mutex::new(false)),
             event_capacity,
             watch_pool: WatchDetectorPool::global(),
+            live: None,
+        }
+    }
+
+    pub fn with_live_session(mut self, session: Arc<LiveActionSession>) -> Self {
+        self.live = Some(LiveRuntimeConfig { session });
+        self
+    }
+
+    pub fn live_input_configured(&self) -> bool {
+        self.live.is_some()
+    }
+
+    fn reauthorize_live(&self) -> Result<()> {
+        let live = self.live.as_ref().context("live input is not configured")?;
+        live.session.resume()?;
+        Ok(())
+    }
+
+    fn suspend_live(&self) {
+        if let Some(live) = &self.live {
+            live.session.suspend();
         }
     }
 
@@ -2689,9 +2857,31 @@ impl MacroRuntime {
         _active: ActiveRunGuard,
     ) -> Result<Vec<RunEvent>> {
         let compiled = CompiledMacro::compile(saved)?;
+        if matches!(mode, RunMode::Live) {
+            self.reauthorize_live()?;
+        }
         let started_at = self.clock.now_ms();
         let run_number = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
         let run_id = format!("{}-{}-{run_number}", compiled.definition().id, started_at);
+        let live = if matches!(mode, RunMode::Live) {
+            let config = self.live.clone().context("live input is not configured")?;
+            let committer = ActionCommitter::new(
+                Arc::clone(&config.session),
+                Arc::clone(&self.clock),
+                run_id.clone(),
+                compiled.definition().safety.max_clicks.clone(),
+                self.event_capacity
+                    .saturating_sub(FINAL_EVENT_RESERVE)
+                    .max(1),
+            )?;
+            Some(LiveRunExecution {
+                config,
+                committer,
+                next_action_instance_id: 1,
+            })
+        } else {
+            None
+        };
         let mut emitter =
             EventEmitter::with_sink(&*self.clock, started_at, run_id, self.event_capacity, sink);
         emitter.run_started(&compiled, mode);
@@ -2710,6 +2900,7 @@ impl MacroRuntime {
             watch_groups: HashMap::new(),
             watch_body_generation: None,
             watch_body_generation_changed: false,
+            live,
         };
         let reason = execution
             .execute_blocks(&blocks)
@@ -2821,6 +3012,7 @@ pub enum MacroControllerStatus {
 
 struct ControllerState {
     active_revision: Option<SavedRevision>,
+    active_mode: Option<RunMode>,
     status: MacroControllerStatus,
     stop_requested: bool,
     completed_cycles: u64,
@@ -2831,6 +3023,7 @@ impl Default for ControllerState {
     fn default() -> Self {
         Self {
             active_revision: None,
+            active_mode: None,
             status: MacroControllerStatus::Idle,
             stop_requested: false,
             completed_cycles: 0,
@@ -2887,7 +3080,9 @@ impl ControllerEventBuffer {
                 }
                 RunEvent::StatusChanged { .. } => semantic.status = Some(event.clone()),
                 RunEvent::BlockEntered { .. } => semantic.active_block = Some(event.clone()),
-                RunEvent::ActionPlanned { .. } | RunEvent::ActionBlocked { .. } => {
+                RunEvent::ActionPlanned { .. }
+                | RunEvent::ActionBlocked { .. }
+                | RunEvent::ActionStateChanged { .. } => {
                     semantic.latest_action = Some(event.clone());
                 }
                 RunEvent::ObservationCompleted { .. } => {
@@ -3102,6 +3297,7 @@ impl MacroController {
             bail!("Run Once cannot execute a reachable Continuous block");
         }
         state.active_revision = Some(saved.clone());
+        state.active_mode = Some(request.mode);
         state.status = MacroControllerStatus::Running;
         state.stop_requested = false;
         state.completed_cycles = 0;
@@ -3195,12 +3391,14 @@ impl MacroController {
                     .lock()
                     .expect("macro controller state poisoned");
                 state.active_revision = None;
+                state.active_mode = None;
                 state.status = MacroControllerStatus::Idle;
                 state.stop_requested = false;
             }) {
             Ok(worker) => worker,
             Err(error) => {
                 state.active_revision = None;
+                state.active_mode = None;
                 state.status = MacroControllerStatus::Idle;
                 return Err(error).context("could not spawn macro controller worker");
             }
@@ -3233,17 +3431,30 @@ impl MacroController {
     pub fn pause(&self) {
         let mut state = self.state.lock().expect("macro controller state poisoned");
         if state.active_revision.is_some() && state.status == MacroControllerStatus::Running {
+            if matches!(state.active_mode, Some(RunMode::Live)) {
+                self.runtime.suspend_live();
+            }
             self.runtime.pause();
             state.status = MacroControllerStatus::Paused;
         }
     }
 
     pub fn resume(&self) -> Result<()> {
-        let mut state = self.state.lock().expect("macro controller state poisoned");
-        if state.status != MacroControllerStatus::Paused {
-            bail!("macro controller is not paused");
+        let live = {
+            let state = self.state.lock().expect("macro controller state poisoned");
+            if state.status != MacroControllerStatus::Paused {
+                bail!("macro controller is not paused");
+            }
+            matches!(state.active_mode, Some(RunMode::Live))
+        };
+        if live {
+            self.runtime.reauthorize_live()?;
         }
-        // Observation-only and dry-run modes have no live target session to reauthorize.
+        let mut state = self.state.lock().expect("macro controller state poisoned");
+        if state.status != MacroControllerStatus::Paused || state.active_revision.is_none() {
+            self.runtime.suspend_live();
+            bail!("macro controller changed state while resuming");
+        }
         self.runtime.resume();
         state.status = MacroControllerStatus::Running;
         Ok(())
@@ -3252,6 +3463,9 @@ impl MacroController {
     pub fn stop(&self) {
         let mut state = self.state.lock().expect("macro controller state poisoned");
         if state.active_revision.is_some() {
+            if matches!(state.active_mode, Some(RunMode::Live)) {
+                self.runtime.suspend_live();
+            }
             state.stop_requested = true;
             state.status = MacroControllerStatus::Stopping;
             self.runtime.stop();
@@ -3261,6 +3475,9 @@ impl MacroController {
     pub fn emergency_stop(&self) {
         let mut state = self.state.lock().expect("macro controller state poisoned");
         if state.active_revision.is_some() {
+            if matches!(state.active_mode, Some(RunMode::Live)) {
+                self.runtime.suspend_live();
+            }
             state.stop_requested = true;
             state.status = MacroControllerStatus::Stopping;
         }
@@ -3422,6 +3639,7 @@ impl Drop for MacroController {
             }
             state.worker.take()
         };
+        self.runtime.suspend_live();
         self.runtime.emergency_stop();
         if let Some(worker) = worker {
             let _ = worker.join();
@@ -3467,6 +3685,37 @@ impl Drop for ActiveRunGuard {
     }
 }
 
+struct LiveRunExecution {
+    config: LiveRuntimeConfig,
+    committer: ActionCommitter,
+    next_action_instance_id: u64,
+}
+
+impl LiveRunExecution {
+    fn resume_authorization(&self) -> Result<ResumeAuthorization> {
+        self.config
+            .session
+            .current_authorization()
+            .context("live action requires fresh resume authorization")
+    }
+
+    fn next_attempt_id(&mut self, run_id: &str) -> ActionAttemptId {
+        let action_instance_id = self.next_action_instance_id;
+        self.next_action_instance_id = self.next_action_instance_id.saturating_add(1);
+        ActionAttemptId {
+            run_id: run_id.to_string(),
+            action_instance_id,
+        }
+    }
+}
+
+impl Drop for LiveRunExecution {
+    fn drop(&mut self) {
+        let _ = self.committer.finish_run();
+        self.config.session.suspend();
+    }
+}
+
 struct RunExecution<'a, 'clock> {
     runtime: &'a MacroRuntime,
     compiled: &'a CompiledMacro,
@@ -3482,6 +3731,7 @@ struct RunExecution<'a, 'clock> {
     watch_groups: HashMap<String, WatchGroupRunner>,
     watch_body_generation: Option<u64>,
     watch_body_generation_changed: bool,
+    live: Option<LiveRunExecution>,
 }
 
 impl RunExecution<'_, '_> {
@@ -4681,12 +4931,13 @@ impl RunExecution<'_, '_> {
             self.emitter.action_planned_if_generation(
                 block_id,
                 action.clone(),
-                token,
+                token.clone(),
                 &self.runtime.control_handle(),
                 expected_generation,
             )
         } else {
-            self.emitter.action_planned(block_id, action.clone(), token);
+            self.emitter
+                .action_planned(block_id, action.clone(), token.clone());
             true
         };
         if !planned {
@@ -4700,10 +4951,147 @@ impl RunExecution<'_, '_> {
                 self.non_authoritative_planned_clicks.saturating_add(1);
         }
         self.watch_body_generation = None;
-        if is_side_effect_action(action) {
+        let (live_stop, live_side_effect) = if self.live.is_some() {
+            self.dispatch_live_action(block_id, action, token.as_ref())
+        } else {
+            (None, is_side_effect_action(action))
+        };
+        if live_side_effect {
             self.invalidate_after_side_effect();
         }
+        if live_stop.is_some() {
+            return live_stop;
+        }
         self.cooperative_wait(self.compiled.definition().safety.minimum_click_interval_ms)
+    }
+
+    fn dispatch_live_action(
+        &mut self,
+        block_id: &str,
+        action: &Action,
+        token: Option<&ObservationToken>,
+    ) -> (Option<StopReason>, bool) {
+        if matches!(action, Action::MoveOnly { .. }) {
+            self.emitter.action_blocked(
+                block_id,
+                action.clone(),
+                "MoveOnly is not supported by the v1 live runtime".to_string(),
+            );
+            return (
+                Some(StopReason::UnsupportedBlock {
+                    block_id: block_id.to_string(),
+                }),
+                false,
+            );
+        }
+        let run_id = self.emitter.run_id().to_string();
+        let generation = self.runtime.control_handle().generation();
+        let live = self.live.as_mut().expect("live execution disappeared");
+        let resume = match live.resume_authorization() {
+            Ok(resume) => resume,
+            Err(error) => {
+                let message = error.to_string();
+                self.emitter
+                    .action_blocked(block_id, action.clone(), message.clone());
+                return (Some(StopReason::TechnicalFailure { message }), false);
+            }
+        };
+        let destination = match live_action_destination(self.compiled, action, token, &resume) {
+            Ok(destination) => destination,
+            Err(error) => {
+                let message = error.to_string();
+                self.emitter
+                    .action_blocked(block_id, action.clone(), message.clone());
+                return (Some(StopReason::TechnicalFailure { message }), false);
+            }
+        };
+        let attempt_id = live.next_attempt_id(&run_id);
+        let authorization = match self.compiled.authorize_action(
+            &run_id,
+            generation,
+            attempt_id.action_instance_id,
+            block_id,
+            action,
+            token,
+            &resume,
+            destination,
+            maximum_observation_age_ms(self.compiled, action, token),
+        ) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                let message = error.to_string();
+                self.emitter
+                    .action_blocked(block_id, action.clone(), message.clone());
+                return (Some(StopReason::TechnicalFailure { message }), false);
+            }
+        };
+        debug_assert_eq!(authorization.attempt_id, attempt_id);
+        let request = ActionPrepareRequest::new(
+            authorization,
+            None,
+            self.compiled.definition().safety.minimum_click_interval_ms,
+            match self.compiled.definition().safety.focus_loss {
+                super::FocusLossPolicy::Pause => TakeoverPolicy::Pause,
+                super::FocusLossPolicy::Stop => TakeoverPolicy::Stop,
+            },
+            resume,
+        );
+        let prepared = match live.committer.prepare(request) {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                let message = format!("{reason:?}");
+                self.emitter
+                    .action_blocked(block_id, action.clone(), message.clone());
+                return (Some(block_reason_to_stop(reason, message)), false);
+            }
+        };
+        let control = self.runtime.control_handle();
+        let context = CommitContext::new(&run_id, generation, token.cloned());
+        let emitter = &mut self.emitter;
+        let event_action = action.clone();
+        let event_attempt = attempt_id.clone();
+        let outcome = live
+            .committer
+            .commit_observed(prepared, &control, context, |state| match state {
+                ActionState::Prepared
+                | ActionState::Committed
+                | ActionState::Dispatched
+                | ActionState::UncertainDispatch => emitter.action_state_changed(
+                    block_id,
+                    event_action.clone(),
+                    event_attempt.clone(),
+                    state,
+                ),
+                ActionState::Blocked | ActionState::Planned => {}
+            });
+        match outcome {
+            ActionOutcome::Dispatched { .. } => (None, true),
+            ActionOutcome::UncertainDispatch { message, .. } => (
+                Some(StopReason::TechnicalFailure {
+                    message: format!(
+                        "action {} entered uncertain dispatch: {message}",
+                        attempt_id.action_instance_id
+                    ),
+                }),
+                true,
+            ),
+            ActionOutcome::Blocked { reason, .. } => {
+                let message = format!("{reason:?}");
+                self.emitter
+                    .action_blocked(block_id, action.clone(), message.clone());
+                let control_stop = self.check_control();
+                if matches!(reason, BlockReason::ManualTakeover(TakeoverPolicy::Pause))
+                    && control_stop.is_none()
+                {
+                    (None, false)
+                } else {
+                    (
+                        control_stop.or_else(|| Some(block_reason_to_stop(reason, message))),
+                        false,
+                    )
+                }
+            }
+        }
     }
 
     fn invalidate_after_side_effect(&mut self) {
@@ -4979,6 +5367,101 @@ fn is_click_action(action: &Action) -> bool {
 
 fn is_side_effect_action(action: &Action) -> bool {
     is_click_action(action) || matches!(action, Action::MoveOnly { .. })
+}
+
+fn live_action_destination(
+    compiled: &CompiledMacro,
+    action: &Action,
+    token: Option<&ObservationToken>,
+    resume: &ResumeAuthorization,
+) -> Result<Point> {
+    let rect_center = |rect: crate::engine::types::Rect| -> Result<Point> {
+        let x = i64::from(rect.x)
+            .checked_add(i64::from(rect.width) / 2)
+            .and_then(|value| i32::try_from(value).ok())
+            .context("action destination x overflowed")?;
+        let y = i64::from(rect.y)
+            .checked_add(i64::from(rect.height) / 2)
+            .and_then(|value| i32::try_from(value).ok())
+            .context("action destination y overflowed")?;
+        Ok(Point::new(x, y))
+    };
+    match action {
+        Action::ClickTextMatch { .. } | Action::ClickImageMatch { .. } => {
+            let token = token.context("matched click requires fresh detector evidence")?;
+            let frame = token
+                .frame_metadata
+                .context("matched click evidence has no frame geometry")?;
+            let local = token
+                .match_rect
+                .context("matched click evidence has no match geometry")?;
+            rect_center(local_rect_to_screen(
+                crate::engine::types::Rect::new(
+                    frame.client_x,
+                    frame.client_y,
+                    frame.client_width,
+                    frame.client_height,
+                ),
+                local,
+            )?)
+        }
+        Action::ClickPoint { point_id, .. } => {
+            let point = compiled
+                .definition()
+                .points
+                .iter()
+                .find(|point| point.id == *point_id)
+                .with_context(|| format!("compiled point '{point_id}' is missing"))?;
+            Ok(resume.target.client_rect.point_from_ratio(point.point))
+        }
+        Action::ClickRegion { region_id, .. } => {
+            let region = compiled
+                .definition()
+                .regions
+                .iter()
+                .find(|region| region.id == *region_id)
+                .with_context(|| format!("compiled region '{region_id}' is missing"))?;
+            rect_center(resume.target.client_rect.rect_from_ratio(region.rect))
+        }
+        Action::MoveOnly { .. } => bail!("MoveOnly is not supported by the v1 live runtime"),
+    }
+}
+
+fn maximum_observation_age_ms(
+    compiled: &CompiledMacro,
+    action: &Action,
+    token: Option<&ObservationToken>,
+) -> u64 {
+    let Some(token) = token else {
+        return 0;
+    };
+    match action {
+        Action::ClickTextMatch { .. } => compiled
+            .definition()
+            .text_rules
+            .iter()
+            .find(|rule| rule.id == token.rule_id)
+            .map_or(1, |rule| rule.poll_interval_ms.max(1)),
+        Action::ClickImageMatch { .. } => compiled
+            .definition()
+            .image_rules
+            .iter()
+            .find(|rule| rule.id == token.rule_id)
+            .map_or(1, |rule| rule.poll_interval_ms.max(1)),
+        Action::ClickPoint { .. } | Action::ClickRegion { .. } | Action::MoveOnly { .. } => 0,
+    }
+}
+
+fn block_reason_to_stop(reason: BlockReason, message: String) -> StopReason {
+    match reason {
+        BlockReason::ClickBudgetExceeded | BlockReason::AttemptLedgerFull => {
+            StopReason::SafetyLimit { message }
+        }
+        BlockReason::Stopped | BlockReason::ManualTakeover(TakeoverPolicy::Stop) => {
+            StopReason::UserStopped
+        }
+        _ => StopReason::TechnicalFailure { message },
+    }
 }
 
 fn validate_action_token(
@@ -5349,6 +5832,29 @@ impl<'a> EventEmitter<'a> {
         });
     }
 
+    fn action_state_changed(
+        &mut self,
+        block_id: &str,
+        action: Action,
+        attempt_id: ActionAttemptId,
+        state: ActionState,
+    ) {
+        debug_assert!(!matches!(
+            state,
+            ActionState::Planned | ActionState::Blocked
+        ));
+        let (sequence, elapsed_ms, run_id) = self.metadata();
+        self.push_critical(RunEvent::ActionStateChanged {
+            sequence,
+            elapsed_ms,
+            run_id,
+            block_id: block_id.to_string(),
+            action,
+            attempt_id,
+            state,
+        });
+    }
+
     fn observation_completed(
         &mut self,
         block_id: &str,
@@ -5673,6 +6179,83 @@ mod tests {
                     reason,
                 });
             }
+            if let Err(reason) = validate_after_movement() {
+                return InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure: InputDispatchFailure::Validation { reason },
+                });
+            }
+            InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingLiveInput {
+        dispatches: AtomicU64,
+        destinations: Mutex<Vec<(Point, MouseButton)>>,
+    }
+
+    #[derive(Debug)]
+    struct CommitObservingInput {
+        observed: Arc<Mutex<Vec<ActionState>>>,
+    }
+
+    impl LiveActionInput for CommitObservingInput {
+        fn reset_manual_baseline(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn manual_takeover_detected(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn dispatch_action(
+            &self,
+            _point: Point,
+            _button: MouseButton,
+            _movement: Option<&MouseMovementProfile>,
+            _stop: &dyn StopSource,
+            commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+            validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+        ) -> InputDispatchOutcome {
+            commit().unwrap();
+            assert_eq!(
+                self.observed.lock().unwrap().last(),
+                Some(&ActionState::Committed),
+                "Committed must be observed before the first input boundary returns"
+            );
+            validate_after_movement().unwrap();
+            InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+        }
+    }
+
+    impl LiveActionInput for CountingLiveInput {
+        fn reset_manual_baseline(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn manual_takeover_detected(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn dispatch_action(
+            &self,
+            point: Point,
+            button: MouseButton,
+            _movement: Option<&MouseMovementProfile>,
+            stop: &dyn StopSource,
+            commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+            validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+        ) -> InputDispatchOutcome {
+            if stop.is_stopped() {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped);
+            }
+            if let Err(reason) = commit() {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit {
+                    reason,
+                });
+            }
+            self.dispatches.fetch_add(1, Ordering::AcqRel);
+            self.destinations.lock().unwrap().push((point, button));
             if let Err(reason) = validate_after_movement() {
                 return InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
                     failure: InputDispatchFailure::Validation { reason },
@@ -6179,6 +6762,252 @@ mod tests {
             Arc::new(detector),
             Arc::new(FakeClock::default()),
         )
+    }
+
+    fn live_target() -> TargetSnapshot {
+        TargetSnapshot {
+            window_id: 9,
+            process_id: 10,
+            process_started_at_100ns: 11,
+            process_path: "game.exe".to_string(),
+            client_rect: Rect::new(0, 0, 1920, 1080),
+            window_revision: 2,
+            geometry_revision: 3,
+            dpi: 96,
+            display_profile: "display-a".to_string(),
+            display_profile_revision: 4,
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
+        }
+    }
+
+    #[test]
+    fn live_mode_refuses_without_live_configuration() {
+        let error = fixture_runtime()
+            .run(fixture_click_macro(), RunMode::Live)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("live input is not configured"));
+    }
+
+    #[test]
+    fn live_mode_dispatches_point_click_inline_with_ordered_transitions() {
+        let input = Arc::new(CountingLiveInput::default());
+        let session = LiveActionSession::new(
+            Arc::new(StableLiveTarget(live_target())),
+            input.clone(),
+            Arc::new(NoopLiveControl),
+        );
+        let events = fixture_runtime()
+            .with_live_session(session)
+            .run(fixture_click_macro(), RunMode::Live)
+            .unwrap();
+
+        assert_eq!(input.dispatches.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *input.destinations.lock().unwrap(),
+            vec![(Point::new(960, 540), MouseButton::Left)]
+        );
+        let states = events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::ActionPlanned { state, .. }
+                | RunEvent::ActionBlocked { state, .. }
+                | RunEvent::ActionStateChanged { state, .. } => Some(state.to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            vec![
+                ActionState::Planned,
+                ActionState::Prepared,
+                ActionState::Committed,
+                ActionState::Dispatched,
+            ]
+        );
+        let attempt_ids = events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::ActionStateChanged { attempt_id, .. } => Some(attempt_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(attempt_ids.len(), 3);
+        assert!(attempt_ids.windows(2).all(|ids| ids[0] == ids[1]));
+    }
+
+    #[test]
+    fn live_mode_rejects_move_only_without_dispatch() {
+        let input = Arc::new(CountingLiveInput::default());
+        let session = LiveActionSession::new(
+            Arc::new(StableLiveTarget(live_target())),
+            input.clone(),
+            Arc::new(NoopLiveControl),
+        );
+        let definition = fixture_definition(vec![block(
+            "move-only",
+            BlockKind::Action {
+                action: Action::MoveOnly {
+                    target: super::super::ActionTarget::Point {
+                        point_id: "point".to_string(),
+                    },
+                },
+            },
+        )]);
+
+        let events = fixture_runtime()
+            .with_live_session(session)
+            .run(saved(definition), RunMode::Live)
+            .unwrap();
+
+        assert_eq!(input.dispatches.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::UnsupportedBlock { block_id },
+                ..
+            }) if block_id == "move-only"
+        ));
+    }
+
+    #[test]
+    fn committer_observes_committed_at_the_input_commit_boundary() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let target = live_target();
+        let session = LiveActionSession::new(
+            Arc::new(StableLiveTarget(target.clone())),
+            Arc::new(CommitObservingInput {
+                observed: Arc::clone(&observed),
+            }),
+            Arc::new(NoopLiveControl),
+        );
+        let resume = session.resume().unwrap();
+        let compiled = CompiledMacro::compile(fixture_click_macro()).unwrap();
+        let action = Action::ClickPoint {
+            point_id: "point".to_string(),
+            button: MouseButton::Left,
+        };
+        let authorization = compiled
+            .authorize_action(
+                "live-run",
+                1,
+                1,
+                "click",
+                &action,
+                None,
+                &resume,
+                Point::new(960, 540),
+                1,
+            )
+            .unwrap();
+        let committer = ActionCommitter::new(
+            session,
+            Arc::new(FrozenClock),
+            "live-run",
+            Limit::Finite(1),
+            4,
+        )
+        .unwrap();
+        let prepared = committer
+            .prepare(ActionPrepareRequest::new(
+                authorization,
+                None,
+                1,
+                TakeoverPolicy::Stop,
+                resume,
+            ))
+            .unwrap();
+
+        let outcome = committer.commit_observed(
+            prepared,
+            &NeverStop,
+            CommitContext::new("live-run", 1, None),
+            |state| observed.lock().unwrap().push(state),
+        );
+
+        assert!(matches!(outcome, ActionOutcome::Dispatched { .. }));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                ActionState::Prepared,
+                ActionState::Committed,
+                ActionState::Dispatched,
+            ]
+        );
+    }
+
+    #[test]
+    fn unlimited_committer_evicts_terminal_attempts_without_allowing_replay() {
+        let target = live_target();
+        let session = LiveActionSession::new(
+            Arc::new(StableLiveTarget(target.clone())),
+            Arc::new(SuccessfulLiveInput),
+            Arc::new(NoopLiveControl),
+        );
+        let resume = session.resume().unwrap();
+        let committer = ActionCommitter::new(
+            session,
+            Arc::new(FrozenClock),
+            "live-run",
+            Limit::Unlimited,
+            2,
+        )
+        .unwrap();
+
+        for action_instance_id in 1..=5 {
+            let authorization = ActionAuthorization::for_test(
+                ActionAttemptId::for_test("live-run", action_instance_id),
+                target.clone(),
+                Point::new(10, 10),
+                MouseButton::Left,
+                None,
+                1,
+                1,
+            );
+            let prepared = committer
+                .prepare(ActionPrepareRequest::new(
+                    authorization,
+                    None,
+                    0,
+                    TakeoverPolicy::Stop,
+                    resume.clone(),
+                ))
+                .unwrap();
+            assert!(matches!(
+                committer.commit(
+                    prepared,
+                    &NeverStop,
+                    CommitContext::new("live-run", 1, None)
+                ),
+                ActionOutcome::Dispatched { .. }
+            ));
+        }
+
+        assert_eq!(committer.committed_clicks(), 5);
+        assert!(committer.retained_attempt_count_for_test() <= 2);
+        let replay = ActionAuthorization::for_test(
+            ActionAttemptId::for_test("live-run", 1),
+            target,
+            Point::new(10, 10),
+            MouseButton::Left,
+            None,
+            1,
+            1,
+        );
+        assert_eq!(
+            committer
+                .prepare(ActionPrepareRequest::new(
+                    replay,
+                    None,
+                    0,
+                    TakeoverPolicy::Stop,
+                    resume,
+                ))
+                .unwrap_err(),
+            BlockReason::AttemptReplay
+        );
     }
 
     fn generated_wizard_definition(
@@ -11514,6 +12343,7 @@ mod tests {
             | RunEvent::BlockEntered { run_id, .. }
             | RunEvent::ActionPlanned { run_id, .. }
             | RunEvent::ActionBlocked { run_id, .. }
+            | RunEvent::ActionStateChanged { run_id, .. }
             | RunEvent::ObservationCompleted { run_id, .. }
             | RunEvent::ConditionEvaluated { run_id, .. }
             | RunEvent::ObservationProgress { run_id, .. }

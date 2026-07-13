@@ -116,10 +116,6 @@ impl EmergencySignal {
         self.requested.load(Ordering::Acquire)
     }
 
-    fn take(&self) -> bool {
-        self.requested.swap(false, Ordering::AcqRel)
-    }
-
     fn notify(&self) {
         self.wake.notify_all();
     }
@@ -139,12 +135,14 @@ impl EmergencySignal {
 pub struct RuntimeCommandSender {
     sender: SyncSender<RuntimeCommand>,
     emergency_stop: Arc<EmergencySignal>,
+    emergency_notice: Arc<AtomicBool>,
 }
 
 impl RuntimeCommandSender {
     pub fn send(&self, command: RuntimeCommand) -> CommandDelivery {
         if matches!(command, RuntimeCommand::EmergencyStop) {
             self.emergency_stop.request();
+            self.emergency_notice.store(true, Ordering::Release);
             return match self.sender.try_send(command) {
                 Ok(()) => CommandDelivery::Sent,
                 Err(TrySendError::Full(_)) => CommandDelivery::Full,
@@ -160,6 +158,7 @@ impl RuntimeCommandSender {
     pub fn try_send(&self, command: RuntimeCommand) -> CommandDelivery {
         if matches!(command, RuntimeCommand::EmergencyStop) {
             self.emergency_stop.request();
+            self.emergency_notice.store(true, Ordering::Release);
         }
         match self.sender.try_send(command) {
             Ok(()) => CommandDelivery::Sent,
@@ -175,7 +174,7 @@ impl RuntimeCommandSender {
 
 pub struct RuntimeCommandReceiver {
     receiver: Receiver<RuntimeCommand>,
-    emergency_stop: Arc<EmergencySignal>,
+    emergency_notice: Arc<AtomicBool>,
 }
 
 impl RuntimeCommandReceiver {
@@ -188,7 +187,7 @@ impl RuntimeCommandReceiver {
     }
 
     pub fn take_emergency_stop(&self) -> bool {
-        self.emergency_stop.take()
+        self.emergency_notice.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -331,6 +330,7 @@ fn bounded_runtime_channels_with_signal(
         "event channel capacity must be positive"
     );
     let (command_sender, command_receiver) = mpsc::sync_channel(command_capacity);
+    let emergency_notice = Arc::new(AtomicBool::new(false));
     let event_queue = Arc::new(EventQueue {
         capacity: event_capacity,
         queue: Mutex::new(VecDeque::with_capacity(event_capacity)),
@@ -341,10 +341,11 @@ fn bounded_runtime_channels_with_signal(
         commands: RuntimeCommandSender {
             sender: command_sender,
             emergency_stop: Arc::clone(&emergency_stop),
+            emergency_notice: Arc::clone(&emergency_notice),
         },
         command_receiver: RuntimeCommandReceiver {
             receiver: command_receiver,
-            emergency_stop,
+            emergency_notice,
         },
         events: RuntimeEventSender {
             queue: Arc::clone(&event_queue),
@@ -712,14 +713,8 @@ impl MacroRuntime {
     }
 
     pub fn run(&self, saved: SavedRevision, mode: RunMode) -> Result<Vec<RunEvent>> {
-        let _active = ActiveRunGuard::acquire(&self.active)?;
-        {
-            self.emergency_stop.reset();
-            let mut control = self.control.lock().expect("runtime control poisoned");
-            control.generation = control.generation.wrapping_add(1);
-            control.paused = false;
-            control.stop = None;
-        }
+        let _active =
+            ActiveRunGuard::acquire_and_reset(&self.active, &self.emergency_stop, &self.control)?;
         let compiled = CompiledMacro::compile(saved)?;
         let started_at = self.clock.now_ms();
         let run_number = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
@@ -798,10 +793,21 @@ struct ActiveRunGuard {
 }
 
 impl ActiveRunGuard {
-    fn acquire(active: &Arc<Mutex<bool>>) -> Result<Self> {
+    fn acquire_and_reset(
+        active: &Arc<Mutex<bool>>,
+        emergency_stop: &EmergencySignal,
+        control: &Mutex<ControlState>,
+    ) -> Result<Self> {
         let mut is_active = active.lock().expect("runtime active-run state poisoned");
         if *is_active {
             bail!("macro runtime is already active");
+        }
+        emergency_stop.reset();
+        {
+            let mut control = control.lock().expect("runtime control poisoned");
+            control.generation = control.generation.wrapping_add(1);
+            control.paused = false;
+            control.stop = None;
         }
         *is_active = true;
         drop(is_active);
@@ -2788,6 +2794,48 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, RunEvent::ActionPlanned { .. }))
         );
+    }
+
+    #[test]
+    fn receiving_the_queued_emergency_does_not_clear_the_runtime_bypass() {
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeCapture),
+            Arc::new(FakeDetector::default()),
+            Arc::new(SystemClock::default()),
+        );
+        let channels = runtime.bounded_channels(1, 1);
+        assert_eq!(
+            channels.commands.try_send(RuntimeCommand::Pause),
+            CommandDelivery::Sent
+        );
+        let runner = runtime.clone();
+        let definition = fixture_definition(vec![block(
+            "wait",
+            BlockKind::Wait {
+                duration_ms: 60_000,
+            },
+        )]);
+        let handle = thread::spawn(move || runner.run(saved(definition), RunMode::DryRun).unwrap());
+        thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(
+            channels.commands.try_send(RuntimeCommand::EmergencyStop),
+            CommandDelivery::Full
+        );
+        assert!(channels.command_receiver.take_emergency_stop());
+        thread::sleep(Duration::from_millis(40));
+        if !handle.is_finished() {
+            runtime.stop();
+        }
+        let events = handle.join().unwrap();
+
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::EmergencyStopped,
+                ..
+            })
+        ));
     }
 
     #[test]

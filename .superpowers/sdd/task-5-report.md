@@ -120,3 +120,7 @@ Review remediation was implemented in `a68bd13` (`fix: harden observation runtim
 - `rustfmt --edition 2024 --check src/engine/macro_engine/observation.rs src/engine/macro_engine/runtime.rs src/engine/macro_engine/semantics.rs src/engine/macro_engine/mod.rs` - exit 0, no output.
 - `cargo clippy --all-targets -- -D warnings -A dead_code -A clippy::collapsible-if -A clippy::too-many-arguments -A clippy::default-constructed-unit-structs -A clippy::ptr-arg` - exit 0.
 - `git diff --check` - exit 0, no output.
+
+### Independent Review Follow-Up
+
+The independent remediation review found one remaining emergency-ownership race. Commit `dd57e03` (`fix: make emergency bypass runtime-sticky`) closes it: command-receiver acknowledgment now uses a separate atomic notice and cannot clear the runtime's sticky emergency signal, while per-run control reset occurs under the active-ownership lock before `active = true` is published. The new regression first ended `UserStopped` after the receiver consumed the bypass; it now ends `EmergencyStopped`. Final counts after this follow-up are 37 runtime tests and 126 full-suite tests.

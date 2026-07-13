@@ -17,7 +17,7 @@ use windows::Win32::{
 };
 
 use super::windows_mouse_hook::{
-    ManualMouseActivityObserver, MouseEventSource, RUNTIME_INPUT_MARKER,
+    ManualMouseActivityObserver, MouseEventSource, MousePoint, SessionInputMarker,
     WindowsMouseHookEventSource,
 };
 use crate::engine::{
@@ -34,6 +34,7 @@ const DEFAULT_MANUAL_MOVEMENT_THRESHOLD_PX: i32 = 4;
 /// Sequenced low-level-hook takeover detector shared by one run-owned macro input sink.
 pub struct ManualInputMonitor {
     observer: ManualMouseActivityObserver,
+    marker: SessionInputMarker,
 }
 
 impl std::fmt::Debug for ManualInputMonitor {
@@ -45,14 +46,24 @@ impl std::fmt::Debug for ManualInputMonitor {
 }
 
 impl ManualInputMonitor {
-    pub fn new() -> Result<Self> {
-        let source = Arc::new(WindowsMouseHookEventSource::install()?);
+    pub fn new(marker: SessionInputMarker) -> Result<Self> {
+        let baseline = cursor_position()?;
+        let source = Arc::new(WindowsMouseHookEventSource::install(
+            marker,
+            MousePoint {
+                x: baseline.x,
+                y: baseline.y,
+            },
+            DEFAULT_MANUAL_MOVEMENT_THRESHOLD_PX,
+        )?);
         Ok(Self::with_event_source(source))
     }
 
     pub fn with_event_source(source: Arc<dyn MouseEventSource>) -> Self {
+        let marker = source.session_marker();
         Self {
             observer: ManualMouseActivityObserver::new(source),
+            marker,
         }
     }
 
@@ -61,25 +72,35 @@ impl ManualInputMonitor {
     }
 
     pub fn reset_baseline(&self) -> Result<()> {
-        self.observer.reset_baseline();
+        let baseline = cursor_position()?;
+        self.observer.reset_baseline(MousePoint {
+            x: baseline.x,
+            y: baseline.y,
+        });
         Ok(())
+    }
+
+    fn marker(&self) -> SessionInputMarker {
+        self.marker
     }
 }
 
 #[derive(Debug)]
 pub struct WindowsInputSink {
     monitor: Arc<ManualInputMonitor>,
+    marker: SessionInputMarker,
 }
 
 impl WindowsInputSink {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            monitor: Arc::new(ManualInputMonitor::new()?),
-        })
+        let marker = SessionInputMarker::generate()?;
+        let monitor = Arc::new(ManualInputMonitor::new(marker)?);
+        Ok(Self::with_monitor(monitor))
     }
 
     pub fn with_monitor(monitor: Arc<ManualInputMonitor>) -> Self {
-        Self { monitor }
+        let marker = monitor.marker();
+        Self { monitor, marker }
     }
 
     pub fn reset_manual_baseline(&self) -> Result<()> {
@@ -115,7 +136,7 @@ impl WindowsInputSink {
                 (f64::from(start.x) + dx as f64 * progress).round() as i32,
                 (f64::from(start.y) + dy as f64 * progress).round() as i32,
             );
-            send_marked_move(next).map_err(|failure| anyhow!(failure.to_string()))?;
+            send_marked_move(next, self.marker).map_err(|failure| anyhow!(failure.to_string()))?;
             if duration_ms > 0 && segment < segments {
                 thread::sleep(Duration::from_millis((duration_ms / segments).max(1)));
             }
@@ -165,7 +186,10 @@ impl WindowsInputSink {
             MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
             MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
         };
-        let inputs = [marked_mouse_input(down), marked_mouse_input(up)];
+        let inputs = [
+            marked_mouse_input(down, self.marker),
+            marked_mouse_input(up, self.marker),
+        ];
         match dispatch_inputs(&WindowsSendInputApi, &inputs) {
             Ok(()) => InputDispatchOutcome::Dispatched,
             Err(failure) => InputDispatchOutcome::UncertainDispatch { failure },
@@ -296,7 +320,10 @@ fn dispatch_inputs(
     }
 }
 
-fn send_marked_move(point: Point) -> std::result::Result<(), SendInputFailure> {
+fn send_marked_move(
+    point: Point,
+    marker: SessionInputMarker,
+) -> std::result::Result<(), SendInputFailure> {
     let x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
     let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
     let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
@@ -315,24 +342,18 @@ fn send_marked_move(point: Point) -> std::result::Result<(), SendInputFailure> {
         .checked_div(i64::from(height - 1))
         .and_then(|value| i32::try_from(value.clamp(0, 65_535)).ok())
         .unwrap_or(0);
-    let input = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx: normalized_x,
-                dy: normalized_y,
-                mouseData: 0,
-                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                time: 0,
-                dwExtraInfo: RUNTIME_INPUT_MARKER,
-            },
-        },
-    };
+    let mut input = marked_mouse_input(
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        marker,
+    );
+    input.Anonymous.mi.dx = normalized_x;
+    input.Anonymous.mi.dy = normalized_y;
     dispatch_inputs(&WindowsSendInputApi, &[input])
 }
 
 fn marked_mouse_input(
     flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+    marker: SessionInputMarker,
 ) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
@@ -343,7 +364,7 @@ fn marked_mouse_input(
                 mouseData: 0,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: RUNTIME_INPUT_MARKER,
+                dwExtraInfo: marker.get(),
             },
         },
     }
@@ -358,7 +379,12 @@ mod tests {
 
     use anyhow::{Result, bail};
 
-    use super::{SendInputApi, dispatch_inputs};
+    use super::{
+        ManualInputMonitor, SendInputApi, WindowsInputSink, dispatch_inputs, marked_mouse_input,
+    };
+    use crate::engine::platform::windows_mouse_hook::{
+        MouseActivitySnapshot, MouseEventSource, MousePoint, SessionInputMarker,
+    };
 
     use crate::engine::{
         automation::{Clock, MouseButton, StopSource, TargetGuard, TargetSnapshot},
@@ -1159,14 +1185,61 @@ mod tests {
         }
     }
 
+    struct StaticMouseEventSource(SessionInputMarker);
+
+    impl MouseEventSource for StaticMouseEventSource {
+        fn session_marker(&self) -> SessionInputMarker {
+            self.0
+        }
+
+        fn snapshot(&self) -> MouseActivitySnapshot {
+            MouseActivitySnapshot::default()
+        }
+
+        fn reset_movement_baseline(&self, _point: MousePoint) -> MouseActivitySnapshot {
+            MouseActivitySnapshot::default()
+        }
+    }
+
+    #[test]
+    fn sink_derives_its_marker_from_the_bound_monitor() {
+        let marker = marker(707);
+        let monitor = Arc::new(ManualInputMonitor::with_event_source(Arc::new(
+            StaticMouseEventSource(marker),
+        )));
+
+        let sink = WindowsInputSink::with_monitor(monitor);
+
+        assert_eq!(sink.marker, marker);
+    }
+
+    #[test]
+    fn movement_and_click_inputs_carry_the_session_marker() {
+        let marker = SessionInputMarker::generate_with(|bytes| {
+            bytes.copy_from_slice(&707_usize.to_ne_bytes());
+            true
+        })
+        .unwrap();
+
+        for flags in [
+            windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_MOVE,
+            windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN,
+        ] {
+            let input = marked_mouse_input(flags, marker);
+            assert_eq!(unsafe { input.Anonymous.mi.dwExtraInfo }, marker.get());
+        }
+    }
+
     #[test]
     fn send_input_adapter_distinguishes_full_zero_and_partial_results() {
         let inputs = [
             super::marked_mouse_input(
                 windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN,
+                marker(11),
             ),
             super::marked_mouse_input(
                 windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP,
+                marker(11),
             ),
         ];
         assert_eq!(
@@ -1206,5 +1279,13 @@ mod tests {
                 error_code: 87
             })
         );
+    }
+
+    fn marker(value: usize) -> SessionInputMarker {
+        SessionInputMarker::generate_with(|bytes| {
+            bytes.copy_from_slice(&value.to_ne_bytes());
+            true
+        })
+        .unwrap()
     }
 }

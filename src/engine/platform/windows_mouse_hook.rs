@@ -1,5 +1,6 @@
 use std::{
     io,
+    num::NonZeroUsize,
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
@@ -7,6 +8,7 @@ use std::{
     },
     thread::{self, JoinHandle},
 };
+use windows::Win32::Security::Cryptography::SystemPrng;
 use windows::Win32::{
     Foundation::{LPARAM, LRESULT, WPARAM},
     System::Threading::GetCurrentThreadId,
@@ -19,7 +21,38 @@ use windows::Win32::{
     },
 };
 
-pub(crate) const RUNTIME_INPUT_MARKER: usize = 0x4D_41_43_52_4F;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionInputMarker(NonZeroUsize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SessionInputMarkerError {
+    #[error("the operating system failed to generate a session input marker")]
+    OsFailure,
+    #[error("the operating system generated an invalid all-zero session input marker")]
+    AllZero,
+}
+
+impl SessionInputMarker {
+    pub fn generate() -> Result<Self, SessionInputMarkerError> {
+        Self::generate_with(|bytes| unsafe { SystemPrng(bytes).as_bool() })
+    }
+
+    pub(crate) fn generate_with(
+        mut fill: impl FnMut(&mut [u8]) -> bool,
+    ) -> Result<Self, SessionInputMarkerError> {
+        let mut bytes = [0; std::mem::size_of::<usize>()];
+        if !fill(&mut bytes) {
+            return Err(SessionInputMarkerError::OsFailure);
+        }
+        NonZeroUsize::new(usize::from_ne_bytes(bytes))
+            .map(Self)
+            .ok_or(SessionInputMarkerError::AllZero)
+    }
+
+    pub fn get(self) -> usize {
+        self.0.get()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MousePoint {
@@ -72,7 +105,9 @@ pub struct MouseActivitySnapshot {
 }
 
 pub trait MouseEventSource: Send + Sync {
+    fn session_marker(&self) -> SessionInputMarker;
     fn snapshot(&self) -> MouseActivitySnapshot;
+    fn reset_movement_baseline(&self, point: MousePoint) -> MouseActivitySnapshot;
 }
 
 pub struct ManualMouseActivityObserver {
@@ -93,30 +128,69 @@ impl ManualMouseActivityObserver {
         self.source.snapshot().sequence != self.baseline.load(Ordering::Acquire)
     }
 
-    pub fn reset_baseline(&self) {
-        self.baseline
-            .store(self.source.snapshot().sequence, Ordering::Release);
+    pub fn reset_baseline(&self, point: MousePoint) {
+        let snapshot = self.source.reset_movement_baseline(point);
+        self.baseline.store(snapshot.sequence, Ordering::Release);
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MouseActivityLedger {
-    snapshot: Mutex<MouseActivitySnapshot>,
+    marker: SessionInputMarker,
+    movement_threshold_squared: i64,
+    state: Mutex<MouseActivityState>,
+}
+
+#[derive(Debug)]
+struct MouseActivityState {
+    snapshot: MouseActivitySnapshot,
+    movement_baseline: MousePoint,
 }
 
 impl MouseActivityLedger {
+    fn new(marker: SessionInputMarker, movement_baseline: MousePoint, threshold_px: i32) -> Self {
+        Self {
+            marker,
+            movement_threshold_squared: i64::from(threshold_px.max(1)).pow(2),
+            state: Mutex::new(MouseActivityState {
+                snapshot: MouseActivitySnapshot::default(),
+                movement_baseline,
+            }),
+        }
+    }
+
     fn observe(&self, raw: RawMouseEvent) {
-        let Some(origin) = manual_origin(raw.flags, raw.extra_info) else {
-            return;
-        };
-        let mut snapshot = self
-            .snapshot
+        let injected = raw.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0;
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let sequence = snapshot.sequence.wrapping_add(1);
-        snapshot.sequence = sequence;
-        snapshot.last_origin = Some(origin);
-        snapshot.last_event = Some(SequencedMouseEvent {
+
+        if injected && raw.extra_info == self.marker.get() {
+            if raw.kind == MouseEventKind::Move {
+                state.movement_baseline = raw.point;
+            }
+            return;
+        }
+
+        let origin = if injected {
+            MouseEventOrigin::ExternalInjected
+        } else {
+            MouseEventOrigin::Physical
+        };
+        if raw.kind == MouseEventKind::Move {
+            if point_distance_squared(raw.point, state.movement_baseline)
+                < self.movement_threshold_squared
+            {
+                return;
+            }
+            state.movement_baseline = raw.point;
+        }
+
+        let sequence = state.snapshot.sequence.wrapping_add(1);
+        state.snapshot.sequence = sequence;
+        state.snapshot.last_origin = Some(origin);
+        state.snapshot.last_event = Some(SequencedMouseEvent {
             sequence,
             kind: raw.kind,
             point: raw.point,
@@ -125,22 +199,26 @@ impl MouseActivityLedger {
     }
 
     fn snapshot(&self) -> MouseActivitySnapshot {
-        *self
-            .snapshot
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot
+    }
+
+    fn reset_movement_baseline(&self, point: MousePoint) -> MouseActivitySnapshot {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.movement_baseline = point;
+        state.snapshot
     }
 }
 
-fn manual_origin(flags: u32, extra_info: usize) -> Option<MouseEventOrigin> {
-    let injected = flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0;
-    if injected && extra_info == RUNTIME_INPUT_MARKER {
-        None
-    } else if injected {
-        Some(MouseEventOrigin::ExternalInjected)
-    } else {
-        Some(MouseEventOrigin::Physical)
-    }
+fn point_distance_squared(left: MousePoint, right: MousePoint) -> i64 {
+    let dx = i64::from(left.x) - i64::from(right.x);
+    let dy = i64::from(left.y) - i64::from(right.y);
+    dx * dx + dy * dy
 }
 
 fn mouse_event_kind_from_message(message: u32, mouse_data: u32) -> Option<MouseEventKind> {
@@ -170,8 +248,16 @@ pub struct WindowsMouseHookEventSource {
 }
 
 impl WindowsMouseHookEventSource {
-    pub fn install() -> io::Result<Self> {
-        let ledger = Arc::new(MouseActivityLedger::default());
+    pub fn install(
+        marker: SessionInputMarker,
+        movement_baseline: MousePoint,
+        movement_threshold_px: i32,
+    ) -> io::Result<Self> {
+        let ledger = Arc::new(MouseActivityLedger::new(
+            marker,
+            movement_baseline,
+            movement_threshold_px,
+        ));
         register_hook_ledger(&ledger)?;
 
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
@@ -236,8 +322,16 @@ impl WindowsMouseHookEventSource {
 }
 
 impl MouseEventSource for WindowsMouseHookEventSource {
+    fn session_marker(&self) -> SessionInputMarker {
+        self.ledger.marker
+    }
+
     fn snapshot(&self) -> MouseActivitySnapshot {
         self.ledger.snapshot()
+    }
+
+    fn reset_movement_baseline(&self, point: MousePoint) -> MouseActivitySnapshot {
+        self.ledger.reset_movement_baseline(point)
     }
 }
 
@@ -359,13 +453,18 @@ unsafe extern "system" fn low_level_mouse_proc(
 }
 
 #[cfg(test)]
-#[derive(Default)]
 struct FakeMouseEventSource {
     ledger: MouseActivityLedger,
 }
 
 #[cfg(test)]
 impl FakeMouseEventSource {
+    fn new(marker: SessionInputMarker, baseline: MousePoint, threshold_px: i32) -> Self {
+        Self {
+            ledger: MouseActivityLedger::new(marker, baseline, threshold_px),
+        }
+    }
+
     fn emit(&self, event: RawMouseEvent) {
         self.ledger.observe(event);
     }
@@ -373,8 +472,16 @@ impl FakeMouseEventSource {
 
 #[cfg(test)]
 impl MouseEventSource for FakeMouseEventSource {
+    fn session_marker(&self) -> SessionInputMarker {
+        self.ledger.marker
+    }
+
     fn snapshot(&self) -> MouseActivitySnapshot {
         self.ledger.snapshot()
+    }
+
+    fn reset_movement_baseline(&self, point: MousePoint) -> MouseActivitySnapshot {
+        self.ledger.reset_movement_baseline(point)
     }
 }
 
@@ -385,8 +492,139 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_input_marker_generation_accepts_nonzero_generator_output() {
+        let expected = usize::from_ne_bytes([0x5a; std::mem::size_of::<usize>()]);
+
+        let marker = SessionInputMarker::generate_with(|bytes| {
+            bytes.fill(0x5a);
+            true
+        })
+        .unwrap();
+
+        assert_eq!(marker.get(), expected);
+    }
+
+    #[test]
+    fn session_input_marker_generation_reports_os_failure() {
+        assert_eq!(
+            SessionInputMarker::generate_with(|_| false),
+            Err(SessionInputMarkerError::OsFailure)
+        );
+    }
+
+    #[test]
+    fn session_input_marker_generation_rejects_all_zero_output() {
+        assert_eq!(
+            SessionInputMarker::generate_with(|bytes| {
+                bytes.fill(0);
+                true
+            }),
+            Err(SessionInputMarkerError::AllZero)
+        );
+    }
+
+    #[test]
+    fn two_sessions_ignore_only_their_own_marker() {
+        let marker_a = marker(101);
+        let marker_b = marker(202);
+        let source_a = Arc::new(FakeMouseEventSource::new(marker_a, point(0, 0), 4));
+        let source_b = Arc::new(FakeMouseEventSource::new(marker_b, point(0, 0), 4));
+        let observer_a = ManualMouseActivityObserver::new(source_a.clone());
+        let observer_b = ManualMouseActivityObserver::new(source_b.clone());
+        let event = raw_at(
+            MouseEventKind::Move,
+            point(10, 0),
+            LLMHF_INJECTED,
+            marker_a.get(),
+        );
+
+        source_a.emit(event);
+        source_b.emit(event);
+
+        assert!(!observer_a.takeover_detected());
+        assert!(observer_b.takeover_detected());
+        assert_eq!(
+            source_b.snapshot().last_origin,
+            Some(MouseEventOrigin::ExternalInjected)
+        );
+    }
+
+    #[test]
+    fn subthreshold_jitter_does_not_advance_manual_sequence() {
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
+        let observer = ManualMouseActivityObserver::new(source.clone());
+
+        source.emit(raw_at(MouseEventKind::Move, point(1, 1), 0, 0));
+        source.emit(raw_at(MouseEventKind::Move, point(2, 1), 0, 0));
+        source.emit(raw_at(MouseEventKind::Move, point(3, 0), 0, 0));
+
+        assert!(!observer.takeover_detected());
+        assert_eq!(source.snapshot().sequence, 0);
+    }
+
+    #[test]
+    fn net_displacement_accumulates_from_baseline_until_threshold() {
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
+        let observer = ManualMouseActivityObserver::new(source.clone());
+
+        source.emit(raw_at(MouseEventKind::Move, point(2, 0), 0, 0));
+        source.emit(raw_at(MouseEventKind::Move, point(3, 0), 0, 0));
+        assert!(!observer.takeover_detected());
+        source.emit(raw_at(MouseEventKind::Move, point(4, 0), 0, 0));
+
+        assert!(observer.takeover_detected());
+        assert_eq!(source.snapshot().sequence, 1);
+    }
+
+    #[test]
+    fn owned_movement_updates_baseline_endpoint_without_takeover() {
+        let owned = marker(101);
+        let source = Arc::new(FakeMouseEventSource::new(owned, point(0, 0), 4));
+        let observer = ManualMouseActivityObserver::new(source.clone());
+
+        source.emit(raw_at(
+            MouseEventKind::Move,
+            point(100, 100),
+            LLMHF_INJECTED,
+            owned.get(),
+        ));
+        source.emit(raw_at(MouseEventKind::Move, point(103, 100), 0, 0));
+        assert!(!observer.takeover_detected());
+        source.emit(raw_at(MouseEventKind::Move, point(104, 100), 0, 0));
+
+        assert!(observer.takeover_detected());
+        assert_eq!(source.snapshot().sequence, 1);
+    }
+
+    #[test]
+    fn button_activity_advances_sequence_immediately() {
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
+        let observer = ManualMouseActivityObserver::new(source.clone());
+
+        source.emit(raw_at(MouseEventKind::LeftDown, point(0, 0), 0, 0));
+
+        assert!(observer.takeover_detected());
+        assert_eq!(source.snapshot().sequence, 1);
+    }
+
+    #[test]
+    fn reset_discards_stale_sequence_and_rebases_movement_endpoint() {
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
+        let observer = ManualMouseActivityObserver::new(source.clone());
+        source.emit(raw_at(MouseEventKind::Move, point(4, 0), 0, 0));
+        assert!(observer.takeover_detected());
+
+        observer.reset_baseline(point(100, 100));
+        source.emit(raw_at(MouseEventKind::Move, point(103, 100), 0, 0));
+        assert!(!observer.takeover_detected());
+        source.emit(raw_at(MouseEventKind::Move, point(104, 100), 0, 0));
+
+        assert!(observer.takeover_detected());
+    }
+
+    #[test]
     fn physical_click_between_polls_is_retained_by_sequence() {
-        let source = Arc::new(FakeMouseEventSource::default());
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
         let observer = ManualMouseActivityObserver::new(source.clone());
 
         source.emit(raw(MouseEventKind::LeftDown, 0, 0));
@@ -397,14 +635,14 @@ mod tests {
 
     #[test]
     fn reset_discards_stale_activity_but_retains_new_activity() {
-        let source = Arc::new(FakeMouseEventSource::default());
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
         source.emit(raw(MouseEventKind::Move, 0, 0));
         let observer = ManualMouseActivityObserver::new(source.clone());
         assert!(!observer.takeover_detected());
 
         source.emit(raw(MouseEventKind::RightDown, 0, 0));
         assert!(observer.takeover_detected());
-        observer.reset_baseline();
+        observer.reset_baseline(point(10, 20));
         assert!(!observer.takeover_detected());
 
         source.emit(raw(MouseEventKind::RightUp, 0, 0));
@@ -413,14 +651,10 @@ mod tests {
 
     #[test]
     fn owned_injected_movement_is_ignored() {
-        let source = Arc::new(FakeMouseEventSource::default());
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
         let observer = ManualMouseActivityObserver::new(source.clone());
 
-        source.emit(raw(
-            MouseEventKind::Move,
-            LLMHF_INJECTED,
-            RUNTIME_INPUT_MARKER,
-        ));
+        source.emit(raw(MouseEventKind::Move, LLMHF_INJECTED, marker(101).get()));
 
         assert!(!observer.takeover_detected());
         assert_eq!(source.snapshot().sequence, 0);
@@ -428,14 +662,10 @@ mod tests {
 
     #[test]
     fn physical_click_during_owned_movement_is_not_suppressed() {
-        let source = Arc::new(FakeMouseEventSource::default());
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
         let observer = ManualMouseActivityObserver::new(source.clone());
 
-        source.emit(raw(
-            MouseEventKind::Move,
-            LLMHF_INJECTED,
-            RUNTIME_INPUT_MARKER,
-        ));
+        source.emit(raw(MouseEventKind::Move, LLMHF_INJECTED, marker(101).get()));
         source.emit(raw(MouseEventKind::LeftDown, 0, 0));
         source.emit(raw(MouseEventKind::LeftUp, 0, 0));
 
@@ -449,7 +679,7 @@ mod tests {
 
     #[test]
     fn external_injected_events_count_as_manual_activity() {
-        let source = Arc::new(FakeMouseEventSource::default());
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
         let observer = ManualMouseActivityObserver::new(source.clone());
 
         source.emit(raw(MouseEventKind::MiddleDown, LLMHF_INJECTED, 91));
@@ -463,10 +693,10 @@ mod tests {
 
     #[test]
     fn marker_without_injected_flag_counts_as_physical_activity() {
-        let source = Arc::new(FakeMouseEventSource::default());
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
         let observer = ManualMouseActivityObserver::new(source.clone());
 
-        source.emit(raw(MouseEventKind::Move, 0, RUNTIME_INPUT_MARKER));
+        source.emit(raw(MouseEventKind::Move, 0, marker(101).get()));
 
         assert!(observer.takeover_detected());
         assert_eq!(
@@ -477,17 +707,17 @@ mod tests {
 
     #[test]
     fn lower_integrity_injected_events_follow_injected_marker_rules() {
-        let source = Arc::new(FakeMouseEventSource::default());
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
         let observer = ManualMouseActivityObserver::new(source.clone());
 
         source.emit(raw(MouseEventKind::Move, LLMHF_LOWER_IL_INJECTED, 71));
         assert!(observer.takeover_detected());
-        observer.reset_baseline();
+        observer.reset_baseline(point(10, 20));
 
         source.emit(raw(
             MouseEventKind::Move,
             LLMHF_LOWER_IL_INJECTED,
-            RUNTIME_INPUT_MARKER,
+            marker(101).get(),
         ));
         assert!(!observer.takeover_detected());
     }
@@ -518,16 +748,37 @@ mod tests {
 
     #[test]
     fn windows_hook_reports_install_readiness_and_shuts_down() {
-        let source = WindowsMouseHookEventSource::install().unwrap();
+        let source = WindowsMouseHookEventSource::install(marker(101), point(0, 0), 4).unwrap();
         source.shutdown().unwrap();
     }
 
     fn raw(kind: MouseEventKind, flags: u32, extra_info: usize) -> RawMouseEvent {
+        raw_at(kind, point(10, 20), flags, extra_info)
+    }
+
+    fn raw_at(
+        kind: MouseEventKind,
+        point: MousePoint,
+        flags: u32,
+        extra_info: usize,
+    ) -> RawMouseEvent {
         RawMouseEvent {
             kind,
-            point: MousePoint { x: 10, y: 20 },
+            point,
             flags,
             extra_info,
         }
+    }
+
+    fn point(x: i32, y: i32) -> MousePoint {
+        MousePoint { x, y }
+    }
+
+    fn marker(value: usize) -> SessionInputMarker {
+        SessionInputMarker::generate_with(|bytes| {
+            bytes.copy_from_slice(&value.to_ne_bytes());
+            true
+        })
+        .unwrap()
     }
 }

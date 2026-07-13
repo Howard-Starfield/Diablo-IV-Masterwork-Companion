@@ -555,6 +555,22 @@ impl CompiledMacro {
             bail!("saved revision does not pin exactly its referenced assets");
         }
 
+        for rule in &saved.definition.image_rules {
+            let template =
+                decode_pinned_image_asset(&saved.pinned_assets, &rule.template, "template")?;
+            let mask = rule
+                .transparent_mask
+                .as_ref()
+                .map(|asset| decode_pinned_image_asset(&saved.pinned_assets, asset, "mask"))
+                .transpose()?;
+            super::image_match::verification::validate_decoded_rule(
+                &saved.definition,
+                rule,
+                &template,
+                mask.as_ref(),
+            )?;
+        }
+
         Ok(Self {
             definition: Arc::new(saved.definition),
             definition_hash: saved.definition_hash,
@@ -565,6 +581,20 @@ impl CompiledMacro {
     pub fn definition(&self) -> &MacroDefinition {
         &self.definition
     }
+}
+
+fn decode_pinned_image_asset(
+    pinned_assets: &[PinnedAsset],
+    asset: &super::AssetRef,
+    kind: &str,
+) -> Result<image::GrayImage> {
+    let pinned = pinned_assets
+        .iter()
+        .find(|pinned| pinned.asset == *asset)
+        .ok_or_else(|| anyhow::anyhow!("compiled image {kind} asset is missing"))?;
+    image::load_from_memory(&pinned.bytes)
+        .map(|image| image.into_luma8())
+        .map_err(|error| anyhow::anyhow!("compiled image {kind} asset cannot be decoded: {error}"))
 }
 
 fn referenced_assets(definition: &MacroDefinition) -> impl Iterator<Item = super::AssetRef> + '_ {
@@ -1809,13 +1839,19 @@ mod tests {
     use crate::engine::automation::SystemClock;
     use crate::engine::{
         macro_engine::{
-            AssetRef, FocusLossPolicy, ImageRule, Limit, MACRO_SCHEMA_VERSION,
+            AssetRef, DEFAULT_MAX_SCORE_CELLS, FocusLossPolicy, IMAGE_RULE_VERIFICATION_VERSION,
+            ImageRule, ImageRuleVerification, ImageRuleVerificationArtifact,
+            ImageRuleVerificationInput, ImageVerificationPreprocess, Limit, MACRO_SCHEMA_VERSION,
             MatchSelectionPolicy, ObserveMode, PointDefinition, PreprocessProfile,
             RegionDefinition, SafetyPolicy, TargetProfile, TextMatchMode, TextRule, TimeoutOutcome,
         },
         types::{PointRatio, Rect, RectRatio, ScreenImage},
     };
-    use std::{collections::VecDeque, thread};
+    use image::{DynamicImage, GrayImage, ImageFormat, Luma};
+    use std::{collections::VecDeque, io::Cursor, thread};
+
+    const NEGATIVE_CORPUS_SHA256: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[derive(Debug, Default)]
     struct FakeCapture;
@@ -2116,6 +2152,83 @@ mod tests {
             definition_hash,
             pinned_assets: vec![],
         }
+    }
+
+    fn fixture_template(seed: u8) -> GrayImage {
+        GrayImage::from_fn(7, 5, |x, y| {
+            Luma([seed.wrapping_add((x * 31 + y * 47) as u8)])
+        })
+    }
+
+    fn png_bytes(image: GrayImage) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageLuma8(image)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    fn fixture_image_rule(id: &str, asset: AssetRef, template: Option<&GrayImage>) -> ImageRule {
+        let mut rule = ImageRule {
+            id: id.to_string(),
+            revision: 1,
+            region_id: "region".to_string(),
+            template: asset,
+            transparent_mask: None,
+            threshold: 0.95,
+            scales_percent: vec![100],
+            stable_frames: 1,
+            maximum_center_drift_px: 2,
+            minimum_runner_up_margin: 0.05,
+            verification: None,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 1,
+            timeout_ms: Limit::Finite(10),
+        };
+        rule.verification = Some(if let Some(template) = template {
+            ImageRuleVerification::verify(ImageRuleVerificationInput {
+                rule: &rule,
+                template,
+                mask: None,
+                captured_dpi: 96,
+                current_dpi: 96,
+                region_revision: 1,
+                search_dimensions: (384, 216),
+                negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
+                negative_sample_count: 100_000,
+                best_negative_score: 0.80,
+                observed_clusters: &[],
+                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+            })
+            .unwrap()
+            .artifact
+        } else {
+            let mut artifact = ImageRuleVerificationArtifact {
+                version: IMAGE_RULE_VERIFICATION_VERSION,
+                preprocess: ImageVerificationPreprocess::GrayscaleNormalizedCrossCorrelation,
+                rule_id: rule.id.clone(),
+                rule_revision: rule.revision,
+                template: rule.template.clone(),
+                transparent_mask: None,
+                captured_dpi: 96,
+                region_id: rule.region_id.clone(),
+                region_revision: 1,
+                search_width: 384,
+                search_height: 216,
+                scales_percent: rule.scales_percent.clone(),
+                threshold: rule.threshold,
+                minimum_runner_up_margin: rule.minimum_runner_up_margin,
+                negative_corpus_sha256: NEGATIVE_CORPUS_SHA256.to_string(),
+                negative_sample_count: 100_000,
+                best_negative_score: 0.80,
+                active_mask_variance: 42.0,
+                verification_fingerprint_sha256: String::new(),
+            };
+            artifact.verification_fingerprint_sha256 =
+                super::super::image_match::verification::fingerprint(&artifact);
+            artifact
+        });
+        rule
     }
 
     fn fixture_click_macro() -> SavedRevision {
@@ -3226,28 +3339,17 @@ mod tests {
 
     #[test]
     fn compiled_snapshot_pins_asset_bytes_and_hashes() {
-        let bytes = b"immutable-template".to_vec();
+        let template = fixture_template(17);
+        let bytes = png_bytes(template.clone());
         let asset = AssetRef {
             id: "template".to_string(),
             revision: 1,
             content_hash: sha256_hex(&bytes),
         };
         let mut definition = fixture_definition(vec![]);
-        definition.image_rules.push(ImageRule {
-            id: "image".to_string(),
-            revision: 1,
-            region_id: "region".to_string(),
-            template: asset.clone(),
-            transparent_mask: None,
-            threshold: 0.95,
-            scales_percent: vec![100],
-            stable_frames: 1,
-            maximum_center_drift_px: 2,
-            minimum_runner_up_margin: 0.05,
-            match_policy: MatchSelectionPolicy::ExactlyOne,
-            poll_interval_ms: 1,
-            timeout_ms: Limit::Finite(10),
-        });
+        definition
+            .image_rules
+            .push(fixture_image_rule("image", asset.clone(), Some(&template)));
         let mut revision = saved(definition);
         revision.pinned_assets.push(PinnedAsset {
             asset: asset.clone(),
@@ -3278,21 +3380,9 @@ mod tests {
         };
         let mut definition = fixture_definition(vec![]);
         for (id, template) in [("image-a", first.clone()), ("image-b", second.clone())] {
-            definition.image_rules.push(ImageRule {
-                id: id.to_string(),
-                revision: 1,
-                region_id: "region".to_string(),
-                template,
-                transparent_mask: None,
-                threshold: 0.95,
-                scales_percent: vec![100],
-                stable_frames: 1,
-                maximum_center_drift_px: 2,
-                minimum_runner_up_margin: 0.05,
-                match_policy: MatchSelectionPolicy::ExactlyOne,
-                poll_interval_ms: 1,
-                timeout_ms: Limit::Finite(10),
-            });
+            definition
+                .image_rules
+                .push(fixture_image_rule(id, template, None));
         }
         let mut revision = saved(definition);
         revision.pinned_assets = vec![

@@ -1146,6 +1146,7 @@ mod tests {
                 stable_frames: 2,
                 maximum_center_drift_px: 2,
                 minimum_runner_up_margin: 0.05,
+                verification: None,
                 match_policy: MatchSelectionPolicy::ExactlyOne,
                 poll_interval_ms: 100,
                 timeout_ms: Limit::Finite(5_000),

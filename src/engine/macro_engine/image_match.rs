@@ -1,18 +1,18 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Mutex};
 
 use crate::engine::types::{Rect, ScreenImage};
 use anyhow::{Context, Result, bail};
 use image::{GrayImage, ImageBuffer, Luma, imageops};
 use imageproc::template_matching::{MatchTemplateMethod, match_template};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::engine::automation::CaptureSource;
 
 use super::{
-    Condition, ConditionDetector, DetectorEvidence, ImageRule, MatchSelectionPolicy,
-    ObservationRequest,
+    Condition, ConditionDetector, DetectorEvidence, IMAGE_RULE_VERIFICATION_VERSION, ImageRule,
+    ImageRuleVerificationArtifact, ImageVerificationPreprocess, MacroDefinition,
+    MatchSelectionPolicy, ObservationRequest,
 };
 
 /// Authoring starts here, but every rule must retain its own verified threshold.
@@ -22,8 +22,176 @@ pub const INITIAL_SIMILARITY_THRESHOLD: f32 = 0.95;
 pub const DEFAULT_MAX_SCORE_CELLS: u64 = 750_000;
 /// Grayscale intensity variance below this value is too flat for safe correlation.
 const MIN_TEMPLATE_VARIANCE: f32 = 16.0;
-/// Adjacent configured scales (95/100/105) remain compatible across stability frames.
-const STABLE_SCALE_TOLERANCE_PERCENT: u16 = 5;
+const DEFAULT_MAX_STABILITY_STATES: usize = 256;
+
+pub(crate) mod verification {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum BindingProblem {
+        Missing,
+        InvalidMargin,
+        InvalidScore,
+        InvalidProvenance,
+        Stale,
+    }
+
+    #[derive(Serialize)]
+    struct FingerprintBinding<'a> {
+        version: u32,
+        preprocess: ImageVerificationPreprocess,
+        rule_id: &'a str,
+        rule_revision: u64,
+        template: &'a super::super::AssetRef,
+        transparent_mask: &'a Option<super::super::AssetRef>,
+        captured_dpi: u32,
+        region_id: &'a str,
+        region_revision: u64,
+        search_width: u32,
+        search_height: u32,
+        scales_percent: &'a [u16],
+        threshold: f32,
+        minimum_runner_up_margin: f32,
+        negative_corpus_sha256: &'a str,
+        negative_sample_count: u64,
+        best_negative_score: f32,
+        active_mask_variance: f32,
+    }
+
+    pub(crate) fn normalized_score(value: f32) -> bool {
+        value.is_finite() && (0.0..=1.0).contains(&value)
+    }
+
+    pub(crate) fn valid_sha256(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    pub(crate) fn fingerprint(artifact: &ImageRuleVerificationArtifact) -> String {
+        let binding = FingerprintBinding {
+            version: artifact.version,
+            preprocess: artifact.preprocess,
+            rule_id: &artifact.rule_id,
+            rule_revision: artifact.rule_revision,
+            template: &artifact.template,
+            transparent_mask: &artifact.transparent_mask,
+            captured_dpi: artifact.captured_dpi,
+            region_id: &artifact.region_id,
+            region_revision: artifact.region_revision,
+            search_width: artifact.search_width,
+            search_height: artifact.search_height,
+            scales_percent: &artifact.scales_percent,
+            threshold: artifact.threshold,
+            minimum_runner_up_margin: artifact.minimum_runner_up_margin,
+            negative_corpus_sha256: &artifact.negative_corpus_sha256,
+            negative_sample_count: artifact.negative_sample_count,
+            best_negative_score: artifact.best_negative_score,
+            active_mask_variance: artifact.active_mask_variance,
+        };
+        let bytes = serde_json::to_vec(&binding)
+            .expect("verification fingerprint binding contains only serializable values");
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    pub(crate) fn validate_binding<'a>(
+        definition: &MacroDefinition,
+        rule: &'a ImageRule,
+    ) -> std::result::Result<&'a ImageRuleVerificationArtifact, BindingProblem> {
+        if !normalized_score(rule.minimum_runner_up_margin) {
+            return Err(BindingProblem::InvalidMargin);
+        }
+        if !normalized_score(rule.threshold) {
+            return Err(BindingProblem::InvalidScore);
+        }
+        let artifact = rule.verification.as_ref().ok_or(BindingProblem::Missing)?;
+        if !normalized_score(artifact.threshold)
+            || !normalized_score(artifact.minimum_runner_up_margin)
+            || !normalized_score(artifact.best_negative_score)
+            || !artifact.active_mask_variance.is_finite()
+            || artifact.active_mask_variance < MIN_TEMPLATE_VARIANCE
+        {
+            return Err(BindingProblem::InvalidScore);
+        }
+        if !valid_sha256(&artifact.negative_corpus_sha256)
+            || artifact.negative_sample_count == 0
+            || !valid_sha256(&artifact.verification_fingerprint_sha256)
+        {
+            return Err(BindingProblem::InvalidProvenance);
+        }
+        if artifact.threshold - artifact.best_negative_score < artifact.minimum_runner_up_margin {
+            return Err(BindingProblem::InvalidScore);
+        }
+        if fingerprint(artifact) != artifact.verification_fingerprint_sha256 {
+            return Err(BindingProblem::Stale);
+        }
+        let Some(region) = definition
+            .regions
+            .iter()
+            .find(|region| region.id == rule.region_id)
+        else {
+            return Err(BindingProblem::Stale);
+        };
+        let client = Rect::new(
+            0,
+            0,
+            definition.target.captured_client_width,
+            definition.target.captured_client_height,
+        );
+        let search = client.rect_from_ratio(region.rect);
+        let current = artifact.version == IMAGE_RULE_VERIFICATION_VERSION
+            && artifact.preprocess
+                == ImageVerificationPreprocess::GrayscaleNormalizedCrossCorrelation
+            && artifact.rule_id == rule.id
+            && artifact.rule_revision == rule.revision
+            && artifact.template == rule.template
+            && artifact.transparent_mask == rule.transparent_mask
+            && artifact.captured_dpi == definition.target.captured_dpi
+            && artifact.region_id == region.id
+            && artifact.region_revision == region.revision
+            && artifact.search_width == search.width
+            && artifact.search_height == search.height
+            && artifact.scales_percent == rule.scales_percent
+            && artifact.threshold == rule.threshold
+            && artifact.minimum_runner_up_margin == rule.minimum_runner_up_margin;
+        current.then_some(artifact).ok_or(BindingProblem::Stale)
+    }
+
+    pub(crate) fn validate_decoded_rule(
+        definition: &MacroDefinition,
+        rule: &ImageRule,
+        template: &GrayImage,
+        mask: Option<&GrayImage>,
+    ) -> Result<()> {
+        let artifact = validate_binding(definition, rule).map_err(|problem| {
+            anyhow::anyhow!("image verification binding is invalid: {problem:?}")
+        })?;
+        let mask = validate_mask_reference(rule, template, mask).map_err(anyhow::Error::new)?;
+        let variance = template_variance(template, mask);
+        if !variance.is_finite() || variance < MIN_TEMPLATE_VARIANCE {
+            bail!(
+                "template variance {variance} is below {}",
+                MIN_TEMPLATE_VARIANCE
+            );
+        }
+        if variance != artifact.active_mask_variance {
+            bail!(
+                "template variance {variance} does not match verified variance {}",
+                artifact.active_mask_variance
+            );
+        }
+        let score_cells = estimate_score_cells(
+            (artifact.search_width, artifact.search_height),
+            template.dimensions(),
+            &rule.scales_percent,
+        );
+        if score_cells > DEFAULT_MAX_SCORE_CELLS {
+            bail!("image score-map work {score_cells} exceeds maximum {DEFAULT_MAX_SCORE_CELLS}");
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageMatchConfig {
@@ -51,6 +219,12 @@ pub struct ImageMatchCandidate {
 pub struct RawImageMatch {
     pub best: ImageMatchCandidate,
     pub candidates: Vec<ImageMatchCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ImageMatchError {
+    #[error("image match coordinate exceeds the supported signed screen range")]
+    CoordinateOverflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -178,12 +352,31 @@ pub struct StabilityTracker {
     stable_frames: u8,
 }
 
-pub trait ImageFrameMetadataSource: Send + Sync {
-    fn metadata(
-        &self,
-        request: &ObservationRequest<'_>,
-        capture_rect: Rect,
-    ) -> Result<ImageFrameMetadata>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StabilityOutcome {
+    Accepted { stable_frames: u8, qualified: bool },
+    Ignored { stable_frames: u8 },
+    Reset { stable_frames: u8 },
+}
+
+impl StabilityOutcome {
+    fn stable_frames(self) -> u8 {
+        match self {
+            Self::Accepted { stable_frames, .. }
+            | Self::Ignored { stable_frames }
+            | Self::Reset { stable_frames } => stable_frames,
+        }
+    }
+
+    fn qualified_current_frame(self) -> bool {
+        matches!(
+            self,
+            Self::Accepted {
+                qualified: true,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -196,18 +389,33 @@ struct ImageStabilityKey {
 }
 
 pub struct ImageDetector {
-    metadata: Arc<dyn ImageFrameMetadataSource>,
     matcher: ImageMatcher,
     stability: Mutex<HashMap<ImageStabilityKey, StabilityTracker>>,
+    maximum_stability_states: usize,
 }
 
 impl ImageDetector {
-    pub fn new(metadata: Arc<dyn ImageFrameMetadataSource>) -> Self {
+    pub fn new() -> Self {
+        Self::with_stability_capacity(DEFAULT_MAX_STABILITY_STATES)
+    }
+
+    pub fn with_stability_capacity(maximum_stability_states: usize) -> Self {
+        assert!(maximum_stability_states > 0);
         Self {
-            metadata,
             matcher: ImageMatcher,
             stability: Mutex::new(HashMap::new()),
+            maximum_stability_states,
         }
+    }
+
+    pub fn clear_run(&self, run_id: &str) -> Result<usize> {
+        let mut stability = self
+            .stability
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image detector stability lock is poisoned"))?;
+        let before = stability.len();
+        stability.retain(|key, _| key.run_id != run_id);
+        Ok(before - stability.len())
     }
 
     fn observe_image(
@@ -235,7 +443,18 @@ impl ImageDetector {
             definition.target.captured_client_height,
         );
         let capture_rect = client.rect_from_ratio(region.rect);
-        let frame = self.metadata.metadata(request, capture_rect)?;
+        let captured = capture.capture_frame(capture_rect)?;
+        let frame = ImageFrameMetadata {
+            frame_id: captured.metadata.frame_id,
+            captured_at_ms: captured.metadata.captured_at_ms,
+            window_id: captured.metadata.window_id,
+            window_revision: captured.metadata.window_revision,
+            geometry_revision: captured.metadata.geometry_revision,
+            display_profile_revision: captured.metadata.display_profile_revision,
+            dpi: captured.metadata.dpi,
+            region_revision: region.revision,
+            rule_revision: rule.revision,
+        };
         if frame.region_revision != region.revision || frame.rule_revision != rule.revision {
             bail!("image frame metadata does not match compiled region/rule revisions");
         }
@@ -246,14 +465,14 @@ impl ImageDetector {
                 frame.dpi
             );
         }
-        let image = capture.capture(capture_rect)?;
+        let image = captured.image;
         let template = decode_gray_asset(request, &rule.template, "template")?;
         let mask = rule
             .transparent_mask
             .as_ref()
             .map(|asset| decode_gray_asset(request, asset, "mask"))
             .transpose()?;
-        validate_runtime_image_rule(rule, &template, mask.as_ref(), capture_rect)?;
+        validate_runtime_image_rule(definition, rule, &template, mask.as_ref(), capture_rect)?;
         let raw = self.matcher.match_screen_image_masked(
             &image,
             capture_rect,
@@ -279,9 +498,12 @@ impl ImageDetector {
             .stability
             .lock()
             .map_err(|_| anyhow::anyhow!("image detector stability lock is poisoned"))?;
-        stability.retain(|existing, _| {
-            existing.run_id == key.run_id && existing.generation == key.generation
-        });
+        if !stability.contains_key(&key) && stability.len() >= self.maximum_stability_states {
+            bail!(
+                "image stability state capacity {} is exhausted; clear completed runs",
+                self.maximum_stability_states
+            );
+        }
         let tracker = stability.entry(key).or_insert_with(|| {
             StabilityTracker::new(
                 rule.stable_frames,
@@ -290,7 +512,7 @@ impl ImageDetector {
             )
         });
         let selected = result.selected.as_ref().map(|cluster| cluster.best.clone());
-        let stable = selected.as_ref().is_some_and(|candidate| {
+        let stability_outcome = selected.as_ref().map(|candidate| {
             tracker.observe(StableImageMatch {
                 frame,
                 candidate: candidate.clone(),
@@ -299,8 +521,9 @@ impl ImageDetector {
         if selected.is_none() {
             tracker.reset();
         }
-        let stable_frames = tracker.stable_frames();
-        let qualified = result.matched && stable;
+        let stable_frames = stability_outcome.map_or(0, StabilityOutcome::stable_frames);
+        let qualified = result.matched
+            && stability_outcome.is_some_and(StabilityOutcome::qualified_current_frame);
         let score = result
             .best
             .as_ref()
@@ -364,15 +587,13 @@ fn decode_gray_asset(
 }
 
 fn validate_runtime_image_rule(
+    definition: &MacroDefinition,
     rule: &ImageRule,
     template: &GrayImage,
     mask: Option<&GrayImage>,
     search_rect: Rect,
 ) -> Result<()> {
-    if !rule.threshold.is_finite() || !(0.0..=1.0).contains(&rule.threshold) {
-        bail!("image threshold must be finite and between zero and one");
-    }
-    validate_mask_reference(rule, template, mask).map_err(anyhow::Error::new)?;
+    verification::validate_decoded_rule(definition, rule, template, mask)?;
     let score_cells = estimate_score_cells(
         (search_rect.width, search_rect.height),
         template.dimensions(),
@@ -395,14 +616,24 @@ impl StabilityTracker {
         }
     }
 
-    pub fn observe(&mut self, observed: StableImageMatch) -> bool {
+    pub fn observe(&mut self, observed: StableImageMatch) -> StabilityOutcome {
         let Some(previous) = self.last.as_ref() else {
             self.last = Some(observed);
             self.stable_frames = 1;
-            return self.stable_frames >= self.required_frames;
+            return StabilityOutcome::Accepted {
+                stable_frames: self.stable_frames,
+                qualified: self.stable_frames >= self.required_frames,
+            };
         };
+        if !same_frame_identity(previous.frame, observed.frame) {
+            self.last = Some(observed);
+            self.stable_frames = 1;
+            return StabilityOutcome::Reset { stable_frames: 1 };
+        }
         if observed.frame.frame_id == previous.frame.frame_id {
-            return self.stable_frames >= self.required_frames;
+            return StabilityOutcome::Ignored {
+                stable_frames: self.stable_frames,
+            };
         }
         if observed
             .frame
@@ -410,13 +641,11 @@ impl StabilityTracker {
             .saturating_sub(previous.frame.captured_at_ms)
             < self.minimum_elapsed_ms
         {
-            return self.stable_frames >= self.required_frames;
+            return StabilityOutcome::Ignored {
+                stable_frames: self.stable_frames,
+            };
         }
-        let compatible = same_frame_identity(previous.frame, observed.frame)
-            && scale_delta(
-                previous.candidate.scale_percent,
-                observed.candidate.scale_percent,
-            ) <= STABLE_SCALE_TOLERANCE_PERCENT
+        let compatible = previous.candidate.scale_percent == observed.candidate.scale_percent
             && centers_within(
                 previous.candidate.rect,
                 observed.candidate.rect,
@@ -428,7 +657,14 @@ impl StabilityTracker {
             1
         };
         self.last = Some(observed);
-        self.stable_frames >= self.required_frames
+        if compatible {
+            StabilityOutcome::Accepted {
+                stable_frames: self.stable_frames,
+                qualified: self.stable_frames >= self.required_frames,
+            }
+        } else {
+            StabilityOutcome::Reset { stable_frames: 1 }
+        }
     }
 
     pub fn reset(&mut self) {
@@ -458,7 +694,10 @@ pub struct ImageRuleVerificationInput<'a> {
     pub mask: Option<&'a GrayImage>,
     pub captured_dpi: u32,
     pub current_dpi: u32,
+    pub region_revision: u64,
     pub search_dimensions: (u32, u32),
+    pub negative_corpus_sha256: &'a str,
+    pub negative_sample_count: u64,
     pub best_negative_score: f32,
     pub observed_clusters: &'a [CandidateCluster],
     pub maximum_score_cells: u64,
@@ -471,12 +710,19 @@ pub struct ImageRuleVerification {
     pub negative_margin: f32,
     pub ambiguity_margin: Option<f32>,
     pub score_cells: u64,
+    pub artifact: ImageRuleVerificationArtifact,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ImageRuleVerificationError {
     #[error("image threshold must be finite and between zero and one")]
     InvalidThreshold,
+    #[error("runner-up margin must be finite and between zero and one")]
+    InvalidRunnerUpMargin,
+    #[error("best negative score must be finite and between zero and one")]
+    InvalidNegativeScore,
+    #[error("negative corpus must have a canonical lowercase SHA-256 and at least one sample")]
+    InvalidNegativeCorpus,
     #[error("configured transparent mask asset is missing")]
     MissingMask,
     #[error("transparent mask is invalid: {reason}")]
@@ -497,8 +743,19 @@ impl ImageRuleVerification {
     pub fn verify(
         input: ImageRuleVerificationInput<'_>,
     ) -> std::result::Result<Self, ImageRuleVerificationError> {
-        if !input.rule.threshold.is_finite() || !(0.0..=1.0).contains(&input.rule.threshold) {
+        if !verification::normalized_score(input.rule.threshold) {
             return Err(ImageRuleVerificationError::InvalidThreshold);
+        }
+        if !verification::normalized_score(input.rule.minimum_runner_up_margin) {
+            return Err(ImageRuleVerificationError::InvalidRunnerUpMargin);
+        }
+        if !verification::normalized_score(input.best_negative_score) {
+            return Err(ImageRuleVerificationError::InvalidNegativeScore);
+        }
+        if !verification::valid_sha256(input.negative_corpus_sha256)
+            || input.negative_sample_count == 0
+        {
+            return Err(ImageRuleVerificationError::InvalidNegativeCorpus);
         }
         let mask = validate_mask_reference(input.rule, input.template, input.mask)?;
         let variance = template_variance(input.template, mask);
@@ -544,12 +801,35 @@ impl ImageRuleVerification {
                 minimum: input.rule.minimum_runner_up_margin,
             });
         }
+        let mut artifact = ImageRuleVerificationArtifact {
+            version: IMAGE_RULE_VERIFICATION_VERSION,
+            preprocess: ImageVerificationPreprocess::GrayscaleNormalizedCrossCorrelation,
+            rule_id: input.rule.id.clone(),
+            rule_revision: input.rule.revision,
+            template: input.rule.template.clone(),
+            transparent_mask: input.rule.transparent_mask.clone(),
+            captured_dpi: input.captured_dpi,
+            region_id: input.rule.region_id.clone(),
+            region_revision: input.region_revision,
+            search_width: input.search_dimensions.0,
+            search_height: input.search_dimensions.1,
+            scales_percent: input.rule.scales_percent.clone(),
+            threshold: input.rule.threshold,
+            minimum_runner_up_margin: input.rule.minimum_runner_up_margin,
+            negative_corpus_sha256: input.negative_corpus_sha256.to_string(),
+            negative_sample_count: input.negative_sample_count,
+            best_negative_score: input.best_negative_score,
+            active_mask_variance: variance,
+            verification_fingerprint_sha256: String::new(),
+        };
+        artifact.verification_fingerprint_sha256 = verification::fingerprint(&artifact);
         Ok(Self {
             threshold: input.rule.threshold,
             template_variance: variance,
             negative_margin,
             ambiguity_margin,
             score_cells,
+            artifact,
         })
     }
 }
@@ -649,7 +929,7 @@ fn extract_local_maxima(
     template_dimensions: (u32, u32),
     scale_percent: u16,
     threshold: f32,
-) -> Vec<ImageMatchCandidate> {
+) -> Result<Vec<ImageMatchCandidate>> {
     let mut maxima = Vec::new();
     for y in 0..scores.height() {
         for x in 0..scores.width() {
@@ -674,8 +954,8 @@ fn extract_local_maxima(
             if is_maximum {
                 maxima.push(ImageMatchCandidate {
                     rect: Rect::new(
-                        i32::try_from(x).unwrap_or(i32::MAX),
-                        i32::try_from(y).unwrap_or(i32::MAX),
+                        i32::try_from(x).map_err(|_| ImageMatchError::CoordinateOverflow)?,
+                        i32::try_from(y).map_err(|_| ImageMatchError::CoordinateOverflow)?,
                         template_dimensions.0,
                         template_dimensions.1,
                     ),
@@ -685,7 +965,20 @@ fn extract_local_maxima(
             }
         }
     }
-    maxima
+    Ok(maxima)
+}
+
+fn offset_rect(rect: Rect, origin: Rect) -> Result<Rect> {
+    Ok(Rect::new(
+        rect.x
+            .checked_add(origin.x)
+            .ok_or(ImageMatchError::CoordinateOverflow)?,
+        rect.y
+            .checked_add(origin.y)
+            .ok_or(ImageMatchError::CoordinateOverflow)?,
+        rect.width,
+        rect.height,
+    ))
 }
 
 fn masked_match_template(
@@ -810,11 +1103,9 @@ impl ImageMatcher {
         let gray = image::DynamicImage::ImageRgba8(search.rgba.clone()).into_luma8();
         let mut result = self.match_template_masked(&gray, template, mask, config)?;
         for candidate in &mut result.candidates {
-            candidate.rect.x += capture_bounds.x;
-            candidate.rect.y += capture_bounds.y;
+            candidate.rect = offset_rect(candidate.rect, capture_bounds)?;
         }
-        result.best.rect.x += capture_bounds.x;
-        result.best.rect.y += capture_bounds.y;
+        result.best.rect = offset_rect(result.best.rect, capture_bounds)?;
         Ok(result)
     }
 
@@ -887,7 +1178,12 @@ impl ImageMatcher {
             );
             for (x, y, pixel) in scores.enumerate_pixels() {
                 let candidate = ImageMatchCandidate {
-                    rect: Rect::new(x as i32, y as i32, width, height),
+                    rect: Rect::new(
+                        i32::try_from(x).map_err(|_| ImageMatchError::CoordinateOverflow)?,
+                        i32::try_from(y).map_err(|_| ImageMatchError::CoordinateOverflow)?,
+                        width,
+                        height,
+                    ),
                     score: pixel[0],
                     scale_percent,
                 };
@@ -903,7 +1199,7 @@ impl ImageMatcher {
                 (width, height),
                 scale_percent,
                 config.threshold,
-            ));
+            )?);
         }
 
         let Some(best) = best else {
@@ -923,17 +1219,16 @@ mod tests {
         SavedRevision, TargetProfile,
     };
     use crate::engine::{
-        automation::CaptureSource,
+        automation::{CaptureFrameMetadata, CaptureSource, CapturedScreenFrame},
         types::{RectRatio, ScreenImage},
     };
     use image::{DynamicImage, GrayImage, ImageFormat, Luma};
     use sha2::{Digest, Sha256};
-    use std::{
-        io::Cursor,
-        sync::{Arc, Mutex},
-    };
+    use std::{io::Cursor, sync::Mutex};
 
     type StabilityMutation = Box<dyn Fn(&mut StableImageMatch)>;
+    const NEGATIVE_CORPUS_SHA256: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn fixture_icon() -> GrayImage {
         GrayImage::from_fn(7, 5, |x, y| {
@@ -982,6 +1277,7 @@ mod tests {
             stable_frames: 2,
             maximum_center_drift_px: 3,
             minimum_runner_up_margin: 0.03,
+            verification: None,
             match_policy: MatchSelectionPolicy::ExactlyOne,
             poll_interval_ms: 100,
             timeout_ms: Limit::Finite(1_000),
@@ -1005,6 +1301,25 @@ mod tests {
         }
     }
 
+    fn capture_metadata(frame: ImageFrameMetadata) -> CaptureFrameMetadata {
+        CaptureFrameMetadata {
+            frame_id: frame.frame_id,
+            captured_at_ms: frame.captured_at_ms,
+            window_id: frame.window_id,
+            window_revision: frame.window_revision,
+            geometry_revision: frame.geometry_revision,
+            display_profile_revision: frame.display_profile_revision,
+            dpi: frame.dpi,
+        }
+    }
+
+    fn captured_frame(image: GrayImage, frame: ImageFrameMetadata) -> CapturedScreenFrame {
+        CapturedScreenFrame {
+            image: ScreenImage::new(DynamicImage::ImageLuma8(image).into_rgba8()),
+            metadata: capture_metadata(frame),
+        }
+    }
+
     fn png_bytes(image: GrayImage) -> Vec<u8> {
         let mut bytes = Cursor::new(Vec::new());
         DynamicImage::ImageLuma8(image)
@@ -1017,18 +1332,60 @@ mod tests {
         format!("{:x}", Sha256::digest(bytes))
     }
 
-    fn compiled_image_macro(template: GrayImage) -> CompiledMacro {
-        let bytes = png_bytes(template);
+    fn saved_image_macro(template: GrayImage, forge_verification: bool) -> SavedRevision {
+        let bytes = png_bytes(template.clone());
         let asset = AssetRef {
             id: "template".to_string(),
             revision: 1,
             content_hash: hash(&bytes),
         };
-        let rule = ImageRule {
+        let mut rule = ImageRule {
             template: asset.clone(),
             scales_percent: vec![100],
             ..fixture_rule(0.95)
         };
+        rule.verification = Some(if forge_verification {
+            let mut artifact = ImageRuleVerificationArtifact {
+                version: IMAGE_RULE_VERIFICATION_VERSION,
+                preprocess: ImageVerificationPreprocess::GrayscaleNormalizedCrossCorrelation,
+                rule_id: rule.id.clone(),
+                rule_revision: rule.revision,
+                template: rule.template.clone(),
+                transparent_mask: None,
+                captured_dpi: 96,
+                region_id: rule.region_id.clone(),
+                region_revision: 13,
+                search_width: 64,
+                search_height: 48,
+                scales_percent: rule.scales_percent.clone(),
+                threshold: rule.threshold,
+                minimum_runner_up_margin: rule.minimum_runner_up_margin,
+                negative_corpus_sha256: NEGATIVE_CORPUS_SHA256.to_string(),
+                negative_sample_count: 100_000,
+                best_negative_score: 0.80,
+                active_mask_variance: 42.0,
+                verification_fingerprint_sha256: String::new(),
+            };
+            artifact.verification_fingerprint_sha256 = verification::fingerprint(&artifact);
+            artifact
+        } else {
+            ImageRuleVerification::verify(ImageRuleVerificationInput {
+                rule: &rule,
+                template: &template,
+                mask: None,
+                captured_dpi: 96,
+                current_dpi: 96,
+                region_revision: 13,
+                search_dimensions: (64, 48),
+                negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
+                negative_sample_count: 100_000,
+                best_negative_score: 0.80,
+                observed_clusters: &[],
+                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+            })
+            .unwrap()
+            .artifact
+        });
         let definition = MacroDefinition {
             schema_version: MACRO_SCHEMA_VERSION,
             id: "macro".to_string(),
@@ -1076,32 +1433,38 @@ mod tests {
             },
         };
         let definition_hash = hash(&serde_json::to_vec_pretty(&definition).unwrap());
-        CompiledMacro::compile(SavedRevision {
+        SavedRevision {
             definition,
             definition_hash,
             pinned_assets: vec![PinnedAsset { asset, bytes }],
-        })
-        .unwrap()
+        }
     }
 
-    struct FixtureCapture(ScreenImage);
+    fn compiled_image_macro(template: GrayImage) -> CompiledMacro {
+        CompiledMacro::compile(saved_image_macro(template, false)).unwrap()
+    }
+
+    struct FixtureCapture {
+        frames: Mutex<Vec<CapturedScreenFrame>>,
+    }
 
     impl CaptureSource for FixtureCapture {
         fn capture(&self, _rect: Rect) -> Result<ScreenImage> {
-            Ok(self.0.clone())
+            bail!("image detector must not request pixels separately from metadata")
+        }
+
+        fn capture_frame(&self, _rect: Rect) -> Result<CapturedScreenFrame> {
+            Ok(self.frames.lock().unwrap().remove(0))
         }
     }
 
-    struct ScriptedFrameMetadata(Mutex<Vec<ImageFrameMetadata>>);
+    #[test]
+    fn compile_rejects_forged_verification_for_flat_template_pixels() {
+        let saved = saved_image_macro(GrayImage::from_pixel(7, 5, Luma([80])), true);
 
-    impl ImageFrameMetadataSource for ScriptedFrameMetadata {
-        fn metadata(
-            &self,
-            _request: &ObservationRequest<'_>,
-            _capture_rect: Rect,
-        ) -> Result<ImageFrameMetadata> {
-            Ok(self.0.lock().unwrap().remove(0))
-        }
+        let error = CompiledMacro::compile(saved).unwrap_err();
+
+        assert!(error.to_string().contains("template variance"));
     }
 
     #[test]
@@ -1149,6 +1512,25 @@ mod tests {
             .unwrap();
 
         assert_eq!((result.best.rect.x, result.best.rect.y), (-97, 92));
+    }
+
+    #[test]
+    fn screen_match_rejects_capture_coordinate_overflow() {
+        let search = fixture_search_with_icon_at(1, 1);
+        let rgba = DynamicImage::ImageLuma8(search).into_rgba8();
+        let error = ImageMatcher
+            .match_screen_image(
+                &ScreenImage::new(rgba),
+                Rect::new(i32::MAX, i32::MAX, 64, 48),
+                &fixture_icon(),
+                &ImageMatchConfig::exact_scale(0.95),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<ImageMatchError>(),
+            Some(ImageMatchError::CoordinateOverflow)
+        ));
     }
 
     #[test]
@@ -1216,7 +1598,7 @@ mod tests {
         scores.put_pixel(3, 2, Luma([0.96]));
         scores.put_pixel(7, 1, Luma([0.95]));
 
-        let maxima = extract_local_maxima(&scores, (7, 5), 100, 0.90);
+        let maxima = extract_local_maxima(&scores, (7, 5), 100, 0.90).unwrap();
 
         assert_eq!(maxima.len(), 2);
         assert!(
@@ -1235,19 +1617,89 @@ mod tests {
     fn same_frame_cannot_satisfy_two_frame_stability() {
         let mut tracker = StabilityTracker::new(2, 40, 3);
 
-        assert!(!tracker.observe(frame(7, 100, 20, 100)));
-        assert!(!tracker.observe(frame(7, 150, 20, 100)));
-        assert!(tracker.observe(frame(8, 160, 21, 100)));
+        assert_eq!(
+            tracker.observe(frame(7, 100, 20, 100)),
+            StabilityOutcome::Accepted {
+                stable_frames: 1,
+                qualified: false,
+            }
+        );
+        assert_eq!(
+            tracker.observe(frame(7, 150, 20, 100)),
+            StabilityOutcome::Ignored { stable_frames: 1 }
+        );
+        assert_eq!(
+            tracker.observe(frame(8, 160, 21, 100)),
+            StabilityOutcome::Accepted {
+                stable_frames: 2,
+                qualified: true,
+            }
+        );
     }
 
     #[test]
-    fn stability_requires_elapsed_separation_and_compatible_scale() {
+    fn stability_requires_elapsed_separation_and_exact_scale() {
         let mut tracker = StabilityTracker::new(2, 40, 3);
 
-        assert!(!tracker.observe(frame(1, 100, 20, 100)));
-        assert!(!tracker.observe(frame(2, 120, 20, 100)));
-        assert!(!tracker.observe(frame(3, 160, 20, 110)));
-        assert!(tracker.observe(frame(4, 205, 21, 105)));
+        assert!(matches!(
+            tracker.observe(frame(1, 100, 20, 100)),
+            StabilityOutcome::Accepted {
+                qualified: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            tracker.observe(frame(2, 120, 20, 100)),
+            StabilityOutcome::Ignored { .. }
+        ));
+        assert!(matches!(
+            tracker.observe(frame(3, 160, 20, 105)),
+            StabilityOutcome::Reset { stable_frames: 1 }
+        ));
+        assert!(matches!(
+            tracker.observe(frame(4, 205, 21, 105)),
+            StabilityOutcome::Accepted {
+                qualified: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn identity_reset_precedes_minimum_elapsed_and_ignored_frame_cannot_qualify() {
+        let mut tracker = StabilityTracker::new(2, 40, 3);
+        let _ = tracker.observe(frame(1, 100, 20, 100));
+        assert!(matches!(
+            tracker.observe(frame(2, 160, 20, 100)),
+            StabilityOutcome::Accepted {
+                qualified: true,
+                ..
+            }
+        ));
+        let mut identity_b = frame(3, 170, 80, 100);
+        identity_b.frame.window_revision += 1;
+
+        assert_eq!(
+            tracker.observe(identity_b.clone()),
+            StabilityOutcome::Reset { stable_frames: 1 }
+        );
+        let mut too_close_b = identity_b.clone();
+        too_close_b.frame.frame_id = 4;
+        too_close_b.frame.captured_at_ms = 180;
+        assert_eq!(
+            tracker.observe(too_close_b),
+            StabilityOutcome::Ignored { stable_frames: 1 }
+        );
+        let mut eligible_b = identity_b;
+        eligible_b.frame.frame_id = 5;
+        eligible_b.frame.captured_at_ms = 220;
+        assert!(matches!(
+            tracker.observe(eligible_b),
+            StabilityOutcome::Accepted {
+                stable_frames: 2,
+                qualified: true,
+            }
+        ));
     }
 
     #[test]
@@ -1263,10 +1715,13 @@ mod tests {
         ];
         for mutate in mutations.drain(..) {
             let mut tracker = StabilityTracker::new(2, 40, 3);
-            assert!(!tracker.observe(frame(1, 100, 20, 100)));
+            let _ = tracker.observe(frame(1, 100, 20, 100));
             let mut changed = frame(2, 160, 20, 100);
             mutate(&mut changed);
-            assert!(!tracker.observe(changed));
+            assert_eq!(
+                tracker.observe(changed),
+                StabilityOutcome::Reset { stable_frames: 1 }
+            );
             assert_eq!(tracker.stable_frames(), 1);
         }
     }
@@ -1324,7 +1779,10 @@ mod tests {
             mask: None,
             captured_dpi: 96,
             current_dpi: 96,
+            region_revision: 13,
             search_dimensions: (640, 360),
+            negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
+            negative_sample_count: 100_000,
             best_negative_score: 0.80,
             observed_clusters: &clusters,
             maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
@@ -1357,6 +1815,86 @@ mod tests {
     }
 
     #[test]
+    fn verification_rejects_non_finite_or_out_of_range_margin_and_negative_scores() {
+        let template = fixture_icon();
+        for value in [f32::NAN, f32::INFINITY, -0.01, 1.01] {
+            let mut rule = fixture_rule(0.91);
+            rule.minimum_runner_up_margin = value;
+            let input = ImageRuleVerificationInput {
+                rule: &rule,
+                template: &template,
+                mask: None,
+                captured_dpi: 96,
+                current_dpi: 96,
+                region_revision: 13,
+                search_dimensions: (640, 360),
+                negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
+                negative_sample_count: 100_000,
+                best_negative_score: 0.80,
+                observed_clusters: &[],
+                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+            };
+            assert_eq!(
+                ImageRuleVerification::verify(input).unwrap_err(),
+                ImageRuleVerificationError::InvalidRunnerUpMargin
+            );
+
+            let rule = fixture_rule(0.91);
+            let input = ImageRuleVerificationInput {
+                rule: &rule,
+                template: &template,
+                mask: None,
+                captured_dpi: 96,
+                current_dpi: 96,
+                region_revision: 13,
+                search_dimensions: (640, 360),
+                negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
+                negative_sample_count: 100_000,
+                best_negative_score: value,
+                observed_clusters: &[],
+                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+            };
+            assert_eq!(
+                ImageRuleVerification::verify(input).unwrap_err(),
+                ImageRuleVerificationError::InvalidNegativeScore
+            );
+        }
+    }
+
+    #[test]
+    fn verification_rejects_invalid_negative_corpus_provenance() {
+        let rule = fixture_rule(0.91);
+        let template = fixture_icon();
+        for (digest, sample_count) in [
+            ("", 100_000),
+            (
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                100_000,
+            ),
+            (NEGATIVE_CORPUS_SHA256, 0),
+        ] {
+            let input = ImageRuleVerificationInput {
+                rule: &rule,
+                template: &template,
+                mask: None,
+                captured_dpi: 96,
+                current_dpi: 96,
+                region_revision: 13,
+                search_dimensions: (640, 360),
+                negative_corpus_sha256: digest,
+                negative_sample_count: sample_count,
+                best_negative_score: 0.80,
+                observed_clusters: &[],
+                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+            };
+            assert_eq!(
+                ImageRuleVerification::verify(input).unwrap_err(),
+                ImageRuleVerificationError::InvalidNegativeCorpus
+            );
+        }
+    }
+
+    #[test]
     fn verification_rejects_negative_margin_ambiguity_and_invalid_masks() {
         let mut rule = fixture_rule(0.91);
         rule.transparent_mask = Some(AssetRef {
@@ -1375,7 +1913,10 @@ mod tests {
             mask: None,
             captured_dpi: 96,
             current_dpi: 96,
+            region_revision: 13,
             search_dimensions: (640, 360),
+            negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
+            negative_sample_count: 100_000,
             best_negative_score: 0.90,
             observed_clusters: &clusters,
             maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
@@ -1424,7 +1965,10 @@ mod tests {
             mask: None,
             captured_dpi: 96,
             current_dpi: 96,
+            region_revision: 13,
             search_dimensions: (640, 360),
+            negative_corpus_sha256: NEGATIVE_CORPUS_SHA256,
+            negative_sample_count: 100_000,
             best_negative_score: 0.80,
             observed_clusters: &clusters,
             maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
@@ -1433,6 +1977,12 @@ mod tests {
 
         assert_eq!(INITIAL_SIMILARITY_THRESHOLD, 0.95);
         assert_eq!(verified.threshold, 0.91);
+        assert_eq!(verified.artifact.rule_id, rule.id);
+        assert_eq!(verified.artifact.rule_revision, rule.revision);
+        assert_eq!(verified.artifact.template, rule.template);
+        assert_eq!(verified.artifact.region_revision, 13);
+        assert_eq!(verified.artifact.scales_percent, vec![100]);
+        assert_eq!(verified.artifact.best_negative_score, 0.80);
     }
 
     #[test]
@@ -1442,18 +1992,15 @@ mod tests {
         let BlockKind::Observe { condition } = &condition.kind else {
             unreachable!()
         };
-        let mut first_frame = frame(1, 100, 23, 100).frame;
-        first_frame.rule_revision = 7;
-        let mut second_frame = frame(2, 200, 23, 100).frame;
-        second_frame.rule_revision = 7;
-        let metadata = Arc::new(ScriptedFrameMetadata(Mutex::new(vec![
-            first_frame,
-            second_frame,
-        ])));
-        let detector = ImageDetector::new(metadata);
-        let capture = FixtureCapture(ScreenImage::new(
-            DynamicImage::ImageLuma8(fixture_search_with_icon_at(23, 17)).into_rgba8(),
-        ));
+        let first_frame = frame(1, 100, 23, 100).frame;
+        let second_frame = frame(2, 200, 23, 100).frame;
+        let detector = ImageDetector::new();
+        let capture = FixtureCapture {
+            frames: Mutex::new(vec![
+                captured_frame(fixture_search_with_icon_at(23, 17), first_frame),
+                captured_frame(fixture_search_with_icon_at(23, 17), second_frame),
+            ]),
+        };
         let first = detector
             .observe(
                 &ObservationRequest {
@@ -1485,5 +2032,152 @@ mod tests {
         assert_eq!(second.match_rect, Some(Rect::new(23, 17, 7, 5)));
         assert_eq!(second.frame_metadata.unwrap().window_id, 11);
         assert_eq!(second.details["selected_scale_percent"], 100);
+    }
+
+    #[test]
+    fn interleaved_runs_reach_image_stability_independently() {
+        let compiled = compiled_image_macro(fixture_icon());
+        let BlockKind::Observe { condition } = &compiled.definition().blocks[0].kind else {
+            unreachable!()
+        };
+        let capture = FixtureCapture {
+            frames: Mutex::new(vec![
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(1, 100, 23, 100).frame,
+                ),
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(2, 110, 23, 100).frame,
+                ),
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(3, 200, 23, 100).frame,
+                ),
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(4, 210, 23, 100).frame,
+                ),
+            ]),
+        };
+        let detector = ImageDetector::new();
+        let observe = |run_id: &str, observed_at_ms: u64| {
+            detector
+                .observe(
+                    &ObservationRequest {
+                        run_id,
+                        generation: 1,
+                        condition,
+                        compiled: &compiled,
+                        observed_at_ms,
+                    },
+                    &capture,
+                )
+                .unwrap()
+        };
+
+        assert!(!observe("run-a", 100).matched);
+        assert!(!observe("run-b", 110).matched);
+        assert!(observe("run-a", 200).matched);
+        assert!(observe("run-b", 210).matched);
+    }
+
+    #[test]
+    fn identity_transition_resets_before_elapsed_filter_and_withholds_new_geometry() {
+        let compiled = compiled_image_macro(fixture_icon());
+        let BlockKind::Observe { condition } = &compiled.definition().blocks[0].kind else {
+            unreachable!()
+        };
+        let mut b1 = frame(3, 210, 31, 100).frame;
+        b1.window_revision += 1;
+        let mut b2 = frame(4, 220, 31, 100).frame;
+        b2.window_revision += 1;
+        let mut b3 = frame(5, 310, 31, 100).frame;
+        b3.window_revision += 1;
+        let capture = FixtureCapture {
+            frames: Mutex::new(vec![
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(1, 100, 23, 100).frame,
+                ),
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(2, 200, 23, 100).frame,
+                ),
+                captured_frame(fixture_search_with_icon_at(31, 22), b1),
+                captured_frame(fixture_search_with_icon_at(31, 22), b2),
+                captured_frame(fixture_search_with_icon_at(31, 22), b3),
+            ]),
+        };
+        let detector = ImageDetector::new();
+        let observe = |observed_at_ms: u64| {
+            detector
+                .observe(
+                    &ObservationRequest {
+                        run_id: "run",
+                        generation: 1,
+                        condition,
+                        compiled: &compiled,
+                        observed_at_ms,
+                    },
+                    &capture,
+                )
+                .unwrap()
+        };
+
+        assert!(!observe(100).matched);
+        assert_eq!(observe(200).match_rect, Some(Rect::new(23, 17, 7, 5)));
+        let first_b = observe(210);
+        let ignored_b = observe(220);
+        let stable_b = observe(310);
+
+        assert!(!first_b.matched);
+        assert!(first_b.match_rect.is_none());
+        assert!(!ignored_b.matched);
+        assert!(ignored_b.match_rect.is_none());
+        assert_eq!(stable_b.match_rect, Some(Rect::new(31, 22, 7, 5)));
+    }
+
+    #[test]
+    fn stability_capacity_requires_explicit_run_cleanup() {
+        let compiled = compiled_image_macro(fixture_icon());
+        let BlockKind::Observe { condition } = &compiled.definition().blocks[0].kind else {
+            unreachable!()
+        };
+        let capture = FixtureCapture {
+            frames: Mutex::new(vec![
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(1, 100, 23, 100).frame,
+                ),
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(2, 110, 23, 100).frame,
+                ),
+                captured_frame(
+                    fixture_search_with_icon_at(23, 17),
+                    frame(3, 120, 23, 100).frame,
+                ),
+            ]),
+        };
+        let detector = ImageDetector::with_stability_capacity(1);
+        let observe = |run_id: &str, observed_at_ms: u64| {
+            detector.observe(
+                &ObservationRequest {
+                    run_id,
+                    generation: 1,
+                    condition,
+                    compiled: &compiled,
+                    observed_at_ms,
+                },
+                &capture,
+            )
+        };
+
+        assert!(observe("run-a", 100).is_ok());
+        let error = observe("run-b", 110).unwrap_err();
+        assert!(error.to_string().contains("capacity 1 is exhausted"));
+        assert_eq!(detector.clear_run("run-a").unwrap(), 1);
+        assert!(observe("run-b", 120).is_ok());
     }
 }

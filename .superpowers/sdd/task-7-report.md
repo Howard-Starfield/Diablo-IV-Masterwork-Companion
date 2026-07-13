@@ -69,3 +69,35 @@ Runtime validation repeats the safety checks available from immutable live input
 - The manual benchmark executable was compiled but not executed because it requires an interactive Windows capture session and installed Windows OCR language support. Task 14 owns named-hardware calibration and corpus accuracy gates.
 - The current Task 5 capture trait does not itself return crop metadata. Task 7 therefore injects an `ImageFrameMetadataSource`; the source owns the immutable frame identity supplied to the detector. Task 8 still owns concrete target snapshots and final pre-action target revalidation.
 - No template cache was added. Exact immutable bytes are decoded per observation in this bounded implementation; precomputed scaled-template caching remains performance work after measured profiling.
+
+## Review remediation appendix
+
+The post-Task-7 safety review was resolved issue by issue:
+
+- Stability now returns typed `Accepted`, `Ignored`, or `Reset` outcomes. Full frame identity is compared before duplicate/minimum-elapsed filtering, exact scale is required, and ignored frames can never qualify or emit match geometry. The end-to-end A-to-B identity regression proves B geometry remains withheld until two eligible B frames have stabilized.
+- Image detection consumes one atomic `CapturedScreenFrame` containing pixels plus frame/window/geometry/display/DPI metadata. The detector fixture rejects the legacy raw-pixel call, so the passing detector tests prove metadata cannot be sampled separately from the matched pixels.
+- Every executable image rule now requires a version-2 persisted verification artifact bound to rule/revision, template/mask identities, DPI, region/revision, search dimensions, scales, threshold, margin, best-negative result, active-pixel variance, canonical negative-corpus SHA-256, and nonzero negative sample count. A deterministic fingerprint covers every persisted binding/result field. Invalid provenance and transplanted or mutated corpus digest/count artifacts fail validation.
+- Authoring, macro validation, compile, and live observation share the same finite/range, provenance, fingerprint, mask, and decoded-template checks. Compile and runtime recompute active-pixel variance from immutable pinned PNG bytes; a forged artifact claiming variance for a flat template is rejected.
+- Stability state is isolated by run, generation, source block, rule, and region. Interleaved runs no longer evict each other. The state map is bounded and fails closed at capacity until explicit `clear_run` lifecycle cleanup removes completed-run entries.
+- Screen-coordinate conversion and capture-origin addition are checked. Unrepresentable coordinates return typed `ImageMatchError::CoordinateOverflow` rather than wrapping or panicking.
+
+### Remediation TDD evidence
+
+- Stability outcome RED: focused compilation failed while the new tests referenced the missing `StabilityOutcome`; GREEN covers identity-before-elapsed ordering, ignored-frame geometry withholding, all identity/revision resets, duplicate frames, and exact-scale stability.
+- Atomic capture RED: the detector regression could not compile before `CapturedScreenFrame` and `capture_frame` existed; GREEN uses only the paired frame contract and makes raw capture fail.
+- Tracker isolation RED: `interleaved_runs_reach_image_stability_independently` failed because observing one run retained only that run's state; GREEN preserves both runs and the capacity/cleanup regression passes.
+- Coordinate RED: the overflow regression could not reference the missing typed error; GREEN returns `CoordinateOverflow` for extreme capture origins.
+- Verification artifact RED: serialization and validation tests failed before the artifact/binding types and required checks existed. GREEN covers missing, invalid, stale, transplanted, invalid-digest, zero-count, and fingerprint-mismatched artifacts.
+- Decoded-pixel RED: `compile_rejects_forged_verification_for_flat_template_pixels` initially received `Ok(CompiledMacro)`; GREEN rejects the forged low-variance template from its pinned bytes.
+- Scalar RED/GREEN covers `NaN`, infinity, negative, and greater-than-one runner-up margins, thresholds, best-negative scores, and artifact values in both authoring and macro validation.
+
+### Remediation final verification
+
+- `cargo test macro_engine::image_match` - 26 passed, 0 failed.
+- `cargo test macro_engine::observation` - 2 passed, 0 failed.
+- `cargo test macro_engine::runtime` - 38 passed, 0 failed.
+- `cargo test macro_engine::validate` - 23 passed, 0 failed.
+- `cargo test` - 189 passed, 0 failed.
+- `rustfmt --edition 2024 --check --config skip_children=true ...` over the benchmark and touched Rust modules - exit 0, no output.
+- `cargo clippy --all-targets -- -D warnings -A dead_code -A clippy::collapsible-if -A clippy::too-many-arguments -A clippy::default-constructed-unit-structs -A clippy::ptr-arg` - exit 0.
+- `cargo build --release --bin macro_detection_bench` - exit 0; optimized benchmark target compiled.

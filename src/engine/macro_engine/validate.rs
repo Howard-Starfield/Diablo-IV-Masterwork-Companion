@@ -95,6 +95,40 @@ pub fn validate_macro(definition: &MacroDefinition) -> Vec<ValidationProblem> {
                 None,
             );
         }
+        if let Err(problem) = super::image_match::verification::validate_binding(definition, rule) {
+            let (code, message) = match problem {
+                super::image_match::verification::BindingProblem::Missing => (
+                    "image_rule.missing_verification",
+                    format!("image rule '{}' has no verification artifact", rule.id),
+                ),
+                super::image_match::verification::BindingProblem::InvalidMargin => (
+                    "image_rule.invalid_margin",
+                    format!(
+                        "image rule '{}' runner-up margin must be finite and between zero and one",
+                        rule.id
+                    ),
+                ),
+                super::image_match::verification::BindingProblem::InvalidScore => (
+                    "image_rule.invalid_verification_score",
+                    format!("image rule '{}' has invalid verification scores", rule.id),
+                ),
+                super::image_match::verification::BindingProblem::InvalidProvenance => (
+                    "image_rule.invalid_verification_provenance",
+                    format!(
+                        "image rule '{}' has invalid negative-corpus provenance",
+                        rule.id
+                    ),
+                ),
+                super::image_match::verification::BindingProblem::Stale => (
+                    "image_rule.stale_verification",
+                    format!(
+                        "image rule '{}' verification does not match its immutable inputs",
+                        rule.id
+                    ),
+                ),
+            };
+            push_problem(&mut problems, code, message, None);
+        }
     }
 
     if definition.safety.max_observations_per_second == 0 {
@@ -918,7 +952,7 @@ mod tests {
     }
 
     fn image_rule(id: &str) -> ImageRule {
-        ImageRule {
+        let mut rule = ImageRule {
             id: id.to_string(),
             revision: 1,
             region_id: "region".to_string(),
@@ -933,10 +967,182 @@ mod tests {
             stable_frames: 1,
             maximum_center_drift_px: 2,
             minimum_runner_up_margin: 0.05,
+            verification: None,
             match_policy: MatchSelectionPolicy::HighestScore,
             poll_interval_ms: 100,
             timeout_ms: Limit::Finite(1_000),
+        };
+        let mut artifact = ImageRuleVerificationArtifact {
+            version: IMAGE_RULE_VERIFICATION_VERSION,
+            preprocess: ImageVerificationPreprocess::GrayscaleNormalizedCrossCorrelation,
+            rule_id: rule.id.clone(),
+            rule_revision: rule.revision,
+            template: rule.template.clone(),
+            transparent_mask: rule.transparent_mask.clone(),
+            captured_dpi: 96,
+            region_id: rule.region_id.clone(),
+            region_revision: 1,
+            search_width: 384,
+            search_height: 108,
+            scales_percent: rule.scales_percent.clone(),
+            threshold: rule.threshold,
+            minimum_runner_up_margin: rule.minimum_runner_up_margin,
+            negative_corpus_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            negative_sample_count: 100_000,
+            best_negative_score: 0.80,
+            active_mask_variance: 42.0,
+            verification_fingerprint_sha256: String::new(),
+        };
+        artifact.verification_fingerprint_sha256 =
+            super::image_match::verification::fingerprint(&artifact);
+        rule.verification = Some(artifact);
+        rule
+    }
+
+    #[test]
+    fn rejects_invalid_image_margin_and_verification_scores() {
+        for value in [f32::NAN, f32::INFINITY, -0.01, 1.01] {
+            let mut definition = fixture_macro(vec![]);
+            definition.image_rules[0].minimum_runner_up_margin = value;
+            assert!(has_code(
+                &validate_macro(&definition),
+                "image_rule.invalid_margin"
+            ));
+
+            let mut definition = fixture_macro(vec![]);
+            definition.image_rules[0]
+                .verification
+                .as_mut()
+                .unwrap()
+                .best_negative_score = value;
+            assert!(has_code(
+                &validate_macro(&definition),
+                "image_rule.invalid_verification_score"
+            ));
+
+            let mut definition = fixture_macro(vec![]);
+            definition.image_rules[0]
+                .verification
+                .as_mut()
+                .unwrap()
+                .threshold = value;
+            assert!(has_code(
+                &validate_macro(&definition),
+                "image_rule.invalid_verification_score"
+            ));
+
+            let mut definition = fixture_macro(vec![]);
+            definition.image_rules[0]
+                .verification
+                .as_mut()
+                .unwrap()
+                .minimum_runner_up_margin = value;
+            assert!(has_code(
+                &validate_macro(&definition),
+                "image_rule.invalid_verification_score"
+            ));
+
+            let mut definition = fixture_macro(vec![]);
+            definition.image_rules[0]
+                .verification
+                .as_mut()
+                .unwrap()
+                .active_mask_variance = value;
+            assert!(has_code(
+                &validate_macro(&definition),
+                "image_rule.invalid_verification_score"
+            ));
         }
+
+        let mut definition = fixture_macro(vec![]);
+        definition.image_rules[0]
+            .verification
+            .as_mut()
+            .unwrap()
+            .active_mask_variance = 15.99;
+        assert!(has_code(
+            &validate_macro(&definition),
+            "image_rule.invalid_verification_score"
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_or_stale_image_verification_binding() {
+        let mut missing = fixture_macro(vec![]);
+        missing.image_rules[0].verification = None;
+        assert!(has_code(
+            &validate_macro(&missing),
+            "image_rule.missing_verification"
+        ));
+
+        let mut stale = fixture_macro(vec![]);
+        stale.image_rules[0].scales_percent = vec![95, 100, 105];
+        assert!(has_code(
+            &validate_macro(&stale),
+            "image_rule.stale_verification"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_transplanted_or_stale_negative_corpus_provenance() {
+        for digest in [
+            "",
+            "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            let mut definition = fixture_macro(vec![]);
+            definition.image_rules[0]
+                .verification
+                .as_mut()
+                .unwrap()
+                .negative_corpus_sha256 = digest.to_string();
+            assert!(has_code(
+                &validate_macro(&definition),
+                "image_rule.invalid_verification_provenance"
+            ));
+        }
+
+        let mut zero_count = fixture_macro(vec![]);
+        zero_count.image_rules[0]
+            .verification
+            .as_mut()
+            .unwrap()
+            .negative_sample_count = 0;
+        assert!(has_code(
+            &validate_macro(&zero_count),
+            "image_rule.invalid_verification_provenance"
+        ));
+
+        let mut stale_digest = fixture_macro(vec![]);
+        stale_digest.image_rules[0]
+            .verification
+            .as_mut()
+            .unwrap()
+            .negative_corpus_sha256 =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        assert!(has_code(
+            &validate_macro(&stale_digest),
+            "image_rule.stale_verification"
+        ));
+
+        let mut stale_count = fixture_macro(vec![]);
+        stale_count.image_rules[0]
+            .verification
+            .as_mut()
+            .unwrap()
+            .negative_sample_count += 1;
+        assert!(has_code(
+            &validate_macro(&stale_count),
+            "image_rule.stale_verification"
+        ));
+
+        let mut transplanted = fixture_macro(vec![]);
+        transplanted.image_rules[0].verification = image_rule("other").verification;
+        assert!(has_code(
+            &validate_macro(&transplanted),
+            "image_rule.stale_verification"
+        ));
     }
 
     fn block(id: &str, kind: BlockKind) -> Block {

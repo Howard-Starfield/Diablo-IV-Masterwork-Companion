@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::engine::automation::MouseButton;
 
 pub const MACRO_SCHEMA_VERSION: u32 = 1;
+pub const IMAGE_RULE_VERIFICATION_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AssetRef {
@@ -88,9 +89,41 @@ pub struct ImageRule {
     pub stable_frames: u8,
     pub maximum_center_drift_px: u32,
     pub minimum_runner_up_margin: f32,
+    pub verification: Option<ImageRuleVerificationArtifact>,
     pub match_policy: MatchSelectionPolicy,
     pub poll_interval_ms: u64,
     pub timeout_ms: Limit<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageVerificationPreprocess {
+    GrayscaleNormalizedCrossCorrelation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageRuleVerificationArtifact {
+    pub version: u32,
+    pub preprocess: ImageVerificationPreprocess,
+    pub rule_id: String,
+    pub rule_revision: u64,
+    pub template: AssetRef,
+    pub transparent_mask: Option<AssetRef>,
+    pub captured_dpi: u32,
+    pub region_id: String,
+    pub region_revision: u64,
+    pub search_width: u32,
+    pub search_height: u32,
+    pub scales_percent: Vec<u16>,
+    pub threshold: f32,
+    pub minimum_runner_up_margin: f32,
+    /// SHA-256 of canonical ordered negative sample identities/content hashes and evaluation inputs.
+    pub negative_corpus_sha256: String,
+    pub negative_sample_count: u64,
+    pub best_negative_score: f32,
+    pub active_mask_variance: f32,
+    /// SHA-256 over every persisted binding and result field above.
+    pub verification_fingerprint_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -371,5 +404,43 @@ mod tests {
         }"#;
 
         assert!(serde_json::from_str::<PassiveCondition>(json).is_err());
+    }
+
+    #[test]
+    fn image_verification_artifact_round_trips_all_binding_fields() {
+        let template = AssetRef {
+            id: "template".to_string(),
+            revision: 3,
+            content_hash: "template-hash".to_string(),
+        };
+        let artifact = ImageRuleVerificationArtifact {
+            version: IMAGE_RULE_VERIFICATION_VERSION,
+            preprocess: ImageVerificationPreprocess::GrayscaleNormalizedCrossCorrelation,
+            rule_id: "image".to_string(),
+            rule_revision: 7,
+            template,
+            transparent_mask: None,
+            captured_dpi: 96,
+            region_id: "region".to_string(),
+            region_revision: 5,
+            search_width: 640,
+            search_height: 360,
+            scales_percent: vec![95, 100, 105],
+            threshold: 0.91,
+            minimum_runner_up_margin: 0.03,
+            negative_corpus_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            negative_sample_count: 100_000,
+            best_negative_score: 0.80,
+            active_mask_variance: 42.5,
+            verification_fingerprint_sha256:
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        };
+
+        let json = serde_json::to_string(&artifact).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ImageRuleVerificationArtifact>(&json).unwrap(),
+            artifact
+        );
     }
 }

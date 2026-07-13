@@ -8,8 +8,29 @@ use super::{
     types::{Point, Rect, ScreenImage},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureFrameMetadata {
+    pub frame_id: u64,
+    pub captured_at_ms: u64,
+    pub window_id: u64,
+    pub window_revision: u64,
+    pub geometry_revision: u64,
+    pub display_profile_revision: u64,
+    pub dpi: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CapturedScreenFrame {
+    pub image: ScreenImage,
+    pub metadata: CaptureFrameMetadata,
+}
+
 pub trait CaptureSource {
     fn capture(&self, rect: Rect) -> Result<ScreenImage>;
+
+    fn capture_frame(&self, _rect: Rect) -> Result<CapturedScreenFrame> {
+        anyhow::bail!("capture source does not provide atomic pixels and frame metadata")
+    }
 }
 
 pub trait InputSink {

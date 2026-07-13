@@ -3,7 +3,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -104,10 +104,54 @@ pub struct MouseActivitySnapshot {
     pub last_event: Option<SequencedMouseEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MouseEventSourceFailure {
+    #[error("mouse hook worker panicked")]
+    WorkerPanicked,
+    #[error("mouse hook worker exited unexpectedly")]
+    UnexpectedExit,
+    #[error("mouse hook worker failed: {message}")]
+    WorkerError { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MouseEventSourceHealth {
+    Starting,
+    Running,
+    ShutdownRequested,
+    Stopped,
+    Failed(MouseEventSourceFailure),
+}
+
+impl MouseEventSourceHealth {
+    fn ensure_running(&self) -> Result<(), MouseEventSourceHealthError> {
+        match self {
+            Self::Running => Ok(()),
+            Self::Starting => Err(MouseEventSourceHealthError::Starting),
+            Self::ShutdownRequested => Err(MouseEventSourceHealthError::ShutdownRequested),
+            Self::Stopped => Err(MouseEventSourceHealthError::Stopped),
+            Self::Failed(failure) => Err(MouseEventSourceHealthError::Failed(failure.clone())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MouseEventSourceHealthError {
+    #[error("mouse hook worker is still starting")]
+    Starting,
+    #[error("mouse hook worker is shutting down")]
+    ShutdownRequested,
+    #[error("mouse hook worker has stopped")]
+    Stopped,
+    #[error(transparent)]
+    Failed(MouseEventSourceFailure),
+}
+
 pub trait MouseEventSource: Send + Sync {
     fn session_marker(&self) -> SessionInputMarker;
     fn snapshot(&self) -> MouseActivitySnapshot;
     fn reset_movement_baseline(&self, point: MousePoint) -> MouseActivitySnapshot;
+    fn health(&self) -> MouseEventSourceHealth;
 }
 
 pub struct ManualMouseActivityObserver {
@@ -124,20 +168,23 @@ impl ManualMouseActivityObserver {
         }
     }
 
-    pub fn takeover_detected(&self) -> bool {
-        self.source.snapshot().sequence != self.baseline.load(Ordering::Acquire)
+    pub fn takeover_detected(&self) -> Result<bool, MouseEventSourceHealthError> {
+        self.source.health().ensure_running()?;
+        Ok(self.source.snapshot().sequence != self.baseline.load(Ordering::Acquire))
     }
 
-    pub fn reset_baseline(&self, point: MousePoint) {
+    pub fn reset_baseline(&self, point: MousePoint) -> Result<(), MouseEventSourceHealthError> {
+        self.source.health().ensure_running()?;
         let snapshot = self.source.reset_movement_baseline(point);
         self.baseline.store(snapshot.sequence, Ordering::Release);
+        Ok(())
     }
 }
 
 #[derive(Debug)]
 struct MouseActivityLedger {
     marker: SessionInputMarker,
-    movement_threshold_squared: i64,
+    movement_threshold_squared: i128,
     state: Mutex<MouseActivityState>,
 }
 
@@ -151,7 +198,7 @@ impl MouseActivityLedger {
     fn new(marker: SessionInputMarker, movement_baseline: MousePoint, threshold_px: i32) -> Self {
         Self {
             marker,
-            movement_threshold_squared: i64::from(threshold_px.max(1)).pow(2),
+            movement_threshold_squared: i128::from(threshold_px.max(1)).pow(2),
             state: Mutex::new(MouseActivityState {
                 snapshot: MouseActivitySnapshot::default(),
                 movement_baseline,
@@ -215,9 +262,9 @@ impl MouseActivityLedger {
     }
 }
 
-fn point_distance_squared(left: MousePoint, right: MousePoint) -> i64 {
-    let dx = i64::from(left.x) - i64::from(right.x);
-    let dy = i64::from(left.y) - i64::from(right.y);
+fn point_distance_squared(left: MousePoint, right: MousePoint) -> i128 {
+    let dx = i128::from(left.x) - i128::from(right.x);
+    let dy = i128::from(left.y) - i128::from(right.y);
     dx * dx + dy * dy
 }
 
@@ -243,6 +290,8 @@ static ACTIVE_MOUSE_HOOK: OnceLock<Mutex<Option<Weak<MouseActivityLedger>>>> = O
 
 pub struct WindowsMouseHookEventSource {
     ledger: Arc<MouseActivityLedger>,
+    health: Arc<Mutex<MouseEventSourceHealth>>,
+    shutdown_requested: Arc<AtomicBool>,
     thread_id: u32,
     worker: Mutex<Option<JoinHandle<io::Result<()>>>>,
 }
@@ -259,13 +308,27 @@ impl WindowsMouseHookEventSource {
             movement_threshold_px,
         ));
         register_hook_ledger(&ledger)?;
+        let health = Arc::new(Mutex::new(MouseEventSourceHealth::Starting));
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
 
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let worker_ledger = ledger.clone();
+        let worker_health = health.clone();
+        let worker_shutdown_requested = shutdown_requested.clone();
         let worker = match thread::Builder::new()
             .name("macro-mouse-hook".to_string())
-            .spawn(move || mouse_hook_thread(worker_ledger, ready_sender))
-        {
+            .spawn(move || {
+                let thread_health = worker_health.clone();
+                let thread_shutdown_requested = worker_shutdown_requested.clone();
+                run_hook_worker(worker_health, worker_shutdown_requested, move || {
+                    mouse_hook_thread(
+                        worker_ledger,
+                        ready_sender,
+                        thread_health,
+                        thread_shutdown_requested,
+                    )
+                })
+            }) {
             Ok(worker) => worker,
             Err(error) => {
                 unregister_hook_ledger(&ledger);
@@ -291,6 +354,8 @@ impl WindowsMouseHookEventSource {
 
         Ok(Self {
             ledger,
+            health,
+            shutdown_requested,
             thread_id,
             worker: Mutex::new(Some(worker)),
         })
@@ -309,6 +374,9 @@ impl WindowsMouseHookEventSource {
         let Some(worker) = worker else {
             return Ok(());
         };
+
+        self.shutdown_requested.store(true, Ordering::Release);
+        set_source_health(&self.health, MouseEventSourceHealth::ShutdownRequested);
 
         let post_result =
             unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
@@ -332,6 +400,13 @@ impl MouseEventSource for WindowsMouseHookEventSource {
 
     fn reset_movement_baseline(&self, point: MousePoint) -> MouseActivitySnapshot {
         self.ledger.reset_movement_baseline(point)
+    }
+
+    fn health(&self) -> MouseEventSourceHealth {
+        self.health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -372,9 +447,51 @@ fn unregister_hook_ledger(ledger: &Arc<MouseActivityLedger>) {
     }
 }
 
+fn set_source_health(health: &Arc<Mutex<MouseEventSourceHealth>>, state: MouseEventSourceHealth) {
+    *health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+}
+
+fn run_hook_worker(
+    health: Arc<Mutex<MouseEventSourceHealth>>,
+    shutdown_requested: Arc<AtomicBool>,
+    worker: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker)) {
+        Ok(Ok(())) if shutdown_requested.load(Ordering::Acquire) => {
+            set_source_health(&health, MouseEventSourceHealth::Stopped);
+            Ok(())
+        }
+        Ok(Ok(())) => {
+            let failure = MouseEventSourceFailure::UnexpectedExit;
+            set_source_health(&health, MouseEventSourceHealth::Failed(failure.clone()));
+            Err(io::Error::other(failure.to_string()))
+        }
+        Ok(Err(error)) => {
+            let failure = if error.kind() == io::ErrorKind::UnexpectedEof {
+                MouseEventSourceFailure::UnexpectedExit
+            } else {
+                MouseEventSourceFailure::WorkerError {
+                    message: error.to_string(),
+                }
+            };
+            set_source_health(&health, MouseEventSourceHealth::Failed(failure));
+            Err(error)
+        }
+        Err(_) => {
+            let failure = MouseEventSourceFailure::WorkerPanicked;
+            set_source_health(&health, MouseEventSourceHealth::Failed(failure.clone()));
+            Err(io::Error::other(failure.to_string()))
+        }
+    }
+}
+
 fn mouse_hook_thread(
     ledger: Arc<MouseActivityLedger>,
     ready: mpsc::SyncSender<io::Result<u32>>,
+    health: Arc<Mutex<MouseEventSourceHealth>>,
+    shutdown_requested: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let thread_id = unsafe { GetCurrentThreadId() };
     let mut message = MSG::default();
@@ -392,6 +509,7 @@ fn mouse_hook_thread(
         }
     };
     let hook = HookGuard(Some(hook));
+    set_source_health(&health, MouseEventSourceHealth::Running);
     if ready.send(Ok(thread_id)).is_err() {
         unregister_hook_ledger(&ledger);
         return Err(io::Error::other("mouse hook owner dropped during startup"));
@@ -403,7 +521,14 @@ fn mouse_hook_thread(
             continue;
         }
         if status == 0 {
-            break Ok(());
+            break if shutdown_requested.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "mouse hook message loop exited without a shutdown request",
+                ))
+            };
         }
         break Err(io::Error::last_os_error());
     };
@@ -455,6 +580,7 @@ unsafe extern "system" fn low_level_mouse_proc(
 #[cfg(test)]
 struct FakeMouseEventSource {
     ledger: MouseActivityLedger,
+    health: Mutex<MouseEventSourceHealth>,
 }
 
 #[cfg(test)]
@@ -462,11 +588,16 @@ impl FakeMouseEventSource {
     fn new(marker: SessionInputMarker, baseline: MousePoint, threshold_px: i32) -> Self {
         Self {
             ledger: MouseActivityLedger::new(marker, baseline, threshold_px),
+            health: Mutex::new(MouseEventSourceHealth::Running),
         }
     }
 
     fn emit(&self, event: RawMouseEvent) {
         self.ledger.observe(event);
+    }
+
+    fn set_health(&self, health: MouseEventSourceHealth) {
+        *self.health.lock().unwrap() = health;
     }
 }
 
@@ -483,11 +614,15 @@ impl MouseEventSource for FakeMouseEventSource {
     fn reset_movement_baseline(&self, point: MousePoint) -> MouseActivitySnapshot {
         self.ledger.reset_movement_baseline(point)
     }
+
+    fn health(&self) -> MouseEventSourceHealth {
+        self.health.lock().unwrap().clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::AtomicBool};
 
     use super::*;
 
@@ -541,8 +676,8 @@ mod tests {
         source_a.emit(event);
         source_b.emit(event);
 
-        assert!(!observer_a.takeover_detected());
-        assert!(observer_b.takeover_detected());
+        assert!(!observer_a.takeover_detected().unwrap());
+        assert!(observer_b.takeover_detected().unwrap());
         assert_eq!(
             source_b.snapshot().last_origin,
             Some(MouseEventOrigin::ExternalInjected)
@@ -558,7 +693,7 @@ mod tests {
         source.emit(raw_at(MouseEventKind::Move, point(2, 1), 0, 0));
         source.emit(raw_at(MouseEventKind::Move, point(3, 0), 0, 0));
 
-        assert!(!observer.takeover_detected());
+        assert!(!observer.takeover_detected().unwrap());
         assert_eq!(source.snapshot().sequence, 0);
     }
 
@@ -569,10 +704,30 @@ mod tests {
 
         source.emit(raw_at(MouseEventKind::Move, point(2, 0), 0, 0));
         source.emit(raw_at(MouseEventKind::Move, point(3, 0), 0, 0));
-        assert!(!observer.takeover_detected());
+        assert!(!observer.takeover_detected().unwrap());
         source.emit(raw_at(MouseEventKind::Move, point(4, 0), 0, 0));
 
-        assert!(observer.takeover_detected());
+        assert!(observer.takeover_detected().unwrap());
+        assert_eq!(source.snapshot().sequence, 1);
+    }
+
+    #[test]
+    fn extreme_i32_endpoints_cannot_wrap_below_the_movement_threshold() {
+        let source = Arc::new(FakeMouseEventSource::new(
+            marker(101),
+            point(i32::MIN, i32::MIN),
+            4,
+        ));
+        let observer = ManualMouseActivityObserver::new(source.clone());
+
+        source.emit(raw_at(
+            MouseEventKind::Move,
+            point(i32::MAX, i32::MAX),
+            0,
+            0,
+        ));
+
+        assert!(observer.takeover_detected().unwrap());
         assert_eq!(source.snapshot().sequence, 1);
     }
 
@@ -589,10 +744,10 @@ mod tests {
             owned.get(),
         ));
         source.emit(raw_at(MouseEventKind::Move, point(103, 100), 0, 0));
-        assert!(!observer.takeover_detected());
+        assert!(!observer.takeover_detected().unwrap());
         source.emit(raw_at(MouseEventKind::Move, point(104, 100), 0, 0));
 
-        assert!(observer.takeover_detected());
+        assert!(observer.takeover_detected().unwrap());
         assert_eq!(source.snapshot().sequence, 1);
     }
 
@@ -603,7 +758,7 @@ mod tests {
 
         source.emit(raw_at(MouseEventKind::LeftDown, point(0, 0), 0, 0));
 
-        assert!(observer.takeover_detected());
+        assert!(observer.takeover_detected().unwrap());
         assert_eq!(source.snapshot().sequence, 1);
     }
 
@@ -612,14 +767,30 @@ mod tests {
         let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
         let observer = ManualMouseActivityObserver::new(source.clone());
         source.emit(raw_at(MouseEventKind::Move, point(4, 0), 0, 0));
-        assert!(observer.takeover_detected());
+        assert!(observer.takeover_detected().unwrap());
 
-        observer.reset_baseline(point(100, 100));
+        observer.reset_baseline(point(100, 100)).unwrap();
         source.emit(raw_at(MouseEventKind::Move, point(103, 100), 0, 0));
-        assert!(!observer.takeover_detected());
+        assert!(!observer.takeover_detected().unwrap());
         source.emit(raw_at(MouseEventKind::Move, point(104, 100), 0, 0));
 
-        assert!(observer.takeover_detected());
+        assert!(observer.takeover_detected().unwrap());
+    }
+
+    #[test]
+    fn unhealthy_source_blocks_manual_baseline_reset() {
+        let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
+        let observer = ManualMouseActivityObserver::new(source.clone());
+        source.set_health(MouseEventSourceHealth::Failed(
+            MouseEventSourceFailure::WorkerPanicked,
+        ));
+
+        assert_eq!(
+            observer.reset_baseline(point(100, 100)),
+            Err(MouseEventSourceHealthError::Failed(
+                MouseEventSourceFailure::WorkerPanicked
+            ))
+        );
     }
 
     #[test]
@@ -630,7 +801,7 @@ mod tests {
         source.emit(raw(MouseEventKind::LeftDown, 0, 0));
         source.emit(raw(MouseEventKind::LeftUp, 0, 0));
 
-        assert!(observer.takeover_detected());
+        assert!(observer.takeover_detected().unwrap());
     }
 
     #[test]
@@ -638,15 +809,15 @@ mod tests {
         let source = Arc::new(FakeMouseEventSource::new(marker(101), point(0, 0), 4));
         source.emit(raw(MouseEventKind::Move, 0, 0));
         let observer = ManualMouseActivityObserver::new(source.clone());
-        assert!(!observer.takeover_detected());
+        assert!(!observer.takeover_detected().unwrap());
 
         source.emit(raw(MouseEventKind::RightDown, 0, 0));
-        assert!(observer.takeover_detected());
-        observer.reset_baseline(point(10, 20));
-        assert!(!observer.takeover_detected());
+        assert!(observer.takeover_detected().unwrap());
+        observer.reset_baseline(point(10, 20)).unwrap();
+        assert!(!observer.takeover_detected().unwrap());
 
         source.emit(raw(MouseEventKind::RightUp, 0, 0));
-        assert!(observer.takeover_detected());
+        assert!(observer.takeover_detected().unwrap());
     }
 
     #[test]
@@ -656,7 +827,7 @@ mod tests {
 
         source.emit(raw(MouseEventKind::Move, LLMHF_INJECTED, marker(101).get()));
 
-        assert!(!observer.takeover_detected());
+        assert!(!observer.takeover_detected().unwrap());
         assert_eq!(source.snapshot().sequence, 0);
     }
 
@@ -669,7 +840,7 @@ mod tests {
         source.emit(raw(MouseEventKind::LeftDown, 0, 0));
         source.emit(raw(MouseEventKind::LeftUp, 0, 0));
 
-        assert!(observer.takeover_detected());
+        assert!(observer.takeover_detected().unwrap());
         assert_eq!(source.snapshot().sequence, 2);
         assert_eq!(
             source.snapshot().last_origin,
@@ -684,7 +855,7 @@ mod tests {
 
         source.emit(raw(MouseEventKind::MiddleDown, LLMHF_INJECTED, 91));
 
-        assert!(observer.takeover_detected());
+        assert!(observer.takeover_detected().unwrap());
         assert_eq!(
             source.snapshot().last_origin,
             Some(MouseEventOrigin::ExternalInjected)
@@ -698,7 +869,7 @@ mod tests {
 
         source.emit(raw(MouseEventKind::Move, 0, marker(101).get()));
 
-        assert!(observer.takeover_detected());
+        assert!(observer.takeover_detected().unwrap());
         assert_eq!(
             source.snapshot().last_origin,
             Some(MouseEventOrigin::Physical)
@@ -711,15 +882,15 @@ mod tests {
         let observer = ManualMouseActivityObserver::new(source.clone());
 
         source.emit(raw(MouseEventKind::Move, LLMHF_LOWER_IL_INJECTED, 71));
-        assert!(observer.takeover_detected());
-        observer.reset_baseline(point(10, 20));
+        assert!(observer.takeover_detected().unwrap());
+        observer.reset_baseline(point(10, 20)).unwrap();
 
         source.emit(raw(
             MouseEventKind::Move,
             LLMHF_LOWER_IL_INJECTED,
             marker(101).get(),
         ));
-        assert!(!observer.takeover_detected());
+        assert!(!observer.takeover_detected().unwrap());
     }
 
     #[test]
@@ -749,7 +920,42 @@ mod tests {
     #[test]
     fn windows_hook_reports_install_readiness_and_shuts_down() {
         let source = WindowsMouseHookEventSource::install(marker(101), point(0, 0), 4).unwrap();
+        assert_eq!(source.health(), MouseEventSourceHealth::Running);
         source.shutdown().unwrap();
+    }
+
+    #[test]
+    fn worker_guard_reports_unexpected_exit_and_panic() {
+        for (worker, expected) in [
+            (
+                Box::new(|| Ok(())) as Box<dyn FnOnce() -> io::Result<()>>,
+                MouseEventSourceFailure::UnexpectedExit,
+            ),
+            (
+                Box::new(|| -> io::Result<()> { panic!("boom") })
+                    as Box<dyn FnOnce() -> io::Result<()>>,
+                MouseEventSourceFailure::WorkerPanicked,
+            ),
+        ] {
+            let health = Arc::new(Mutex::new(MouseEventSourceHealth::Running));
+            let shutdown_requested = Arc::new(AtomicBool::new(false));
+
+            assert!(run_hook_worker(health.clone(), shutdown_requested, worker).is_err());
+            assert_eq!(
+                *health.lock().unwrap(),
+                MouseEventSourceHealth::Failed(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn worker_guard_accepts_only_requested_shutdown_as_clean_exit() {
+        let health = Arc::new(Mutex::new(MouseEventSourceHealth::ShutdownRequested));
+        let shutdown_requested = Arc::new(AtomicBool::new(true));
+
+        run_hook_worker(health.clone(), shutdown_requested, || Ok(())).unwrap();
+
+        assert_eq!(*health.lock().unwrap(), MouseEventSourceHealth::Stopped);
     }
 
     fn raw(kind: MouseEventKind, flags: u32, extra_info: usize) -> RawMouseEvent {

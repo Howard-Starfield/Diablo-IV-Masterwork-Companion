@@ -413,6 +413,7 @@ pub struct LiveActionSession {
     input: Arc<dyn LiveActionInput>,
     control: Arc<dyn LiveControlSink>,
     resume: Mutex<ResumeState>,
+    registered_committer_runs: Mutex<HashSet<String>>,
 }
 
 impl LiveActionSession {
@@ -427,6 +428,7 @@ impl LiveActionSession {
             input,
             control,
             resume: Mutex::new(ResumeState::default()),
+            registered_committer_runs: Mutex::new(HashSet::new()),
         })
     }
 
@@ -471,6 +473,22 @@ impl LiveActionSession {
             TakeoverPolicy::Pause => self.control.pause_for_manual_takeover(),
             TakeoverPolicy::Stop => self.control.stop_for_manual_takeover(),
         }
+    }
+
+    fn register_committer_run(
+        &self,
+        run_id: &str,
+    ) -> std::result::Result<(), ActionCommitterCreateError> {
+        let mut registered = self
+            .registered_committer_runs
+            .lock()
+            .expect("live committer registry poisoned");
+        if !registered.insert(run_id.to_string()) {
+            return Err(ActionCommitterCreateError::RunAlreadyRegistered {
+                run_id: run_id.to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -556,6 +574,14 @@ pub struct ActionCommitter {
     ledger: Arc<Mutex<CommitLedger>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ActionCommitterCreateError {
+    #[error("action attempt ledger capacity must be positive")]
+    ZeroAttemptCapacity,
+    #[error("run {run_id:?} already has an action committer in this live session")]
+    RunAlreadyRegistered { run_id: String },
+}
+
 impl ActionCommitter {
     pub fn new(
         session: Arc<LiveActionSession>,
@@ -563,17 +589,18 @@ impl ActionCommitter {
         run_id: impl Into<String>,
         maximum_clicks: Limit<u64>,
         maximum_attempts: usize,
-    ) -> Self {
-        assert!(
-            maximum_attempts > 0,
-            "action attempt ledger capacity must be positive"
-        );
-        Self {
+    ) -> std::result::Result<Self, ActionCommitterCreateError> {
+        if maximum_attempts == 0 {
+            return Err(ActionCommitterCreateError::ZeroAttemptCapacity);
+        }
+        let run_id = run_id.into();
+        session.register_committer_run(&run_id)?;
+        Ok(Self {
             owner_id: NEXT_COMMITTER_OWNER_ID.fetch_add(1, Ordering::Relaxed),
             session,
             clock,
             ledger: Arc::new(Mutex::new(CommitLedger {
-                run_id: run_id.into(),
+                run_id,
                 maximum_clicks,
                 maximum_attempts,
                 committed_clicks: 0,
@@ -582,7 +609,7 @@ impl ActionCommitter {
                 attempts: HashMap::new(),
                 finished: false,
             })),
-        }
+        })
     }
 
     pub fn prepare(
@@ -3792,7 +3819,8 @@ mod tests {
             "live-run",
             Limit::Finite(1),
             1,
-        );
+        )
+        .unwrap();
         let prepared = committer
             .prepare(ActionPrepareRequest::new(
                 authorization,

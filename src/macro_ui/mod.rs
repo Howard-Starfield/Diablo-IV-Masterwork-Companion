@@ -12,7 +12,7 @@ use crate::engine::macro_engine::{RunEvent, ValidationProblem};
 
 use library::{MacroLibraryRow, project_definition};
 use monitor::{MonitorProjection, RunDefinitionSnapshot, project_last_completion, project_monitor};
-use timeline::{TimelineRow, project_timeline};
+use timeline::{TimelineRow, TimelineSelection, project_timeline};
 
 /// Canonical editor state. It intentionally owns no runtime command sender, capture service,
 /// mouse controller, or platform input handle.
@@ -24,6 +24,7 @@ pub struct MacroPageState {
     pub running_snapshot: Option<RunDefinitionSnapshot>,
     pub runtime_events: Vec<RunEvent>,
     pub selected_block_id: Option<String>,
+    selected_timeline: Option<TimelineSelection>,
     pub pending_inspector_intent: Option<inspector::InspectorIntent>,
     pub editor_feedback: Option<String>,
     pending_conversion: Option<PendingConversion>,
@@ -38,6 +39,7 @@ impl Default for MacroPageState {
             running_snapshot: None,
             runtime_events: Vec::new(),
             selected_block_id: None,
+            selected_timeline: None,
             pending_inspector_intent: None,
             editor_feedback: None,
             pending_conversion: None,
@@ -111,7 +113,7 @@ impl MacroPage {
             title(ui);
             ui.add_space(8.0);
             if let Some(target) = status_strip(ui, state, &monitor, &problems) {
-                state.selected_block_id = Some(target);
+                select_timeline(state, TimelineSelection::Identity(target));
             }
             ui.add_space(8.0);
             if let Some(target) = workspace(
@@ -122,7 +124,7 @@ impl MacroPage {
                 &monitor,
                 &problems,
             ) {
-                state.selected_block_id = Some(target);
+                select_timeline(state, target);
             }
         });
     }
@@ -138,6 +140,22 @@ impl MacroPage {
             &state.runtime_events,
         );
         monitor::show(ui, &monitor);
+    }
+}
+
+fn select_timeline(state: &mut MacroPageState, selection: TimelineSelection) {
+    state.selected_block_id = match &selection {
+        TimelineSelection::Identity(id) => Some(id.clone()),
+        TimelineSelection::TimeoutBody { .. } => None,
+    };
+    state.selected_timeline = Some(selection);
+}
+
+fn current_timeline_selection(state: &MacroPageState) -> Option<TimelineSelection> {
+    match (&state.selected_block_id, &state.selected_timeline) {
+        (Some(id), _) => Some(TimelineSelection::Identity(id.clone())),
+        (None, Some(selection @ TimelineSelection::TimeoutBody { .. })) => Some(selection.clone()),
+        _ => None,
     }
 }
 
@@ -230,6 +248,7 @@ fn status_strip(
                 if state.draft.is_none() && ui.button("Create starter draft").clicked() {
                     state.draft = Some(EditorDraft::new(starter_macro_definition()));
                     state.selected_block_id = Some("observe-1".into());
+                    state.selected_timeline = Some(TimelineSelection::Identity("observe-1".into()));
                     state.editor_feedback =
                         Some("Created an unsaved starter draft for editor authoring.".into());
                 }
@@ -375,10 +394,11 @@ fn workspace(
     timeline_rows: &[TimelineRow],
     monitor: &MonitorProjection,
     problems: &[ValidationProblem],
-) -> Option<String> {
+) -> Option<TimelineSelection> {
     let mut selection = None;
     let selected_owned = state.selected_block_id.clone();
     let selected = selected_owned.as_deref();
+    let selected_timeline = current_timeline_selection(state);
     let projection = state
         .draft
         .as_ref()
@@ -401,8 +421,12 @@ fn workspace(
             });
             section(&mut columns[1], "EVENT TIMELINE", |ui| {
                 editor_toolbar(ui, state);
-                selection =
-                    timeline::show(ui, timeline_rows, monitor.active_block.as_deref(), selected);
+                selection = timeline::show(
+                    ui,
+                    timeline_rows,
+                    monitor.active_block.as_deref(),
+                    selected_timeline.as_ref(),
+                );
             });
             section(&mut columns[2], "INSPECTOR", |ui| {
                 if let Some(intent) = inspector::show(ui, &projection, editable) {
@@ -424,8 +448,12 @@ fn workspace(
         ui.add_space(8.0);
         section(ui, "EVENT TIMELINE", |ui| {
             editor_toolbar(ui, state);
-            selection =
-                timeline::show(ui, timeline_rows, monitor.active_block.as_deref(), selected);
+            selection = timeline::show(
+                ui,
+                timeline_rows,
+                monitor.active_block.as_deref(),
+                selected_timeline.as_ref(),
+            );
         });
         ui.add_space(8.0);
         section(ui, "INSPECTOR", |ui| {
@@ -524,6 +552,7 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
         .as_ref()
         .is_some_and(|draft| matches!(draft.editability, DraftEditability::Editable));
     let selected = state.selected_block_id.clone();
+    let selected_timeline = current_timeline_selection(state);
     if let Some(feedback) = &state.editor_feedback {
         ui.label(
             RichText::new(feedback)
@@ -580,7 +609,9 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                     .draft
                     .as_ref()
                     .ok_or_else(|| "No draft is open.".to_string())
-                    .and_then(|draft| palette_command(draft, selected.as_deref(), kind));
+                    .and_then(|draft| {
+                        palette_command_for_selection(draft, selected_timeline.as_ref(), kind)
+                    });
                 match command {
                     Ok(command) => {
                         let _ = dispatch_editor_command(state, command);
@@ -984,7 +1015,7 @@ fn conversion_preview_ui(ui: &mut Ui, pending: &mut PendingConversion) {
 
 fn pending_conversion_valid(draft: &EditorDraft, pending: &PendingConversion) -> bool {
     use crate::engine::macro_engine::{BlockKind, Limit};
-    match &pending.command {
+    let required_values_valid = match &pending.command {
         EditorCommand::ConvertBlock { target, .. } => match target {
             ConversionTarget::ClickPoint { point_id, .. } => {
                 draft.points.iter().any(|point| point.id == *point_id)
@@ -1056,7 +1087,12 @@ fn pending_conversion_valid(draft: &EditorDraft, pending: &PendingConversion) ->
             _ => true,
         },
         _ => true,
+    };
+    if !required_values_valid {
+        return false;
     }
+    let mut candidate = draft.clone();
+    apply_editor_command(&mut candidate, pending.command.clone()).is_ok()
 }
 
 fn confirm_pending_conversion(state: &mut MacroPageState) -> Result<EditOutcome, EditorError> {
@@ -1104,18 +1140,36 @@ fn conversion_choices(
     use crate::engine::macro_engine::{
         Action, BlockKind, Condition, Limit, MouseButton, ObserveMode, TimeoutOutcome,
     };
-    let wait_true = || ObserveMode::WaitForTrue {
-        timeout_ms: Limit::Unlimited,
-        timeout_outcome: TimeoutOutcome::Continue,
+    let wait_true = |current: &ObserveMode| {
+        if matches!(current, ObserveMode::WaitForTrue { .. }) {
+            current.clone()
+        } else {
+            editor::transition_observe_mode(
+                current,
+                ObserveMode::WaitForTrue {
+                    timeout_ms: Limit::Unlimited,
+                    timeout_outcome: TimeoutOutcome::Continue,
+                },
+            )
+        }
     };
-    let wait_false = || ObserveMode::WaitForFalse {
-        timeout_ms: Limit::Unlimited,
-        timeout_outcome: TimeoutOutcome::Continue,
+    let wait_false = |current: &ObserveMode| {
+        if matches!(current, ObserveMode::WaitForFalse { .. }) {
+            current.clone()
+        } else {
+            editor::transition_observe_mode(
+                current,
+                ObserveMode::WaitForFalse {
+                    timeout_ms: Limit::Unlimited,
+                    timeout_outcome: TimeoutOutcome::Continue,
+                },
+            )
+        }
     };
     let mut targets = Vec::new();
     match &block.kind {
         BlockKind::Observe {
-            condition: Condition::Text { .. },
+            condition: Condition::Text { mode, .. },
         } => targets.extend([
             (
                 "Text: Check now".into(),
@@ -1125,15 +1179,19 @@ fn conversion_choices(
             ),
             (
                 "Text: Wait true".into(),
-                ConversionTarget::TextObservation { mode: wait_true() },
+                ConversionTarget::TextObservation {
+                    mode: wait_true(mode),
+                },
             ),
             (
                 "Text: Wait false".into(),
-                ConversionTarget::TextObservation { mode: wait_false() },
+                ConversionTarget::TextObservation {
+                    mode: wait_false(mode),
+                },
             ),
         ]),
         BlockKind::Observe {
-            condition: Condition::Image { .. },
+            condition: Condition::Image { mode, .. },
         } => targets.extend([
             (
                 "Image: Check now".into(),
@@ -1143,11 +1201,15 @@ fn conversion_choices(
             ),
             (
                 "Image: Wait true".into(),
-                ConversionTarget::ImageObservation { mode: wait_true() },
+                ConversionTarget::ImageObservation {
+                    mode: wait_true(mode),
+                },
             ),
             (
                 "Image: Wait false".into(),
-                ConversionTarget::ImageObservation { mode: wait_false() },
+                ConversionTarget::ImageObservation {
+                    mode: wait_false(mode),
+                },
             ),
         ]),
         BlockKind::Action {
@@ -1381,14 +1443,34 @@ fn replace_block_preview(
             },
             children: ChildDisposition::KeepOwnedContents,
         },
-        structural_children: matches!(
-            block.kind,
-            BlockKind::If { .. }
-                | BlockKind::RepeatN { .. }
-                | BlockKind::RepeatUntil { .. }
-                | BlockKind::Continuous { .. }
-                | BlockKind::WatchGroup { .. }
-        ),
+        structural_children: has_replaceable_children(block),
+    }
+}
+
+fn has_replaceable_children(block: &crate::engine::macro_engine::Block) -> bool {
+    use crate::engine::macro_engine::{BlockKind, Condition, ObserveMode, TimeoutOutcome};
+    match &block.kind {
+        BlockKind::Observe { condition } => {
+            let mode = match condition {
+                Condition::Text { mode, .. } | Condition::Image { mode, .. } => mode,
+            };
+            matches!(
+                mode,
+                ObserveMode::WaitForTrue {
+                    timeout_outcome: TimeoutOutcome::RunBody { .. },
+                    ..
+                } | ObserveMode::WaitForFalse {
+                    timeout_outcome: TimeoutOutcome::RunBody { .. },
+                    ..
+                }
+            )
+        }
+        BlockKind::If { .. }
+        | BlockKind::RepeatN { .. }
+        | BlockKind::RepeatUntil { .. }
+        | BlockKind::Continuous { .. }
+        | BlockKind::WatchGroup { .. } => true,
+        _ => false,
     }
 }
 
@@ -1515,9 +1597,19 @@ enum PaletteKind {
     Stop,
 }
 
+#[cfg(test)]
 fn palette_command(
     draft: &EditorDraft,
     selected_id: Option<&str>,
+    kind: PaletteKind,
+) -> Result<EditorCommand, String> {
+    let selection = selected_id.map(|id| TimelineSelection::Identity(id.to_string()));
+    palette_command_for_selection(draft, selection.as_ref(), kind)
+}
+
+fn palette_command_for_selection(
+    draft: &EditorDraft,
+    selected: Option<&TimelineSelection>,
     kind: PaletteKind,
 ) -> Result<EditorCommand, String> {
     use crate::engine::macro_engine::{
@@ -1525,7 +1617,11 @@ fn palette_command(
         TimeoutOutcome, WatchGroup, WatchLane,
     };
 
-    let target = insertion_target(draft, selected_id);
+    let target = insertion_target(draft, selected);
+    let selected_id = selected.and_then(|selection| match selection {
+        TimelineSelection::Identity(id) => Some(id.as_str()),
+        TimelineSelection::TimeoutBody { .. } => None,
+    });
     let id = next_unique_id(
         draft,
         match kind {
@@ -1632,21 +1728,27 @@ fn palette_command(
     })
 }
 
-fn insertion_target(draft: &EditorDraft, selected_id: Option<&str>) -> InsertionTarget {
-    let Some(selected_id) = selected_id else {
+fn insertion_target(draft: &EditorDraft, selected: Option<&TimelineSelection>) -> InsertionTarget {
+    let Some(selected) = selected else {
         return InsertionTarget {
             container: ContainerPath::Root,
             index: draft.blocks.len(),
         };
     };
-    if let Some(owner_id) = selected_id.strip_suffix("-timeout") {
+    if let TimelineSelection::TimeoutBody { owner_id } = selected {
         let container = ContainerPath::TimeoutBody {
-            owner_id: owner_id.into(),
+            owner_id: owner_id.clone(),
         };
         if let Some(index) = container_len(draft, &container) {
             return InsertionTarget { container, index };
         }
     }
+    let TimelineSelection::Identity(selected_id) = selected else {
+        return InsertionTarget {
+            container: ContainerPath::Root,
+            index: draft.blocks.len(),
+        };
+    };
     if let Some((watch_id, _, _, _)) = locate_watch_lane(draft, selected_id) {
         let container = ContainerPath::WatchLaneBody {
             watch_id,
@@ -1947,8 +2049,11 @@ mod tests {
             timeout_ms: Limit::Finite(100),
             timeout_outcome: TimeoutOutcome::RunBody { body: vec![] },
         };
+        let timeout = TimelineSelection::TimeoutBody {
+            owner_id: "observe-1".into(),
+        };
         let EditorCommand::InsertBlock { target, .. } =
-            palette_command(&draft, Some("observe-1-timeout"), PaletteKind::Wait).unwrap()
+            palette_command_for_selection(&draft, Some(&timeout), PaletteKind::Wait).unwrap()
         else {
             panic!()
         };
@@ -1958,6 +2063,36 @@ mod tests {
                 owner_id: "observe-1".into()
             }
         );
+    }
+
+    #[test]
+    fn real_block_id_with_timeout_suffix_is_not_treated_as_a_timeout_marker() {
+        let mut draft = fixture();
+        let BlockKind::Observe { condition } = &mut draft.blocks[0].kind else {
+            panic!()
+        };
+        let Condition::Text { mode, .. } = condition else {
+            panic!()
+        };
+        *mode = ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Finite(100),
+            timeout_outcome: TimeoutOutcome::RunBody { body: vec![] },
+        };
+        draft.blocks.push(Block {
+            id: "observe-1-timeout".into(),
+            enabled: true,
+            kind: BlockKind::Comment {
+                text: "real imported block".into(),
+            },
+        });
+
+        let EditorCommand::InsertBlock { target, .. } =
+            palette_command(&draft, Some("observe-1-timeout"), PaletteKind::Wait).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(target.container, ContainerPath::Root);
+        assert_eq!(target.index, draft.blocks.len());
     }
 
     #[test]
@@ -2094,6 +2229,33 @@ mod tests {
     }
 
     #[test]
+    fn observe_timeout_body_requires_explicit_replacement_disposition() {
+        let mut draft = fixture();
+        let BlockKind::Observe { condition } = &mut draft.blocks[0].kind else {
+            panic!()
+        };
+        let Condition::Text { mode, .. } = condition else {
+            panic!()
+        };
+        *mode = ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Finite(100),
+            timeout_outcome: TimeoutOutcome::RunBody {
+                body: vec![Block {
+                    id: "fallback".into(),
+                    enabled: true,
+                    kind: BlockKind::Comment {
+                        text: "keep".into(),
+                    },
+                }],
+            },
+        };
+        let block = &draft.blocks[0];
+        let path = locate_block_path(&draft, &block.id).unwrap();
+        let pending = replace_block_preview(block, path, ReplacementKind::Wait);
+        assert!(pending.structural_children);
+    }
+
+    #[test]
     fn conversion_choices_cover_saved_targets_buttons_and_replacement_families() {
         use crate::engine::types::{PointRatio, RectRatio};
         let mut draft = fixture();
@@ -2176,6 +2338,47 @@ mod tests {
     }
 
     #[test]
+    fn observation_conversion_choices_preserve_configured_wait_outcomes() {
+        let mut draft = fixture();
+        let BlockKind::Observe { condition } = &mut draft.blocks[0].kind else {
+            panic!()
+        };
+        let Condition::Text { mode, .. } = condition else {
+            panic!()
+        };
+        *mode = ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Finite(812),
+            timeout_outcome: TimeoutOutcome::RunBody {
+                body: vec![Block {
+                    id: "fallback".into(),
+                    enabled: true,
+                    kind: BlockKind::Comment {
+                        text: "keep".into(),
+                    },
+                }],
+            },
+        };
+        let block = &draft.blocks[0];
+        let path = locate_block_path(&draft, &block.id).unwrap();
+        let (_, pending) = conversion_choices(&draft, block, &path)
+            .into_iter()
+            .find(|(label, _)| label == "Text: Wait false")
+            .unwrap();
+        assert!(matches!(
+            pending.command,
+            EditorCommand::ConvertBlock {
+                target: ConversionTarget::TextObservation {
+                    mode: ObserveMode::WaitForFalse {
+                        timeout_ms: Limit::Finite(812),
+                        timeout_outcome: TimeoutOutcome::RunBody { ref body },
+                    },
+                },
+                ..
+            } if body[0].id == "fallback"
+        ));
+    }
+
+    #[test]
     fn conversion_confirm_cancel_and_invalid_requirements_are_transactional() {
         let mut state = MacroPageState {
             draft: Some(fixture()),
@@ -2228,6 +2431,16 @@ mod tests {
         );
         assert!(state.pending_conversion.is_some());
         assert_eq!(state.draft.as_ref().unwrap().definition, before);
+    }
+
+    #[test]
+    fn replacement_preview_validates_sources_against_the_post_replacement_candidate() {
+        let draft = fixture();
+        let block = &draft.blocks[0];
+        let path = locate_block_path(&draft, &block.id).unwrap();
+        let pending =
+            replace_block_preview(block, path, ReplacementKind::ActionText(block.id.clone()));
+        assert!(!pending_conversion_valid(&draft, &pending));
     }
 
     #[test]

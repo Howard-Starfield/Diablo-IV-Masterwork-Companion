@@ -68,6 +68,7 @@ pub struct TextInspector {
     pub rule: TextRule,
     pub observe_mode: ObserveMode,
     pub repeat_until_max: Option<Limit<u64>>,
+    pub supports_observe_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +91,7 @@ pub struct ImageInspector {
     pub observe_mode: ObserveMode,
     pub repeat_until_max: Option<Limit<u64>>,
     pub available_templates: Vec<AssetRef>,
+    pub supports_observe_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +158,7 @@ pub fn project_inspector(
                             selected_problems(),
                             flow_fields(&block.kind),
                             repeat_until_max(&block.kind),
+                            true,
                         )
                     })
                     .unwrap_or(InspectorProjection::Empty),
@@ -172,6 +175,7 @@ pub fn project_inspector(
                             flow_fields(&block.kind),
                             repeat_until_max(&block.kind),
                             &definition.image_rules,
+                            true,
                         )
                     })
                     .unwrap_or(InspectorProjection::Empty),
@@ -208,6 +212,7 @@ pub fn project_inspector(
                         problems,
                         vec![],
                         None,
+                        false,
                     )
                 })
                 .unwrap_or(InspectorProjection::Empty),
@@ -224,6 +229,7 @@ pub fn project_inspector(
                         vec![],
                         None,
                         &definition.image_rules,
+                        false,
                     )
                 })
                 .unwrap_or(InspectorProjection::Empty),
@@ -254,6 +260,7 @@ fn text_projection(
     problems: Vec<String>,
     flow_fields: Vec<(String, String)>,
     repeat_until_max: Option<Limit<u64>>,
+    supports_observe_mode: bool,
 ) -> InspectorProjection {
     InspectorProjection::Text(TextInspector {
         block_id: id.into(),
@@ -284,6 +291,7 @@ fn text_projection(
         rule: rule.clone(),
         observe_mode: mode.clone(),
         repeat_until_max,
+        supports_observe_mode,
     })
 }
 fn image_projection(
@@ -294,6 +302,7 @@ fn image_projection(
     flow_fields: Vec<(String, String)>,
     repeat_until_max: Option<Limit<u64>>,
     image_rules: &[ImageRule],
+    supports_observe_mode: bool,
 ) -> InspectorProjection {
     InspectorProjection::Image(ImageInspector {
         block_id: id.into(),
@@ -324,6 +333,7 @@ fn image_projection(
             .iter()
             .map(|rule| rule.template.clone())
             .collect(),
+        supports_observe_mode,
     })
 }
 fn flow_projection(id: &str, kind: &BlockKind, problems: Vec<String>) -> InspectorProjection {
@@ -543,8 +553,10 @@ pub fn show(
             if rule != original_rule {
                 intent = Some(InspectorIntent::ReplaceTextRule { rule });
             }
-            mode_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
-            mode_timeout_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
+            if p.supports_observe_mode {
+                mode_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
+                mode_timeout_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
+            }
             repeat_until_editor(
                 ui,
                 &p.block_id,
@@ -598,8 +610,10 @@ pub fn show(
                     Some(InspectorIntent::ReplaceImageRule { rule })
                 };
             }
-            mode_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
-            mode_timeout_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
+            if p.supports_observe_mode {
+                mode_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
+                mode_timeout_editor(ui, &p.block_id, &p.observe_mode, editable, &mut intent);
+            }
             repeat_until_editor(
                 ui,
                 &p.block_id,
@@ -828,21 +842,28 @@ fn mode_editor(
         .add_enabled(editable, Button::new("Cycle detector mode"))
         .clicked()
     {
-        let mode = match current {
-            ObserveMode::CheckNow => ObserveMode::WaitForTrue {
-                timeout_ms: Limit::Unlimited,
-                timeout_outcome: TimeoutOutcome::Continue,
-            },
-            ObserveMode::WaitForTrue { .. } => ObserveMode::WaitForFalse {
-                timeout_ms: Limit::Unlimited,
-                timeout_outcome: TimeoutOutcome::Continue,
-            },
-            ObserveMode::WaitForFalse { .. } => ObserveMode::CheckNow,
-        };
+        let mode = next_observe_mode(current);
         *intent = Some(InspectorIntent::SetConditionMode {
             block_id: block_id.into(),
             mode,
         });
+    }
+}
+
+fn next_observe_mode(current: &ObserveMode) -> ObserveMode {
+    match current {
+        ObserveMode::CheckNow => ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Unlimited,
+            timeout_outcome: TimeoutOutcome::Continue,
+        },
+        ObserveMode::WaitForTrue {
+            timeout_ms,
+            timeout_outcome,
+        } => ObserveMode::WaitForFalse {
+            timeout_ms: timeout_ms.clone(),
+            timeout_outcome: timeout_outcome.clone(),
+        },
+        ObserveMode::WaitForFalse { .. } => ObserveMode::CheckNow,
     }
 }
 
@@ -1160,6 +1181,7 @@ mod tests {
             panic!("text lane inspector");
         };
         assert_eq!(text.lane_priority, Some(2));
+        assert!(!text.supports_observe_mode);
     }
 
     #[test]
@@ -1300,6 +1322,30 @@ mod tests {
             edited,
             ObserveMode::WaitForTrue {
                 timeout_ms: Limit::Unlimited,
+                timeout_outcome: TimeoutOutcome::RunBody { ref body },
+            } if body[0].id == "fallback"
+        ));
+    }
+
+    #[test]
+    fn detector_mode_cycle_preserves_wait_configuration() {
+        let current = ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Finite(444),
+            timeout_outcome: TimeoutOutcome::RunBody {
+                body: vec![Block {
+                    id: "fallback".into(),
+                    enabled: true,
+                    kind: BlockKind::Comment {
+                        text: "keep".into(),
+                    },
+                }],
+            },
+        };
+        let next = next_observe_mode(&current);
+        assert!(matches!(
+            next,
+            ObserveMode::WaitForFalse {
+                timeout_ms: Limit::Finite(444),
                 timeout_outcome: TimeoutOutcome::RunBody { ref body },
             } if body[0].id == "fallback"
         ));

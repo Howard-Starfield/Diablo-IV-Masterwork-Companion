@@ -5,8 +5,15 @@ use crate::engine::macro_engine::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimelineSelection {
+    Identity(String),
+    TimeoutBody { owner_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineRow {
-    pub id: String,
+    pub identity: Option<String>,
+    pub selection: Option<TimelineSelection>,
     pub depth: usize,
     pub label: String,
     pub summary: String,
@@ -26,7 +33,8 @@ fn append_blocks(blocks: &[Block], depth: usize, rows: &mut Vec<TimelineRow>) {
     for block in blocks {
         let (label, summary) = block_summary(&block.kind);
         rows.push(TimelineRow {
-            id: block.id.clone(),
+            identity: Some(block.id.clone()),
+            selection: Some(TimelineSelection::Identity(block.id.clone())),
             depth,
             label,
             summary,
@@ -42,9 +50,9 @@ fn append_blocks(blocks: &[Block], depth: usize, rows: &mut Vec<TimelineRow>) {
                 else_body,
                 condition,
             } => {
-                append_container(&format!("{}-then", block.id), depth + 1, "THEN", rows);
+                append_container(depth + 1, "THEN", rows);
                 append_blocks(then_body, depth + 2, rows);
-                append_container(&format!("{}-else", block.id), depth + 1, "ELSE", rows);
+                append_container(depth + 1, "ELSE", rows);
                 append_blocks(else_body, depth + 2, rows);
                 append_condition_timeout(condition, block, depth, rows);
             }
@@ -62,7 +70,8 @@ fn append_blocks(blocks: &[Block], depth: usize, rows: &mut Vec<TimelineRow>) {
             BlockKind::WatchGroup { group } => {
                 for (index, lane) in group.lanes.iter().enumerate() {
                     rows.push(TimelineRow {
-                        id: lane.id.clone(),
+                        identity: Some(lane.id.clone()),
+                        selection: Some(TimelineSelection::Identity(lane.id.clone())),
                         depth: depth + 1,
                         label: format!("Priority {}", index + 1),
                         summary: passive_condition_summary(&lane.condition),
@@ -71,16 +80,11 @@ fn append_blocks(blocks: &[Block], depth: usize, rows: &mut Vec<TimelineRow>) {
                         is_loop_marker: false,
                         is_selectable: true,
                     });
-                    append_container(&format!("{}-then", lane.id), depth + 2, "THEN", rows);
+                    append_container(depth + 2, "THEN", rows);
                     append_blocks(&lane.then_body, depth + 3, rows);
                 }
                 if let TimeoutOutcome::RunBody { body } = &group.timeout_outcome {
-                    append_timeout_container(
-                        &format!("{}-timeout", block.id),
-                        depth + 1,
-                        "ON TIMEOUT",
-                        rows,
-                    );
+                    append_timeout_container(&block.id, depth + 1, "ON TIMEOUT", rows);
                     append_blocks(body, depth + 2, rows);
                 }
             }
@@ -103,19 +107,22 @@ fn append_condition_timeout(
     rows: &mut Vec<TimelineRow>,
 ) {
     if let Some(body) = condition_timeout_body(condition) {
-        append_timeout_container(
-            &format!("{}-timeout", owner.id),
-            depth + 1,
-            "ON TIMEOUT",
-            rows,
-        );
+        append_timeout_container(&owner.id, depth + 1, "ON TIMEOUT", rows);
         append_blocks(body, depth + 2, rows);
     }
 }
 
-fn append_timeout_container(id: &str, depth: usize, label: &str, rows: &mut Vec<TimelineRow>) {
+fn append_timeout_container(
+    owner_id: &str,
+    depth: usize,
+    label: &str,
+    rows: &mut Vec<TimelineRow>,
+) {
     rows.push(TimelineRow {
-        id: id.to_string(),
+        identity: None,
+        selection: Some(TimelineSelection::TimeoutBody {
+            owner_id: owner_id.to_string(),
+        }),
         depth,
         label: label.to_string(),
         summary: "Owned timeout branch".to_string(),
@@ -143,9 +150,10 @@ fn condition_timeout_body(condition: &Condition) -> Option<&[Block]> {
     }
 }
 
-fn append_container(id: &str, depth: usize, label: &str, rows: &mut Vec<TimelineRow>) {
+fn append_container(depth: usize, label: &str, rows: &mut Vec<TimelineRow>) {
     rows.push(TimelineRow {
-        id: id.to_string(),
+        identity: None,
+        selection: None,
         depth,
         label: label.to_string(),
         summary: "Owned branch".to_string(),
@@ -158,7 +166,8 @@ fn append_container(id: &str, depth: usize, label: &str, rows: &mut Vec<Timeline
 
 fn append_loop_marker(block: &Block, depth: usize, rows: &mut Vec<TimelineRow>) {
     rows.push(TimelineRow {
-        id: format!("{}-loop-return", block.id),
+        identity: None,
+        selection: None,
         depth,
         label: "LOOP".to_string(),
         summary: "Return to loop start".to_string(),
@@ -260,8 +269,8 @@ pub fn show(
     ui: &mut Ui,
     rows: &[TimelineRow],
     active_block: Option<&str>,
-    selected_block: Option<&str>,
-) -> Option<String> {
+    current_selection: Option<&TimelineSelection>,
+) -> Option<TimelineSelection> {
     if rows.is_empty() {
         Frame::none()
             .fill(Color32::from_rgb(14, 16, 18))
@@ -283,10 +292,10 @@ pub fn show(
         return None;
     }
 
-    let mut selected = None;
+    let mut clicked_selection = None;
     for row in rows {
         let active =
-            active_block == Some(row.id.as_str()) || selected_block == Some(row.id.as_str());
+            row.identity.as_deref() == active_block || row.selection.as_ref() == current_selection;
         let fill = if active {
             Color32::from_rgb(58, 37, 24)
         } else if row.is_loop_marker {
@@ -331,11 +340,11 @@ pub fn show(
             })
             .response;
         if row.is_selectable && response.interact(egui::Sense::click()).clicked() {
-            selected = Some(row.id.clone());
+            clicked_selection = row.selection.clone();
         }
         ui.add_space(4.0);
     }
-    selected
+    clicked_selection
 }
 
 #[cfg(test)]
@@ -457,17 +466,64 @@ mod tests {
             },
         ]);
 
-        for (marker, child) in [
-            ("observe-timeout", "observe-timeout-child"),
-            ("if-timeout", "if-timeout-child"),
-            ("repeat-timeout", "repeat-timeout-child"),
+        for (owner, child) in [
+            ("observe", "observe-timeout-child"),
+            ("if", "if-timeout-child"),
+            ("repeat", "repeat-timeout-child"),
         ] {
-            let marker = rows.iter().find(|row| row.id == marker).unwrap();
+            let marker = rows
+                .iter()
+                .find(|row| {
+                    row.selection
+                        == Some(TimelineSelection::TimeoutBody {
+                            owner_id: owner.into(),
+                        })
+                })
+                .unwrap();
             assert_eq!(marker.label, "ON TIMEOUT");
             assert!(marker.is_selectable);
-            let child = rows.iter().find(|row| row.id == child).unwrap();
+            let child = rows
+                .iter()
+                .find(|row| row.identity.as_deref() == Some(child))
+                .unwrap();
             assert!(child.is_selectable);
             assert!(child.depth > marker.depth);
         }
+    }
+
+    #[test]
+    fn typed_timeout_marker_does_not_collide_with_real_suffix_identity() {
+        let rows = project_timeline(&[
+            Block {
+                id: "owner".into(),
+                enabled: true,
+                kind: BlockKind::Observe {
+                    condition: Condition::Text {
+                        source_block_id: "owner".into(),
+                        rule_id: "rule".into(),
+                        mode: ObserveMode::WaitForTrue {
+                            timeout_ms: Limit::Finite(100),
+                            timeout_outcome: TimeoutOutcome::RunBody { body: vec![] },
+                        },
+                    },
+                },
+            },
+            Block {
+                id: "owner-timeout".into(),
+                enabled: true,
+                kind: BlockKind::Comment {
+                    text: "real block".into(),
+                },
+            },
+        ]);
+        assert!(rows.iter().any(|row| {
+            row.selection == Some(TimelineSelection::Identity("owner-timeout".into()))
+        }));
+        assert!(rows.iter().any(|row| {
+            row.selection
+                == Some(TimelineSelection::TimeoutBody {
+                    owner_id: "owner".into(),
+                })
+        }));
     }
 }

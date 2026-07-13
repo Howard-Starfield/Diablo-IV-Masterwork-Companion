@@ -406,11 +406,15 @@ pub fn apply_editor_command(
         definition: draft.definition.clone(),
         invalidated_source_ids: draft.invalidated_source_ids.clone(),
     };
+    let existing_action_dependency_problems = action_dependency_problems(&before.definition);
     let mut candidate = before.definition.clone();
     let mut invalidated = before.invalidated_source_ids.clone();
     apply_to_definition(&mut candidate, &mut invalidated, command)?;
     ensure_unique_structural_ids(&candidate)?;
     reject_nested_watch_groups(&candidate.blocks, false)?;
+    if !action_dependency_problems(&candidate).is_subset(&existing_action_dependency_problems) {
+        return Err(EditorError::ValidationFailed);
+    }
 
     if candidate == before.definition && invalidated == before.invalidated_source_ids {
         return Ok(EditOutcome::NoChange);
@@ -425,6 +429,21 @@ pub fn apply_editor_command(
     draft.invalidated_source_ids = invalidated;
     draft.status = DraftStatus::NeedsValidation;
     Ok(EditOutcome::Changed)
+}
+
+fn action_dependency_problems(
+    definition: &MacroDefinition,
+) -> HashSet<(String, Option<String>, String)> {
+    crate::engine::macro_engine::validate_macro(definition)
+        .into_iter()
+        .filter(|problem| {
+            matches!(
+                problem.code.as_str(),
+                "action.invalid_source" | "action.detector_family_mismatch"
+            )
+        })
+        .map(|problem| (problem.code, problem.block_id, problem.message))
+        .collect()
 }
 
 /// Runtime validation plus editor-only dependency invalidations. Saved canonical definitions do not
@@ -510,14 +529,14 @@ fn apply_to_definition(
                 .position(|block| block.id == path.block_id)
                 .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
             let removed = container.remove(index);
-            match removed.kind {
-                BlockKind::RepeatN { body, .. }
-                | BlockKind::RepeatUntil { body, .. }
-                | BlockKind::Continuous { body } => match loop_choice {
+            match &removed.kind {
+                BlockKind::RepeatN { .. }
+                | BlockKind::RepeatUntil { .. }
+                | BlockKind::Continuous { .. } => match loop_choice {
                     None => return Err(EditorError::LoopDeletionChoiceRequired),
                     Some(LoopDeletionChoice::DeleteWithContents) => {}
                     Some(LoopDeletionChoice::KeepContents) => {
-                        container.splice(index..index, body);
+                        container.splice(index..index, owned_contents(removed));
                     }
                 },
                 _ if loop_choice == Some(LoopDeletionChoice::KeepContents) => {
@@ -658,6 +677,7 @@ fn apply_to_definition(
             };
             let changed = match condition {
                 Condition::Text { mode: current, .. } | Condition::Image { mode: current, .. } => {
+                    let mode = transition_observe_mode(current, mode);
                     if *current == mode {
                         false
                     } else {
@@ -814,7 +834,7 @@ fn convert_block(block: &mut Block, target: ConversionTarget) -> Result<(), Edit
                 condition: Condition::Image { mode, .. },
             },
             ConversionTarget::ImageObservation { mode: next },
-        ) => *mode = next,
+        ) => *mode = transition_observe_mode(mode, next),
         (
             BlockKind::Action {
                 action: Action::ClickTextMatch { button, .. },
@@ -866,24 +886,81 @@ fn convert_block(block: &mut Block, target: ConversionTarget) -> Result<(), Edit
     Ok(())
 }
 
+pub(super) fn transition_observe_mode(current: &ObserveMode, next: ObserveMode) -> ObserveMode {
+    match (current, next) {
+        (
+            ObserveMode::WaitForTrue {
+                timeout_ms,
+                timeout_outcome,
+            },
+            ObserveMode::WaitForFalse { .. },
+        ) => ObserveMode::WaitForFalse {
+            timeout_ms: timeout_ms.clone(),
+            timeout_outcome: timeout_outcome.clone(),
+        },
+        (
+            ObserveMode::WaitForFalse {
+                timeout_ms,
+                timeout_outcome,
+            },
+            ObserveMode::WaitForTrue { .. },
+        ) => ObserveMode::WaitForTrue {
+            timeout_ms: timeout_ms.clone(),
+            timeout_outcome: timeout_outcome.clone(),
+        },
+        (_, next) => next,
+    }
+}
+
 fn owned_contents(block: Block) -> Vec<Block> {
     match block.kind {
+        BlockKind::Observe { condition } => condition_owned_timeout(condition),
         BlockKind::If {
             mut then_body,
             else_body,
-            ..
+            condition,
         } => {
             then_body.extend(else_body);
+            then_body.extend(condition_owned_timeout(condition));
             then_body
         }
-        BlockKind::RepeatN { body, .. }
-        | BlockKind::RepeatUntil { body, .. }
-        | BlockKind::Continuous { body } => body,
-        BlockKind::WatchGroup { group } => group
-            .lanes
-            .into_iter()
-            .flat_map(|lane| lane.then_body)
-            .collect(),
+        BlockKind::RepeatN { body, .. } | BlockKind::Continuous { body } => body,
+        BlockKind::RepeatUntil {
+            mut body,
+            condition,
+            ..
+        } => {
+            body.extend(condition_owned_timeout(condition));
+            body
+        }
+        BlockKind::WatchGroup { group } => {
+            let mut owned: Vec<Block> = group
+                .lanes
+                .into_iter()
+                .flat_map(|lane| lane.then_body)
+                .collect();
+            if let TimeoutOutcome::RunBody { body } = group.timeout_outcome {
+                owned.extend(body);
+            }
+            owned
+        }
+        _ => vec![],
+    }
+}
+
+fn condition_owned_timeout(condition: Condition) -> Vec<Block> {
+    let mode = match condition {
+        Condition::Text { mode, .. } | Condition::Image { mode, .. } => mode,
+    };
+    match mode {
+        ObserveMode::WaitForTrue {
+            timeout_outcome: TimeoutOutcome::RunBody { body },
+            ..
+        }
+        | ObserveMode::WaitForFalse {
+            timeout_outcome: TimeoutOutcome::RunBody { body },
+            ..
+        } => body,
         _ => vec![],
     }
 }
@@ -2139,6 +2216,276 @@ mod tests {
                 .map(|b| b.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
+        );
+    }
+
+    fn condition_with_timeout(owner: &str, timeout_child: &str) -> Condition {
+        Condition::Text {
+            source_block_id: owner.into(),
+            rule_id: "r".into(),
+            mode: ObserveMode::WaitForTrue {
+                timeout_ms: Limit::Finite(321),
+                timeout_outcome: TimeoutOutcome::RunBody {
+                    body: vec![comment(timeout_child)],
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn keep_owned_contents_flattens_all_owned_branches_in_canonical_order() {
+        let blocks = vec![
+            Block {
+                id: "observe".into(),
+                enabled: true,
+                kind: BlockKind::Observe {
+                    condition: condition_with_timeout("observe", "observe-timeout"),
+                },
+            },
+            Block {
+                id: "if".into(),
+                enabled: true,
+                kind: BlockKind::If {
+                    condition: condition_with_timeout("if", "if-timeout"),
+                    then_body: vec![comment("if-then")],
+                    else_body: vec![comment("if-else")],
+                },
+            },
+            Block {
+                id: "repeat".into(),
+                enabled: true,
+                kind: BlockKind::RepeatUntil {
+                    condition: condition_with_timeout("repeat", "repeat-timeout"),
+                    max_iterations: Limit::Finite(4),
+                    body: vec![comment("repeat-body")],
+                },
+            },
+            Block {
+                id: "watch".into(),
+                enabled: true,
+                kind: BlockKind::WatchGroup {
+                    group: WatchGroup {
+                        lanes: vec![
+                            WatchLane {
+                                id: "lane-1".into(),
+                                enabled: true,
+                                condition: PassiveCondition::Text {
+                                    source_block_id: "lane-1".into(),
+                                    rule_id: "r".into(),
+                                },
+                                then_body: vec![comment("lane-1-body")],
+                            },
+                            WatchLane {
+                                id: "lane-2".into(),
+                                enabled: true,
+                                condition: PassiveCondition::Text {
+                                    source_block_id: "lane-2".into(),
+                                    rule_id: "r".into(),
+                                },
+                                then_body: vec![comment("lane-2-body")],
+                            },
+                        ],
+                        timeout_ms: Limit::Finite(100),
+                        timeout_outcome: TimeoutOutcome::RunBody {
+                            body: vec![comment("watch-timeout")],
+                        },
+                        cooldown_ms: 0,
+                    },
+                },
+            },
+        ];
+        let mut draft = EditorDraft::new(def(blocks));
+        for id in ["observe", "if", "repeat", "watch"] {
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::ReplaceBlock {
+                    path: path(id),
+                    replacement: comment(id),
+                    children: ChildDisposition::KeepOwnedContents,
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            draft
+                .blocks
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "observe",
+                "observe-timeout",
+                "if",
+                "if-then",
+                "if-else",
+                "if-timeout",
+                "repeat",
+                "repeat-body",
+                "repeat-timeout",
+                "watch",
+                "lane-1-body",
+                "lane-2-body",
+                "watch-timeout",
+            ]
+        );
+    }
+
+    #[test]
+    fn repeat_until_keep_contents_preserves_body_then_timeout_branch() {
+        let mut draft = EditorDraft::new(def(vec![Block {
+            id: "repeat".into(),
+            enabled: true,
+            kind: BlockKind::RepeatUntil {
+                condition: condition_with_timeout("repeat", "timeout"),
+                max_iterations: Limit::Finite(4),
+                body: vec![comment("body")],
+            },
+        }]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::RemoveBlock {
+                path: path("repeat"),
+                loop_choice: Some(LoopDeletionChoice::KeepContents),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            draft
+                .blocks
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["body", "timeout"]
+        );
+    }
+
+    #[test]
+    fn wait_mode_direction_changes_preserve_timeout_configuration_and_body() {
+        let configured = ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Finite(777),
+            timeout_outcome: TimeoutOutcome::RunBody {
+                body: vec![comment("fallback")],
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![Block {
+            id: "observe".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "observe".into(),
+                    rule_id: "r".into(),
+                    mode: configured,
+                },
+            },
+        }]));
+
+        for command in [
+            EditorCommand::ConvertBlock {
+                path: path("observe"),
+                target: ConversionTarget::TextObservation {
+                    mode: ObserveMode::WaitForFalse {
+                        timeout_ms: Limit::Unlimited,
+                        timeout_outcome: TimeoutOutcome::Continue,
+                    },
+                },
+            },
+            EditorCommand::SetConditionMode {
+                path: path("observe"),
+                mode: ObserveMode::WaitForTrue {
+                    timeout_ms: Limit::Unlimited,
+                    timeout_outcome: TimeoutOutcome::Continue,
+                },
+            },
+        ] {
+            apply_editor_command(&mut draft, command).unwrap();
+            let BlockKind::Observe { condition } = &draft.blocks[0].kind else {
+                panic!()
+            };
+            let mode = match condition {
+                Condition::Text { mode, .. } => mode,
+                _ => panic!(),
+            };
+            assert!(matches!(
+                mode,
+                ObserveMode::WaitForTrue {
+                    timeout_ms: Limit::Finite(777),
+                    timeout_outcome: TimeoutOutcome::RunBody { body },
+                } | ObserveMode::WaitForFalse {
+                    timeout_ms: Limit::Finite(777),
+                    timeout_outcome: TimeoutOutcome::RunBody { body },
+                } if body[0].id == "fallback"
+            ));
+        }
+    }
+
+    #[test]
+    fn replacement_rejects_action_sources_removed_by_the_same_transaction() {
+        let owner = Block {
+            id: "owner".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "owner".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::WaitForTrue {
+                        timeout_ms: Limit::Finite(321),
+                        timeout_outcome: TimeoutOutcome::RunBody {
+                            body: vec![Block {
+                                id: "child-source".into(),
+                                enabled: true,
+                                kind: BlockKind::Observe {
+                                    condition: Condition::Text {
+                                        source_block_id: "child-source".into(),
+                                        rule_id: "r".into(),
+                                        mode: ObserveMode::CheckNow,
+                                    },
+                                },
+                            }],
+                        },
+                    },
+                },
+            },
+        };
+        let replacement = |source: &str| Block {
+            id: "owner".into(),
+            enabled: true,
+            kind: BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: source.into(),
+                    button: MouseButton::Left,
+                },
+            },
+        };
+
+        for source in ["owner", "child-source"] {
+            let mut draft = EditorDraft::new(def(vec![owner.clone()]));
+            let before = draft.clone();
+            assert_eq!(
+                apply_editor_command(
+                    &mut draft,
+                    EditorCommand::ReplaceBlock {
+                        path: path("owner"),
+                        replacement: replacement(source),
+                        children: ChildDisposition::DeleteOwnedContents,
+                    },
+                ),
+                Err(EditorError::ValidationFailed)
+            );
+            assert_eq!(draft, before);
+        }
+
+        let mut keep = EditorDraft::new(def(vec![owner]));
+        assert_eq!(
+            apply_editor_command(
+                &mut keep,
+                EditorCommand::ReplaceBlock {
+                    path: path("owner"),
+                    replacement: replacement("child-source"),
+                    children: ChildDisposition::KeepOwnedContents,
+                },
+            ),
+            Ok(EditOutcome::Changed)
         );
     }
 

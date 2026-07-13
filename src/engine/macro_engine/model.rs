@@ -209,6 +209,19 @@ pub enum Condition {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "detector", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PassiveCondition {
+    Text {
+        source_block_id: String,
+        rule_id: String,
+    },
+    Image {
+        source_block_id: String,
+        rule_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ObserveMode {
     CheckNow,
@@ -258,7 +271,7 @@ pub struct WatchGroup {
 pub struct WatchLane {
     pub id: String,
     pub enabled: bool,
-    pub condition: Condition,
+    pub condition: PassiveCondition,
     pub then_body: Vec<Block>,
 }
 
@@ -315,5 +328,37 @@ mod tests {
             let json = serde_json::to_string(&mode).unwrap();
             assert_eq!(serde_json::from_str::<ObserveMode>(&json).unwrap(), mode);
         }
+    }
+
+    #[test]
+    fn passive_watch_condition_has_no_wait_mode_or_timeout_body() {
+        let condition = PassiveCondition::Text {
+            source_block_id: "observe".to_string(),
+            rule_id: "text-rule".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_string(&condition).unwrap(),
+            r#"{"detector":"text","source_block_id":"observe","rule_id":"text-rule"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<PassiveCondition>(
+                r#"{"detector":"text","source_block_id":"observe","rule_id":"text-rule"}"#
+            )
+            .unwrap(),
+            condition
+        );
+    }
+
+    #[test]
+    fn passive_watch_condition_rejects_wait_fields() {
+        let json = r#"{
+            "detector":"text",
+            "source_block_id":"observe",
+            "rule_id":"text-rule",
+            "mode":{"type":"wait_for_true","timeout_ms":{"kind":"unlimited"},"timeout_outcome":{"type":"continue"}}
+        }"#;
+
+        assert!(serde_json::from_str::<PassiveCondition>(json).is_err());
     }
 }

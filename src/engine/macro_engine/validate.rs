@@ -19,6 +19,7 @@ enum DetectorFamily {
 struct SourceInfo<'a> {
     family: DetectorFamily,
     rule_id: &'a str,
+    enabled: bool,
 }
 
 struct ValidationContext<'a> {
@@ -118,6 +119,7 @@ pub fn validate_macro(definition: &MacroDefinition) -> Vec<ValidationProblem> {
     let mut sources = HashMap::new();
     index_blocks(
         &definition.blocks,
+        true,
         &mut block_ids,
         &mut lane_ids,
         &mut sources,
@@ -141,7 +143,14 @@ pub fn validate_macro(definition: &MacroDefinition) -> Vec<ValidationProblem> {
             .collect(),
         sources,
     };
-    validate_blocks(&definition.blocks, &context, false, false, &mut problems);
+    validate_blocks(
+        &definition.blocks,
+        &context,
+        true,
+        false,
+        false,
+        &mut problems,
+    );
 
     problems
 }
@@ -163,12 +172,14 @@ fn collect_unique_ids<'a>(
 
 fn index_blocks<'a>(
     blocks: &'a [Block],
+    ancestors_enabled: bool,
     block_ids: &mut HashSet<&'a str>,
     lane_ids: &mut HashSet<&'a str>,
     sources: &mut HashMap<&'a str, SourceInfo<'a>>,
     problems: &mut Vec<ValidationProblem>,
 ) {
     for block in blocks {
+        let block_enabled = ancestors_enabled && block.enabled;
         if !block_ids.insert(block.id.as_str()) {
             push_problem(
                 problems,
@@ -182,8 +193,15 @@ fn index_blocks<'a>(
             BlockKind::Observe { condition }
             | BlockKind::If { condition, .. }
             | BlockKind::RepeatUntil { condition, .. } => {
-                sources.insert(block.id.as_str(), source_info(condition));
-                index_condition_timeout_body(condition, block_ids, lane_ids, sources, problems);
+                sources.insert(block.id.as_str(), source_info(condition, block_enabled));
+                index_condition_timeout_body(
+                    condition,
+                    block_enabled,
+                    block_ids,
+                    lane_ids,
+                    sources,
+                    problems,
+                );
             }
             _ => {}
         }
@@ -194,13 +212,27 @@ fn index_blocks<'a>(
                 else_body,
                 ..
             } => {
-                index_blocks(then_body, block_ids, lane_ids, sources, problems);
-                index_blocks(else_body, block_ids, lane_ids, sources, problems);
+                index_blocks(
+                    then_body,
+                    block_enabled,
+                    block_ids,
+                    lane_ids,
+                    sources,
+                    problems,
+                );
+                index_blocks(
+                    else_body,
+                    block_enabled,
+                    block_ids,
+                    lane_ids,
+                    sources,
+                    problems,
+                );
             }
             BlockKind::RepeatN { body, .. }
             | BlockKind::RepeatUntil { body, .. }
             | BlockKind::Continuous { body } => {
-                index_blocks(body, block_ids, lane_ids, sources, problems);
+                index_blocks(body, block_enabled, block_ids, lane_ids, sources, problems);
             }
             BlockKind::WatchGroup { group } => {
                 for lane in &group.lanes {
@@ -212,18 +244,22 @@ fn index_blocks<'a>(
                             Some(&block.id),
                         );
                     }
-                    sources.insert(lane.id.as_str(), source_info(&lane.condition));
-                    index_condition_timeout_body(
-                        &lane.condition,
+                    let lane_enabled = block_enabled && lane.enabled;
+                    sources.insert(
+                        lane.id.as_str(),
+                        passive_source_info(&lane.condition, lane_enabled),
+                    );
+                    index_blocks(
+                        &lane.then_body,
+                        lane_enabled,
                         block_ids,
                         lane_ids,
                         sources,
                         problems,
                     );
-                    index_blocks(&lane.then_body, block_ids, lane_ids, sources, problems);
                 }
                 if let TimeoutOutcome::RunBody { body } = &group.timeout_outcome {
-                    index_blocks(body, block_ids, lane_ids, sources, problems);
+                    index_blocks(body, block_enabled, block_ids, lane_ids, sources, problems);
                 }
             }
             _ => {}
@@ -233,25 +269,50 @@ fn index_blocks<'a>(
 
 fn index_condition_timeout_body<'a>(
     condition: &'a Condition,
+    condition_enabled: bool,
     block_ids: &mut HashSet<&'a str>,
     lane_ids: &mut HashSet<&'a str>,
     sources: &mut HashMap<&'a str, SourceInfo<'a>>,
     problems: &mut Vec<ValidationProblem>,
 ) {
     if let Some(TimeoutOutcome::RunBody { body }) = condition_timeout_outcome(condition) {
-        index_blocks(body, block_ids, lane_ids, sources, problems);
+        index_blocks(
+            body,
+            condition_enabled,
+            block_ids,
+            lane_ids,
+            sources,
+            problems,
+        );
     }
 }
 
-fn source_info(condition: &Condition) -> SourceInfo<'_> {
+fn source_info(condition: &Condition, enabled: bool) -> SourceInfo<'_> {
     match condition {
         Condition::Text { rule_id, .. } => SourceInfo {
             family: DetectorFamily::Text,
             rule_id,
+            enabled,
         },
         Condition::Image { rule_id, .. } => SourceInfo {
             family: DetectorFamily::Image,
             rule_id,
+            enabled,
+        },
+    }
+}
+
+fn passive_source_info(condition: &PassiveCondition, enabled: bool) -> SourceInfo<'_> {
+    match condition {
+        PassiveCondition::Text { rule_id, .. } => SourceInfo {
+            family: DetectorFamily::Text,
+            rule_id,
+            enabled,
+        },
+        PassiveCondition::Image { rule_id, .. } => SourceInfo {
+            family: DetectorFamily::Image,
+            rule_id,
+            enabled,
         },
     }
 }
@@ -259,34 +320,38 @@ fn source_info(condition: &Condition) -> SourceInfo<'_> {
 fn validate_blocks(
     blocks: &[Block],
     context: &ValidationContext<'_>,
+    ancestors_enabled: bool,
     inside_watch_group: bool,
     inside_lane_body: bool,
     problems: &mut Vec<ValidationProblem>,
 ) {
     for block in blocks {
+        let block_enabled = ancestors_enabled && block.enabled;
         match &block.kind {
             BlockKind::Observe { condition } => {
-                validate_condition(condition, context, &block.id, problems);
+                validate_condition(condition, context, &block.id, block_enabled, problems);
                 validate_condition_timeout_body(
                     condition,
                     context,
+                    block_enabled,
                     inside_watch_group,
                     inside_lane_body,
                     problems,
                 );
             }
             BlockKind::Action { action } => {
-                validate_action(action, context, &block.id, problems);
+                validate_action(action, context, &block.id, block_enabled, problems);
             }
             BlockKind::If {
                 condition,
                 then_body,
                 else_body,
             } => {
-                validate_condition(condition, context, &block.id, problems);
+                validate_condition(condition, context, &block.id, block_enabled, problems);
                 validate_condition_timeout_body(
                     condition,
                     context,
+                    block_enabled,
                     inside_watch_group,
                     inside_lane_body,
                     problems,
@@ -294,6 +359,7 @@ fn validate_blocks(
                 validate_blocks(
                     then_body,
                     context,
+                    block_enabled,
                     inside_watch_group,
                     inside_lane_body,
                     problems,
@@ -301,6 +367,7 @@ fn validate_blocks(
                 validate_blocks(
                     else_body,
                     context,
+                    block_enabled,
                     inside_watch_group,
                     inside_lane_body,
                     problems,
@@ -309,6 +376,7 @@ fn validate_blocks(
             BlockKind::RepeatN { body, .. } => validate_blocks(
                 body,
                 context,
+                block_enabled,
                 inside_watch_group,
                 inside_lane_body,
                 problems,
@@ -316,10 +384,11 @@ fn validate_blocks(
             BlockKind::RepeatUntil {
                 condition, body, ..
             } => {
-                validate_condition(condition, context, &block.id, problems);
+                validate_condition(condition, context, &block.id, block_enabled, problems);
                 validate_condition_timeout_body(
                     condition,
                     context,
+                    block_enabled,
                     inside_watch_group,
                     inside_lane_body,
                     problems,
@@ -327,6 +396,7 @@ fn validate_blocks(
                 validate_blocks(
                     body,
                     context,
+                    block_enabled,
                     inside_watch_group,
                     inside_lane_body,
                     problems,
@@ -341,7 +411,7 @@ fn validate_blocks(
                         Some(&block.id),
                     );
                 }
-                if block.enabled && !contains_paced_or_blocking_operation(body) {
+                if block_enabled && !contains_paced_or_blocking_operation(body) {
                     push_problem(
                         problems,
                         "continuous.busy_loop",
@@ -352,6 +422,7 @@ fn validate_blocks(
                 validate_blocks(
                     body,
                     context,
+                    block_enabled,
                     inside_watch_group,
                     inside_lane_body,
                     problems,
@@ -386,12 +457,18 @@ fn validate_blocks(
                     );
                 }
                 for lane in &group.lanes {
-                    validate_condition(&lane.condition, context, &block.id, problems);
-                    validate_condition_timeout_body(&lane.condition, context, true, true, problems);
-                    validate_blocks(&lane.then_body, context, true, true, problems);
+                    let lane_enabled = block_enabled && lane.enabled;
+                    validate_passive_condition(
+                        &lane.condition,
+                        context,
+                        &block.id,
+                        lane_enabled,
+                        problems,
+                    );
+                    validate_blocks(&lane.then_body, context, lane_enabled, true, true, problems);
                 }
                 if let TimeoutOutcome::RunBody { body } = &group.timeout_outcome {
-                    validate_blocks(body, context, true, false, problems);
+                    validate_blocks(body, context, block_enabled, true, false, problems);
                 }
             }
             BlockKind::Wait { .. }
@@ -406,6 +483,7 @@ fn validate_condition(
     condition: &Condition,
     context: &ValidationContext<'_>,
     owner_block_id: &str,
+    consumer_enabled: bool,
     problems: &mut Vec<ValidationProblem>,
 ) {
     let (source_block_id, rule_id, expected_family, rule_exists) = match condition {
@@ -452,20 +530,106 @@ fn validate_condition(
         );
     }
 
-    match context.sources.get(source_block_id.as_str()) {
+    validate_source_binding(
+        source_block_id,
+        rule_id,
+        expected_family,
+        consumer_enabled,
+        context,
+        owner_block_id,
+        "condition",
+        problems,
+    );
+}
+
+fn validate_passive_condition(
+    condition: &PassiveCondition,
+    context: &ValidationContext<'_>,
+    owner_block_id: &str,
+    consumer_enabled: bool,
+    problems: &mut Vec<ValidationProblem>,
+) {
+    let (source_block_id, rule_id, expected_family, rule_exists) = match condition {
+        PassiveCondition::Text {
+            source_block_id,
+            rule_id,
+        } => (
+            source_block_id,
+            rule_id,
+            DetectorFamily::Text,
+            context.text_rules.contains_key(rule_id.as_str()),
+        ),
+        PassiveCondition::Image {
+            source_block_id,
+            rule_id,
+        } => (
+            source_block_id,
+            rule_id,
+            DetectorFamily::Image,
+            context.image_rules.contains_key(rule_id.as_str()),
+        ),
+    };
+
+    if !rule_exists {
+        push_problem(
+            problems,
+            "condition.invalid_rule",
+            format!("passive condition references missing rule '{rule_id}'"),
+            Some(owner_block_id),
+        );
+    }
+
+    validate_source_binding(
+        source_block_id,
+        rule_id,
+        expected_family,
+        consumer_enabled,
+        context,
+        owner_block_id,
+        "condition",
+        problems,
+    );
+}
+
+fn validate_source_binding(
+    source_block_id: &str,
+    rule_id: &str,
+    expected_family: DetectorFamily,
+    consumer_enabled: bool,
+    context: &ValidationContext<'_>,
+    owner_block_id: &str,
+    code_prefix: &str,
+    problems: &mut Vec<ValidationProblem>,
+) {
+    match context.sources.get(source_block_id) {
         None => push_problem(
             problems,
-            "condition.invalid_source",
+            &format!("{code_prefix}.invalid_source"),
             format!("condition references missing observation source '{source_block_id}'"),
             Some(owner_block_id),
         ),
         Some(source) if source.family != expected_family => push_problem(
             problems,
-            "condition.detector_family_mismatch",
+            &format!("{code_prefix}.detector_family_mismatch"),
             format!("condition detector family does not match source '{source_block_id}'"),
             Some(owner_block_id),
         ),
-        _ => {}
+        Some(source) if source.rule_id != rule_id => push_problem(
+            problems,
+            &format!("{code_prefix}.source_rule_mismatch"),
+            format!(
+                "consumer rule '{rule_id}' does not match source '{source_block_id}' rule '{}'",
+                source.rule_id
+            ),
+            Some(owner_block_id),
+        ),
+        Some(source) if consumer_enabled && !source.enabled => push_problem(
+            problems,
+            &format!("{code_prefix}.disabled_source"),
+            format!("enabled consumer references disabled source '{source_block_id}'"),
+            Some(owner_block_id),
+        ),
+        Some(_) => {}
     }
 }
 
@@ -487,6 +651,7 @@ fn condition_timeout_outcome(condition: &Condition) -> Option<&TimeoutOutcome> {
 fn validate_condition_timeout_body(
     condition: &Condition,
     context: &ValidationContext<'_>,
+    condition_enabled: bool,
     inside_watch_group: bool,
     inside_lane_body: bool,
     problems: &mut Vec<ValidationProblem>,
@@ -495,6 +660,7 @@ fn validate_condition_timeout_body(
         validate_blocks(
             body,
             context,
+            condition_enabled,
             inside_watch_group,
             inside_lane_body,
             problems,
@@ -506,6 +672,7 @@ fn validate_action(
     action: &Action,
     context: &ValidationContext<'_>,
     block_id: &str,
+    consumer_enabled: bool,
     problems: &mut Vec<ValidationProblem>,
 ) {
     match action {
@@ -519,6 +686,7 @@ fn validate_action(
             DetectorFamily::Text,
             context,
             block_id,
+            consumer_enabled,
             problems,
         ),
         Action::ClickImageMatch {
@@ -531,6 +699,7 @@ fn validate_action(
             DetectorFamily::Image,
             context,
             block_id,
+            consumer_enabled,
             problems,
         ),
         Action::ClickRegion { region_id, .. }
@@ -567,6 +736,7 @@ fn validate_match_source(
     expected_family: DetectorFamily,
     context: &ValidationContext<'_>,
     block_id: &str,
+    consumer_enabled: bool,
     problems: &mut Vec<ValidationProblem>,
 ) {
     let Some(source) = context.sources.get(source_block_id) else {
@@ -584,6 +754,16 @@ fn validate_match_source(
             problems,
             "action.detector_family_mismatch",
             format!("action target family does not match observation source '{source_block_id}'"),
+            Some(block_id),
+        );
+        return;
+    }
+
+    if consumer_enabled && !source.enabled {
+        push_problem(
+            problems,
+            "action.disabled_source",
+            format!("enabled action references disabled source '{source_block_id}'"),
             Some(block_id),
         );
         return;
@@ -610,12 +790,18 @@ fn contains_paced_or_blocking_operation(blocks: &[Block]) -> bool {
         .filter(|block| block.enabled)
         .any(|block| match &block.kind {
             BlockKind::Observe { .. }
-            | BlockKind::Action { .. }
             | BlockKind::If { .. }
             | BlockKind::RepeatUntil { .. }
             | BlockKind::WatchGroup { .. }
             | BlockKind::StopSuccess
             | BlockKind::StopError { .. } => true,
+            BlockKind::Action { action } => matches!(
+                action,
+                Action::ClickTextMatch { .. }
+                    | Action::ClickImageMatch { .. }
+                    | Action::ClickPoint { .. }
+                    | Action::ClickRegion { .. }
+            ),
             BlockKind::Wait { duration_ms } => *duration_ms > 0,
             BlockKind::RepeatN { count, body } => {
                 *count > 0 && contains_paced_or_blocking_operation(body)
@@ -747,6 +933,20 @@ mod tests {
         }
     }
 
+    fn passive_text_condition(source_block_id: &str, rule_id: &str) -> PassiveCondition {
+        PassiveCondition::Text {
+            source_block_id: source_block_id.to_string(),
+            rule_id: rule_id.to_string(),
+        }
+    }
+
+    fn passive_image_condition(source_block_id: &str, rule_id: &str) -> PassiveCondition {
+        PassiveCondition::Image {
+            source_block_id: source_block_id.to_string(),
+            rule_id: rule_id.to_string(),
+        }
+    }
+
     fn has_code(problems: &[ValidationProblem], code: &str) -> bool {
         problems.iter().any(|problem| problem.code == code)
     }
@@ -843,7 +1043,7 @@ mod tests {
                     lanes: vec![WatchLane {
                         id: "lane".to_string(),
                         enabled: true,
-                        condition: text_condition("observe", "text-present"),
+                        condition: passive_text_condition("lane", "text-present"),
                         then_body: vec![nested_watch, continuous],
                     }],
                     timeout_ms: Limit::Finite(1_000),
@@ -867,7 +1067,7 @@ mod tests {
                     lanes: vec![WatchLane {
                         id: "lane".to_string(),
                         enabled: true,
-                        condition: text_condition("observe", "text-present"),
+                        condition: passive_text_condition("lane", "text-present"),
                         then_body: vec![],
                     }],
                     timeout_ms: Limit::Finite(1_000),
@@ -1071,6 +1271,174 @@ mod tests {
         assert!(has_code(
             &validate_macro(&definition),
             "condition.timeout_outcome_missing"
+        ));
+    }
+
+    #[test]
+    fn rejects_text_condition_source_rule_mismatch() {
+        let mut definition = fixture_macro(vec![
+            block(
+                "observe",
+                BlockKind::Observe {
+                    condition: text_condition("observe", "text-present"),
+                },
+            ),
+            block(
+                "if",
+                BlockKind::If {
+                    condition: text_condition("observe", "text-other"),
+                    then_body: vec![],
+                    else_body: vec![],
+                },
+            ),
+        ]);
+        definition
+            .text_rules
+            .push(text_rule("text-other", TextMatchMode::Contains));
+
+        assert!(has_code(
+            &validate_macro(&definition),
+            "condition.source_rule_mismatch"
+        ));
+    }
+
+    #[test]
+    fn rejects_image_passive_condition_source_rule_mismatch() {
+        let mut definition = fixture_macro(vec![
+            block(
+                "observe-image",
+                BlockKind::Observe {
+                    condition: image_condition("observe-image", "image"),
+                },
+            ),
+            block(
+                "watch",
+                BlockKind::WatchGroup {
+                    group: WatchGroup {
+                        lanes: vec![WatchLane {
+                            id: "lane".to_string(),
+                            enabled: true,
+                            condition: passive_image_condition("observe-image", "image-other"),
+                            then_body: vec![],
+                        }],
+                        timeout_ms: Limit::Finite(1_000),
+                        timeout_outcome: TimeoutOutcome::Continue,
+                        cooldown_ms: 0,
+                    },
+                },
+            ),
+        ]);
+        definition.image_rules.push(image_rule("image-other"));
+
+        assert!(has_code(
+            &validate_macro(&definition),
+            "condition.source_rule_mismatch"
+        ));
+    }
+
+    #[test]
+    fn rejects_enabled_click_referencing_disabled_source() {
+        let mut source = block(
+            "observe",
+            BlockKind::Observe {
+                condition: text_condition("observe", "text-present"),
+            },
+        );
+        source.enabled = false;
+        let definition = fixture_macro(vec![
+            source,
+            block(
+                "click",
+                BlockKind::Action {
+                    action: Action::ClickTextMatch {
+                        source_block_id: "observe".to_string(),
+                        button: MouseButton::Left,
+                    },
+                },
+            ),
+        ]);
+
+        assert!(has_code(
+            &validate_macro(&definition),
+            "action.disabled_source"
+        ));
+    }
+
+    #[test]
+    fn rejects_enabled_condition_referencing_disabled_source() {
+        let mut source = block(
+            "observe",
+            BlockKind::Observe {
+                condition: text_condition("observe", "text-present"),
+            },
+        );
+        source.enabled = false;
+        let definition = fixture_macro(vec![
+            source,
+            block(
+                "if",
+                BlockKind::If {
+                    condition: text_condition("observe", "text-present"),
+                    then_body: vec![],
+                    else_body: vec![],
+                },
+            ),
+        ]);
+
+        assert!(has_code(
+            &validate_macro(&definition),
+            "condition.disabled_source"
+        ));
+    }
+
+    #[test]
+    fn disabled_consumers_may_reference_disabled_sources() {
+        let mut source = block(
+            "observe",
+            BlockKind::Observe {
+                condition: text_condition("observe", "text-present"),
+            },
+        );
+        source.enabled = false;
+        let mut click = block(
+            "click",
+            BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: "observe".to_string(),
+                    button: MouseButton::Left,
+                },
+            },
+        );
+        click.enabled = false;
+        let definition = fixture_macro(vec![source, click]);
+
+        assert!(!has_code(
+            &validate_macro(&definition),
+            "action.disabled_source"
+        ));
+    }
+
+    #[test]
+    fn rejects_continuous_loop_paced_only_by_move_only() {
+        let definition = fixture_macro(vec![block(
+            "continuous",
+            BlockKind::Continuous {
+                body: vec![block(
+                    "move",
+                    BlockKind::Action {
+                        action: Action::MoveOnly {
+                            target: ActionTarget::Point {
+                                point_id: "point".to_string(),
+                            },
+                        },
+                    },
+                )],
+            },
+        )]);
+
+        assert!(has_code(
+            &validate_macro(&definition),
+            "continuous.busy_loop"
         ));
     }
 }

@@ -1657,9 +1657,20 @@ impl MacroStore {
                 }
                 Err(error) => return Err(error.into()),
             };
-            if let Err(error) =
-                prune_run_files(&runs, limits.max_runs.saturating_sub(1), Some(&path))
-            {
+            let protected_runs = self
+                .activity
+                .runs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("store activity poisoned"))?
+                .iter()
+                .map(|active| active.run_id.clone())
+                .collect::<HashSet<_>>();
+            if let Err(error) = prune_run_files(
+                &runs,
+                limits.max_runs.saturating_sub(1),
+                Some(&path),
+                &protected_runs,
+            ) {
                 drop(file);
                 let _ = fs::remove_file(&path);
                 return Err(error);
@@ -1796,8 +1807,14 @@ impl MacroStore {
     }
 }
 
-fn prune_run_files(runs: &Path, keep: usize, exclude: Option<&Path>) -> Result<()> {
+fn prune_run_files(
+    runs: &Path,
+    keep: usize,
+    exclude: Option<&Path>,
+    protected_run_ids: &HashSet<String>,
+) -> Result<()> {
     let mut files = Vec::new();
+    let mut protected_count = 0_usize;
     for entry in fs::read_dir(runs)? {
         let entry = entry?;
         if exclude.is_some_and(|excluded| entry.path() == excluded) {
@@ -1806,7 +1823,17 @@ fn prune_run_files(runs: &Path, keep: usize, exclude: Option<&Path>) -> Result<(
         if entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
             && entry.file_type()?.is_file()
         {
-            files.push(entry);
+            let run_id = entry
+                .path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .context("run history filename is invalid")?
+                .to_string();
+            if protected_run_ids.contains(&run_id) {
+                protected_count = protected_count.saturating_add(1);
+            } else {
+                files.push(entry);
+            }
         }
     }
     files.sort_by_key(|entry| {
@@ -1815,7 +1842,8 @@ fn prune_run_files(runs: &Path, keep: usize, exclude: Option<&Path>) -> Result<(
             .and_then(|metadata| metadata.modified())
             .ok()
     });
-    let remove_count = files.len().saturating_sub(keep);
+    let keep_unprotected = keep.saturating_sub(protected_count);
+    let remove_count = files.len().saturating_sub(keep_unprotected);
     for entry in files.into_iter().take(remove_count) {
         fs::remove_file(entry.path())?;
     }
@@ -4003,5 +4031,22 @@ mod tests {
         drop(active);
         store.delete_run_history("run-one").unwrap();
         assert!(store.list_run_history().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cross_store_journal_pruning_never_removes_an_active_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = MacroStore::open(temp.path()).unwrap();
+        let second = MacroStore::open(temp.path()).unwrap();
+        let active = first.acquire_active_run("active-run").unwrap();
+        let active_journal =
+            ready_journal(first.open_journal("active-run", JournalLimits::new(1_024, 2)));
+        let active_path = active_journal.path().to_path_buf();
+
+        let _new = ready_journal(second.open_journal("new-run", JournalLimits::new(1_024, 1)));
+
+        assert!(active_path.exists());
+        drop(active_journal);
+        drop(active);
     }
 }

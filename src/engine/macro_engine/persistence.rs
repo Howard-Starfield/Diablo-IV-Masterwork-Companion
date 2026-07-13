@@ -722,6 +722,7 @@ impl MacroStore {
             }
             let macro_id = macro_directory.file_name().to_string_lossy().into_owned();
             validate_component("saved macro directory", &macro_id)?;
+            validate_revision_sidecars(&macro_directory.path())?;
             for revision_file in fs::read_dir(macro_directory.path())? {
                 let revision_file = revision_file?;
                 if !revision_file.file_type()?.is_file()
@@ -827,6 +828,41 @@ fn prune_run_files(runs: &Path, keep: usize, exclude: Option<&Path>) -> Result<(
     let remove_count = files.len().saturating_sub(keep);
     for entry in files.into_iter().take(remove_count) {
         fs::remove_file(entry.path())?;
+    }
+    Ok(())
+}
+
+fn validate_revision_sidecars(definition_directory: &Path) -> Result<()> {
+    for entry in fs::read_dir(definition_directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("sha256") {
+            continue;
+        }
+        if !entry.file_type()?.is_file() {
+            bail!("revision checksum metadata is not a file");
+        }
+        let file_name = entry
+            .file_name()
+            .to_str()
+            .context("revision checksum filename is invalid UTF-8")?
+            .to_string();
+        let revision_text = file_name
+            .strip_suffix(".json.sha256")
+            .context("revision checksum filename is invalid")?;
+        let revision = revision_text
+            .parse::<u64>()
+            .context("revision checksum filename is invalid")?;
+        if revision.to_string() != revision_text {
+            bail!("revision checksum filename is invalid");
+        }
+        let revision_path = definition_directory.join(format!("{revision}.json"));
+        if !revision_path.is_file() {
+            bail!(
+                "orphan revision checksum has no immutable revision: {}",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -1852,5 +1888,44 @@ mod tests {
             JournalAppendOutcome::Written
         ));
         assert!(fs::metadata(first.path()).unwrap().len() <= 512);
+    }
+
+    #[test]
+    fn cleanup_rejects_orphan_revision_checksum_before_deleting_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let old_asset = store.assets().put_png(b"old revision").unwrap();
+        let current_asset = store.assets().put_png(b"current revision").unwrap();
+        let orphan = store.assets().put_png(b"unreferenced").unwrap();
+        store.save(fixture_definition(old_asset.clone())).unwrap();
+        let mut current = fixture_definition(current_asset.clone());
+        current.revision = 2;
+        store.save(current).unwrap();
+        fs::remove_file(temp.path().join("macro_data/definitions/macro-one/1.json")).unwrap();
+
+        let error = store.cleanup_orphan_assets(&HashSet::new()).unwrap_err();
+        assert!(error.to_string().contains("orphan revision checksum"));
+        assert!(store.assets().read(&old_asset).is_ok());
+        assert!(store.assets().read(&current_asset).is_ok());
+        assert!(store.assets().read(&orphan).is_ok());
+    }
+
+    #[test]
+    fn cleanup_rejects_malformed_revision_checksum_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let saved_asset = store.assets().put_png(b"saved").unwrap();
+        let orphan = store.assets().put_png(b"orphan").unwrap();
+        store.save(fixture_definition(saved_asset)).unwrap();
+        fs::write(
+            temp.path()
+                .join("macro_data/definitions/macro-one/not-a-revision.json.sha256"),
+            "0".repeat(64),
+        )
+        .unwrap();
+
+        let error = store.cleanup_orphan_assets(&HashSet::new()).unwrap_err();
+        assert!(error.to_string().contains("checksum filename is invalid"));
+        assert!(store.assets().read(&orphan).is_ok());
     }
 }

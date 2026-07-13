@@ -34,6 +34,15 @@ pub struct RawImageMatch {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ImageMatcher;
 
+fn scaled_dimension(dimension: u32, scale_percent: u16) -> Result<u32> {
+    let rounded = u64::from(dimension)
+        .checked_mul(u64::from(scale_percent))
+        .and_then(|value| value.checked_add(50))
+        .map(|value| value / 100)
+        .ok_or_else(|| anyhow::anyhow!("scaled template dimension calculation overflowed"))?;
+    u32::try_from(rounded).map_err(|_| anyhow::anyhow!("scaled template dimension exceeds u32"))
+}
+
 impl ImageMatcher {
     pub fn match_screen_image(
         &self,
@@ -75,9 +84,12 @@ impl ImageMatcher {
             if scale_percent == 0 {
                 bail!("image match scale must be greater than zero");
             }
-            let width = ((template.width() as u64 * scale_percent as u64 + 50) / 100) as u32;
-            let height = ((template.height() as u64 * scale_percent as u64 + 50) / 100) as u32;
-            if width == 0 || height == 0 || width >= search.width() || height >= search.height() {
+            let width = scaled_dimension(template.width(), scale_percent)?;
+            let height = scaled_dimension(template.height(), scale_percent)?;
+            if width == 0 || height == 0 {
+                continue;
+            }
+            if width > search.width() || height > search.height() {
                 continue;
             }
             let scaled = if scale_percent == 100 {
@@ -153,6 +165,24 @@ mod tests {
 
         assert_eq!((result.best.rect.x, result.best.rect.y), (23, 17));
         assert!(result.best.score >= 0.95);
+    }
+
+    #[test]
+    fn equal_size_template_produces_single_origin_match() {
+        let search = fixture_icon();
+        let result = ImageMatcher::default()
+            .match_template(&search, &search, &ImageMatchConfig::exact_scale(0.95))
+            .unwrap();
+
+        assert_eq!((result.best.rect.x, result.best.rect.y), (0, 0));
+        assert_eq!(result.candidates, vec![result.best]);
+    }
+
+    #[test]
+    fn scaled_dimension_rejects_result_larger_than_u32() {
+        let error = scaled_dimension(u32::MAX, u16::MAX).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds u32"));
     }
 
     #[test]

@@ -66,18 +66,7 @@ impl WindowsTextRecognizer {
 }
 
 fn software_bitmap_from_gray8(pixels: &[u8], width: u32, height: u32) -> Result<SoftwareBitmap> {
-    if width == 0 || height == 0 {
-        bail!("OCR frame dimensions must be non-zero");
-    }
-    let expected_len = width as usize * height as usize;
-    if pixels.len() != expected_len {
-        bail!(
-            "OCR Gray8 buffer length {} does not match {width}x{height}",
-            pixels.len()
-        );
-    }
-    let width = i32::try_from(width).context("OCR frame width exceeds Windows bitmap limits")?;
-    let height = i32::try_from(height).context("OCR frame height exceeds Windows bitmap limits")?;
+    let (width, height) = validated_gray8_dimensions(pixels.len(), width, height)?;
     let buffer = CryptographicBuffer::CreateFromByteArray(pixels)?;
     Ok(SoftwareBitmap::CreateCopyFromBuffer(
         &buffer,
@@ -85,6 +74,30 @@ fn software_bitmap_from_gray8(pixels: &[u8], width: u32, height: u32) -> Result<
         width,
         height,
     )?)
+}
+
+fn validated_gray8_dimensions(pixels_len: usize, width: u32, height: u32) -> Result<(i32, i32)> {
+    if width == 0 || height == 0 {
+        bail!("OCR frame dimensions must be non-zero");
+    }
+    let winrt_width =
+        i32::try_from(width).context("OCR frame width exceeds Windows bitmap limits")?;
+    let winrt_height =
+        i32::try_from(height).context("OCR frame height exceeds Windows bitmap limits")?;
+    let expected_len = checked_pixel_len(width as usize, height as usize)?;
+    if pixels_len != expected_len {
+        bail!(
+            "OCR Gray8 buffer length {} does not match {width}x{height}",
+            pixels_len
+        );
+    }
+    Ok((winrt_width, winrt_height))
+}
+
+fn checked_pixel_len(width: usize, height: usize) -> Result<usize> {
+    width
+        .checked_mul(height)
+        .ok_or_else(|| anyhow::anyhow!("OCR Gray8 pixel count overflows usize"))
 }
 
 #[cfg(test)]
@@ -108,5 +121,19 @@ mod tests {
 
         assert_eq!((frame.width, frame.height), (3, 2));
         assert_eq!(frame.pixels, vec![255; 6]);
+    }
+
+    #[test]
+    fn rejects_dimension_above_winrt_i32_limit_before_length_check() {
+        let error = validated_gray8_dimensions(0, i32::MAX as u32 + 1, 1).unwrap_err();
+
+        assert!(error.to_string().contains("Windows bitmap limits"));
+    }
+
+    #[test]
+    fn checked_pixel_len_rejects_usize_product_overflow() {
+        let error = checked_pixel_len(usize::MAX, 2).unwrap_err();
+
+        assert!(error.to_string().contains("pixel count overflows usize"));
     }
 }

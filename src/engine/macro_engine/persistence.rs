@@ -2,6 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -81,6 +85,11 @@ pub enum JournalAppendOutcome {
     Dropped { diagnostic: String },
 }
 
+pub enum JournalOpenOutcome {
+    Ready(RunJournal),
+    Disabled { diagnostic: String },
+}
+
 pub struct RunJournal {
     path: PathBuf,
     file: File,
@@ -139,9 +148,35 @@ struct PackageManifestAsset {
     path: PathBuf,
 }
 
+const ASSET_IDENTITY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AssetIdentityIndex {
+    schema_version: u32,
+    bindings: Vec<AssetRef>,
+}
+
+impl Default for AssetIdentityIndex {
+    fn default() -> Self {
+        Self {
+            schema_version: ASSET_IDENTITY_SCHEMA_VERSION,
+            bindings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InstalledAsset {
+    asset: AssetRef,
+    created_binding: bool,
+    created_file: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct AssetStore {
     root: PathBuf,
+    identity_index: PathBuf,
+    lock: Arc<Mutex<()>>,
 }
 
 impl AssetStore {
@@ -157,27 +192,126 @@ impl AssetStore {
     }
 
     pub fn put_png_revision(&self, asset: AssetRef, bytes: &[u8]) -> Result<()> {
-        if sha256_hex(bytes) != asset.content_hash {
-            bail!("asset content hash does not match bytes");
-        }
-        fs::create_dir_all(&self.root)?;
-        let path = self.path_for_hash(&asset.content_hash)?;
-        if path.exists() {
-            let existing = fs::read(&path)?;
-            if sha256_hex(&existing) != asset.content_hash {
-                bail!("existing asset is corrupt: {}", asset.content_hash);
-            }
-            return Ok(());
-        }
-        atomic_write(&path, bytes)
+        let _guard = lock_store(&self.lock)?;
+        self.install_locked(asset, bytes).map(|_| ())
     }
 
     pub fn read(&self, asset: &AssetRef) -> Result<Vec<u8>> {
+        let _guard = lock_store(&self.lock)?;
+        self.read_locked(asset)
+    }
+
+    fn read_locked(&self, asset: &AssetRef) -> Result<Vec<u8>> {
+        let index = self.load_index_locked()?;
+        validate_identity_binding(&index.bindings, asset)?;
         let path = self.path_for_hash(&asset.content_hash)?;
         let bytes =
             fs::read(&path).with_context(|| format!("missing asset {}", asset.content_hash))?;
         if sha256_hex(&bytes) != asset.content_hash {
             bail!("corrupt asset {}", asset.content_hash);
+        }
+        Ok(bytes)
+    }
+
+    fn install_locked(&self, asset: AssetRef, bytes: &[u8]) -> Result<InstalledAsset> {
+        validate_asset_ref(&asset)?;
+        if sha256_hex(bytes) != asset.content_hash {
+            bail!("asset content hash does not match bytes");
+        }
+        fs::create_dir_all(&self.root)?;
+        let mut index = self.load_index_locked()?;
+        let identity = (asset.id.as_str(), asset.revision);
+        if let Some(existing) = index
+            .bindings
+            .iter()
+            .find(|binding| (binding.id.as_str(), binding.revision) == identity)
+        {
+            if existing.content_hash != asset.content_hash {
+                bail!(
+                    "immutable asset identity {} revision {} is already bound to {}",
+                    asset.id,
+                    asset.revision,
+                    existing.content_hash
+                );
+            }
+            self.verify_hash_file_locked(&asset.content_hash)?;
+            return Ok(InstalledAsset {
+                asset,
+                created_binding: false,
+                created_file: false,
+            });
+        }
+
+        let path = self.path_for_hash(&asset.content_hash)?;
+        let created_file = matches!(
+            atomic_publish_noclobber(&path, bytes)?,
+            PublishOutcome::Published
+        );
+        index.bindings.push(asset.clone());
+        if let Err(error) = self.write_index_locked(&index) {
+            if created_file {
+                let _ = fs::remove_file(&path);
+            }
+            return Err(error);
+        }
+        Ok(InstalledAsset {
+            asset,
+            created_binding: true,
+            created_file,
+        })
+    }
+
+    fn rollback_locked(&self, installed: &[InstalledAsset]) -> Result<()> {
+        let mut index = self.load_index_locked()?;
+        let created: HashSet<_> = installed
+            .iter()
+            .filter(|change| change.created_binding)
+            .map(|change| (change.asset.id.clone(), change.asset.revision))
+            .collect();
+        index
+            .bindings
+            .retain(|binding| !created.contains(&(binding.id.clone(), binding.revision)));
+        self.write_index_locked(&index)?;
+        let remaining_hashes: HashSet<_> = index
+            .bindings
+            .iter()
+            .map(|binding| binding.content_hash.as_str())
+            .collect();
+        for change in installed.iter().rev() {
+            if change.created_file && !remaining_hashes.contains(change.asset.content_hash.as_str())
+            {
+                let path = self.path_for_hash(&change.asset.content_hash)?;
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn load_index_locked(&self) -> Result<AssetIdentityIndex> {
+        if !self.identity_index.exists() {
+            return Ok(AssetIdentityIndex::default());
+        }
+        let index: AssetIdentityIndex = serde_json::from_slice(&fs::read(&self.identity_index)?)
+            .context("corrupt asset identity index")?;
+        if index.schema_version != ASSET_IDENTITY_SCHEMA_VERSION {
+            bail!("unsupported asset identity schema {}", index.schema_version);
+        }
+        validate_identity_set(index.bindings.iter())?;
+        Ok(index)
+    }
+
+    fn write_index_locked(&self, index: &AssetIdentityIndex) -> Result<()> {
+        validate_identity_set(index.bindings.iter())?;
+        atomic_write(&self.identity_index, &serde_json::to_vec_pretty(index)?)
+    }
+
+    fn verify_hash_file_locked(&self, hash: &str) -> Result<Vec<u8>> {
+        let path = self.path_for_hash(hash)?;
+        let bytes = fs::read(&path).with_context(|| format!("missing asset {hash}"))?;
+        if sha256_hex(&bytes) != hash {
+            bail!("corrupt asset {hash}");
         }
         Ok(bytes)
     }
@@ -194,18 +328,41 @@ impl AssetStore {
 pub struct MacroStore {
     root: PathBuf,
     assets: AssetStore,
+    lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    fail_import_after_assets: Arc<AtomicBool>,
 }
 
 impl MacroStore {
     pub fn open(root: &Path) -> Result<Self> {
         let root = root.join("macro_data");
+        let lock = Arc::new(Mutex::new(()));
         let assets = AssetStore {
             root: root.join("assets"),
+            identity_index: root.join("asset_identities.json"),
+            lock: Arc::clone(&lock),
         };
         fs::create_dir_all(root.join("definitions"))?;
         fs::create_dir_all(&assets.root)?;
         fs::create_dir_all(root.join("runs"))?;
-        Ok(Self { root, assets })
+        let store = Self {
+            root,
+            assets,
+            lock,
+            #[cfg(test)]
+            fail_import_after_assets: Arc::new(AtomicBool::new(false)),
+        };
+        {
+            let _guard = lock_store(&store.lock)?;
+            if !store.assets.identity_index.exists() {
+                store
+                    .assets
+                    .write_index_locked(&AssetIdentityIndex::default())?;
+            } else {
+                store.assets.load_index_locked()?;
+            }
+        }
+        Ok(store)
     }
 
     pub fn assets(&self) -> &AssetStore {
@@ -213,15 +370,21 @@ impl MacroStore {
     }
 
     pub fn save(&self, definition: MacroDefinition) -> Result<SavedRevision> {
+        let _guard = lock_store(&self.lock)?;
+        self.save_locked(definition)
+    }
+
+    fn save_locked(&self, definition: MacroDefinition) -> Result<SavedRevision> {
         if definition.schema_version != MACRO_SCHEMA_VERSION {
             bail!("unsupported macro schema {}", definition.schema_version);
         }
         validate_component("macro ID", &definition.id)?;
+        validate_identity_set(referenced_assets(&definition))?;
         let mut pinned_assets = Vec::new();
-        let mut pinned_hashes = HashSet::new();
+        let mut pinned_refs = HashSet::new();
         for asset in referenced_assets(&definition) {
-            let bytes = self.assets.read(asset)?;
-            if pinned_hashes.insert(asset.content_hash.clone()) {
+            let bytes = self.assets.read_locked(asset)?;
+            if pinned_refs.insert(asset.clone()) {
                 pinned_assets.push(PinnedAsset {
                     asset: asset.clone(),
                     bytes,
@@ -238,17 +401,18 @@ impl MacroStore {
         let directory = self.root.join("definitions").join(&saved.definition.id);
         fs::create_dir_all(&directory)?;
         let revision_path = directory.join(format!("{}.json", saved.definition.revision));
-        if revision_path.exists() {
-            if fs::read(&revision_path)? != bytes {
-                bail!(
-                    "immutable revision {} already exists with different content",
-                    saved.definition.revision
-                );
+        let publication = atomic_publish_noclobber(&revision_path, &bytes).with_context(|| {
+            format!(
+                "immutable revision {} publication failed",
+                saved.definition.revision
+            )
+        })?;
+        if let Err(error) = atomic_write(&directory.join("current.json"), &bytes) {
+            if matches!(publication, PublishOutcome::Published) {
+                let _ = fs::remove_file(&revision_path);
             }
-        } else {
-            atomic_write(&revision_path, &bytes)?;
+            return Err(error.context("current revision publication failed"));
         }
-        atomic_write(&directory.join("current.json"), &bytes)?;
         Ok(saved)
     }
 
@@ -267,11 +431,9 @@ impl MacroStore {
         if manifest.schema_version != PACKAGE_SCHEMA_VERSION {
             bail!("unsupported package schema {}", manifest.schema_version);
         }
-
-        // Validate every package-controlled path before parsing payloads so a
-        // malformed definition cannot hide an outside-package reference.
+        validate_package_relative(&manifest.definition)?;
         for asset in &manifest.assets {
-            package_file(&root, &asset.path)?;
+            validate_package_relative(&asset.path)?;
         }
 
         let definition_path = package_file(&root, &manifest.definition)?;
@@ -282,6 +444,9 @@ impl MacroStore {
         if definition.schema_version != MACRO_SCHEMA_VERSION {
             bail!("unsupported macro schema {}", definition.schema_version);
         }
+        validate_component("macro ID", &definition.id)?;
+        validate_identity_set(referenced_assets(&definition))?;
+        validate_identity_set(manifest.assets.iter().map(|entry| &entry.asset))?;
 
         let mut assets = Vec::with_capacity(manifest.assets.len());
         let mut manifest_refs = HashSet::new();
@@ -307,17 +472,36 @@ impl MacroStore {
             bail!("package asset references do not match definition");
         }
 
-        Ok(MacroPackage {
+        let package = MacroPackage {
             schema_version: manifest.schema_version,
             definition,
             assets,
-        })
+        };
+        validate_package_memory(&package)?;
+        Ok(package)
     }
 
     pub fn export_package(&self, saved: &SavedRevision, package_root: &Path) -> Result<()> {
-        fs::create_dir_all(package_root)?;
-        let canonical_root = package_root.canonicalize()?;
-        let definition_path = package_output_file(&canonical_root, Path::new("macro.json"))?;
+        let _guard = lock_store(&self.lock)?;
+        validate_identity_set(referenced_assets(&saved.definition))?;
+        let parent = package_root
+            .parent()
+            .context("package destination has no parent")?;
+        fs::create_dir_all(parent)?;
+        let canonical_parent = parent.canonicalize()?;
+        let name = package_root
+            .file_name()
+            .context("package destination has no folder name")?;
+        validate_component("package folder name", &name.to_string_lossy())?;
+        let destination = canonical_parent.join(name);
+        if destination.exists() {
+            bail!("package destination already exists");
+        }
+        let temporary = tempfile::Builder::new()
+            .prefix(".macro-package-")
+            .tempdir_in(&canonical_parent)?;
+        let staging_root = temporary.path();
+        let definition_path = staging_root.join("macro.json");
         let definition_bytes = serde_json::to_vec_pretty(&saved.definition)?;
         atomic_write(&definition_path, &definition_bytes)?;
 
@@ -327,9 +511,9 @@ impl MacroStore {
             if !seen.insert(asset.clone()) {
                 continue;
             }
-            let bytes = self.assets.read(asset)?;
+            let bytes = self.assets.read_locked(asset)?;
             let relative_path = PathBuf::from("assets").join(format!("{}.png", asset.content_hash));
-            let output_path = package_output_file(&canonical_root, &relative_path)?;
+            let output_path = staging_root.join(&relative_path);
             atomic_write(&output_path, &bytes)?;
             manifest_assets.push(PackageManifestAsset {
                 asset: asset.clone(),
@@ -341,13 +525,31 @@ impl MacroStore {
             definition: PathBuf::from("macro.json"),
             assets: manifest_assets,
         };
-        let manifest_path = package_output_file(&canonical_root, Path::new("manifest.json"))?;
-        atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)
+        atomic_write(
+            &staging_root.join("manifest.json"),
+            &serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        let staged = temporary.keep();
+        if destination.exists() {
+            let _ = fs::remove_dir_all(&staged);
+            bail!("package destination already exists");
+        }
+        if let Err(error) = fs::rename(&staged, &destination) {
+            let _ = fs::remove_dir_all(&staged);
+            return Err(error).context("atomic package publication failed");
+        }
+        sync_directory(&canonical_parent)?;
+        Ok(())
     }
 
     pub fn import_package(&self, package_root: &Path) -> Result<SavedRevision> {
-        let mut package = Self::validate_package(package_root)?;
-        let saved_definitions = self.saved_definitions()?;
+        let package = Self::validate_package(package_root)?;
+        self.import_validated_package(package)
+    }
+
+    pub fn import_validated_package(&self, mut package: MacroPackage) -> Result<SavedRevision> {
+        validate_package_memory(&package)?;
+        let _guard = lock_store(&self.lock)?;
         let existing_macro_ids = fs::read_dir(self.root.join("definitions"))?
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
@@ -355,25 +557,20 @@ impl MacroStore {
             .collect();
         package.definition.id = remap_id(&package.definition.id, &existing_macro_ids);
 
-        let existing_assets: HashMap<(String, u64), String> = saved_definitions
-            .iter()
-            .flat_map(referenced_assets)
-            .map(|asset| {
-                (
-                    (asset.id.clone(), asset.revision),
-                    asset.content_hash.clone(),
-                )
-            })
-            .collect();
+        let identity_index = self.assets.load_index_locked()?;
         let mut remaps = HashMap::new();
-        let mut reserved_asset_ids: HashSet<String> =
-            existing_assets.keys().map(|(id, _)| id.clone()).collect();
+        let mut reserved_asset_ids: HashSet<String> = identity_index
+            .bindings
+            .iter()
+            .map(|asset| asset.id.clone())
+            .collect();
         for package_asset in &package.assets {
             let key = (package_asset.asset.id.clone(), package_asset.asset.revision);
-            if existing_assets
-                .get(&key)
-                .is_some_and(|hash| hash != &package_asset.asset.content_hash)
-            {
+            if identity_index.bindings.iter().any(|existing| {
+                existing.id == key.0
+                    && existing.revision == key.1
+                    && existing.content_hash != package_asset.asset.content_hash
+            }) {
                 let remapped = remap_id(&package_asset.asset.id, &reserved_asset_ids);
                 reserved_asset_ids.insert(remapped.clone());
                 remaps.insert(key, remapped);
@@ -384,52 +581,106 @@ impl MacroStore {
                 asset.id = id.clone();
             }
         }
+        let mut installed = Vec::new();
         for package_asset in &mut package.assets {
             if let Some(id) =
                 remaps.get(&(package_asset.asset.id.clone(), package_asset.asset.revision))
             {
                 package_asset.asset.id = id.clone();
             }
-            self.assets
-                .put_png_revision(package_asset.asset.clone(), &package_asset.bytes)?;
+            match self
+                .assets
+                .install_locked(package_asset.asset.clone(), &package_asset.bytes)
+            {
+                Ok(change) => installed.push(change),
+                Err(error) => {
+                    let rollback = self.assets.rollback_locked(&installed);
+                    return match rollback {
+                        Ok(()) => Err(error),
+                        Err(rollback_error) => Err(error
+                            .context(format!("asset rollback also failed: {rollback_error:#}"))),
+                    };
+                }
+            }
         }
-        self.save(package.definition)
+        #[cfg(test)]
+        if self.fail_import_after_assets.swap(false, Ordering::SeqCst) {
+            self.assets.rollback_locked(&installed)?;
+            bail!("injected import failure after asset installs");
+        }
+        match self.save_locked(package.definition) {
+            Ok(saved) => Ok(saved),
+            Err(error) => {
+                let rollback = self.assets.rollback_locked(&installed);
+                match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => {
+                        Err(error
+                            .context(format!("asset rollback also failed: {rollback_error:#}")))
+                    }
+                }
+            }
+        }
     }
 
-    pub fn open_journal(&self, run_id: &str, limits: JournalLimits) -> Result<RunJournal> {
-        validate_component("run ID", run_id)?;
-        if limits.max_bytes_per_run == 0 || limits.max_runs == 0 {
-            bail!("journal limits must be non-zero");
+    #[cfg(test)]
+    fn fail_next_import_after_asset_installs(&self) {
+        self.fail_import_after_assets.store(true, Ordering::SeqCst);
+    }
+
+    pub fn open_journal(&self, run_id: &str, limits: JournalLimits) -> JournalOpenOutcome {
+        let result = (|| -> Result<RunJournal> {
+            let _guard = lock_store(&self.lock)?;
+            validate_component("run ID", run_id)?;
+            if limits.max_bytes_per_run == 0 || limits.max_runs == 0 {
+                bail!("journal limits must be non-zero");
+            }
+            let runs = self.root.join("runs");
+            fs::create_dir_all(&runs)?;
+            prune_run_files(&runs, limits.max_runs.saturating_sub(1))?;
+            let path = runs.join(format!("{run_id}.jsonl"));
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)?;
+            Ok(RunJournal {
+                path,
+                file,
+                max_bytes: limits.max_bytes_per_run,
+                bytes_written: 0,
+                failed: false,
+            })
+        })();
+        match result {
+            Ok(journal) => JournalOpenOutcome::Ready(journal),
+            Err(error) => JournalOpenOutcome::Disabled {
+                diagnostic: format!("journal initialization failed: {error:#}"),
+            },
         }
-        let runs = self.root.join("runs");
-        fs::create_dir_all(&runs)?;
-        prune_run_files(&runs, limits.max_runs.saturating_sub(1))?;
-        let path = runs.join(format!("{run_id}.jsonl"));
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&path)?;
-        Ok(RunJournal {
-            path,
-            file,
-            max_bytes: limits.max_bytes_per_run,
-            bytes_written: 0,
-            failed: false,
-        })
     }
 
     pub fn cleanup_orphan_assets(&self, running_assets: &HashSet<AssetRef>) -> Result<usize> {
-        let mut referenced_hashes: HashSet<String> = running_assets
-            .iter()
-            .map(|asset| asset.content_hash.clone())
-            .collect();
+        let _guard = lock_store(&self.lock)?;
+        validate_identity_set(running_assets.iter())?;
+        let mut index = self.assets.load_index_locked()?;
+        for binding in &index.bindings {
+            self.assets.verify_hash_file_locked(&binding.content_hash)?;
+        }
+        for running in running_assets {
+            validate_identity_binding(&index.bindings, running)?;
+            self.assets.verify_hash_file_locked(&running.content_hash)?;
+        }
+
+        let mut protected = running_assets.clone();
         let definitions_root = self.root.join("definitions");
         for macro_directory in fs::read_dir(definitions_root)? {
             let macro_directory = macro_directory?;
             if !macro_directory.file_type()?.is_dir() {
                 continue;
             }
+            let macro_id = macro_directory.file_name().to_string_lossy().into_owned();
+            validate_component("saved macro directory", &macro_id)?;
             for revision_file in fs::read_dir(macro_directory.path())? {
                 let revision_file = revision_file?;
                 if !revision_file.file_type()?.is_file()
@@ -441,15 +692,45 @@ impl MacroStore {
                 {
                     continue;
                 }
-                let definition: MacroDefinition =
-                    serde_json::from_slice(&fs::read(revision_file.path())?)
-                        .context("corrupt saved macro definition blocks orphan cleanup")?;
-                referenced_hashes
-                    .extend(referenced_assets(&definition).map(|asset| asset.content_hash.clone()));
+                let file_name = revision_file.file_name().to_string_lossy().into_owned();
+                let bytes = fs::read(revision_file.path())?;
+                let definition: MacroDefinition = serde_json::from_slice(&bytes)
+                    .context("corrupt saved macro definition blocks orphan cleanup")?;
+                if definition.schema_version != MACRO_SCHEMA_VERSION {
+                    bail!(
+                        "unsupported macro schema {} blocks orphan cleanup",
+                        definition.schema_version
+                    );
+                }
+                if definition.id != macro_id {
+                    bail!("saved macro ID does not match definition directory");
+                }
+                if file_name == "current.json" {
+                    let immutable = macro_directory
+                        .path()
+                        .join(format!("{}.json", definition.revision));
+                    if fs::read(&immutable).context("current revision file is missing")? != bytes {
+                        bail!("current definition does not match immutable revision");
+                    }
+                } else {
+                    let file_revision = file_name
+                        .strip_suffix(".json")
+                        .and_then(|stem| stem.parse::<u64>().ok())
+                        .context("saved revision filename is invalid")?;
+                    if definition.revision != file_revision {
+                        bail!("saved revision does not match revision filename");
+                    }
+                }
+                validate_identity_set(referenced_assets(&definition))?;
+                for asset in referenced_assets(&definition) {
+                    validate_identity_binding(&index.bindings, asset)?;
+                    self.assets.verify_hash_file_locked(&asset.content_hash)?;
+                    protected.insert(asset.clone());
+                }
             }
         }
 
-        let mut removed = 0;
+        let mut asset_files = Vec::new();
         for entry in fs::read_dir(&self.assets.root)? {
             let entry = entry?;
             if !entry.file_type()?.is_file()
@@ -457,48 +738,31 @@ impl MacroStore {
             {
                 continue;
             }
-            let Some(hash) = entry
+            let hash = entry
                 .path()
                 .file_stem()
                 .and_then(|stem| stem.to_str())
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            if hash.len() == 64
-                && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                && !referenced_hashes.contains(&hash)
-            {
-                fs::remove_file(entry.path())?;
+                .context("asset filename is not valid UTF-8")?
+                .to_string();
+            self.assets.verify_hash_file_locked(&hash)?;
+            asset_files.push((hash, entry.path()));
+        }
+
+        index.bindings.retain(|binding| protected.contains(binding));
+        self.assets.write_index_locked(&index)?;
+        let referenced_hashes: HashSet<_> = index
+            .bindings
+            .iter()
+            .map(|asset| asset.content_hash.as_str())
+            .collect();
+        let mut removed = 0;
+        for (hash, path) in asset_files {
+            if !referenced_hashes.contains(hash.as_str()) {
+                fs::remove_file(path)?;
                 removed += 1;
             }
         }
         Ok(removed)
-    }
-
-    fn saved_definitions(&self) -> Result<Vec<MacroDefinition>> {
-        let root = self.root.join("definitions");
-        let mut definitions = Vec::new();
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            for revision in fs::read_dir(entry.path())? {
-                let revision = revision?;
-                if !revision.file_type()?.is_file()
-                    || revision.file_name() == "current.json"
-                    || revision.path().extension().and_then(|ext| ext.to_str()) != Some("json")
-                {
-                    continue;
-                }
-                definitions.push(
-                    serde_json::from_slice(&fs::read(revision.path())?)
-                        .context("corrupt saved macro definition")?,
-                );
-            }
-        }
-        Ok(definitions)
     }
 }
 
@@ -537,14 +801,98 @@ fn referenced_assets_mut(definition: &mut MacroDefinition) -> impl Iterator<Item
         .flat_map(|rule| std::iter::once(&mut rule.template).chain(rule.transparent_mask.as_mut()))
 }
 
-fn package_file(root: &Path, relative: &Path) -> Result<PathBuf> {
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
+fn validate_asset_ref(asset: &AssetRef) -> Result<()> {
+    validate_component("asset ID", &asset.id)?;
+    if asset.content_hash.len() != 64
+        || !asset
+            .content_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        bail!("reference points outside package");
+        bail!("invalid asset content hash");
     }
+    Ok(())
+}
+
+fn validate_identity_set<'a>(assets: impl IntoIterator<Item = &'a AssetRef>) -> Result<()> {
+    let mut identities: HashMap<(&str, u64), &str> = HashMap::new();
+    for asset in assets {
+        validate_asset_ref(asset)?;
+        let key = (asset.id.as_str(), asset.revision);
+        if let Some(existing) = identities.insert(key, asset.content_hash.as_str()) {
+            if existing != asset.content_hash {
+                bail!(
+                    "conflicting asset identity {} revision {} has multiple hashes",
+                    asset.id,
+                    asset.revision
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_identity_binding(bindings: &[AssetRef], asset: &AssetRef) -> Result<()> {
+    validate_asset_ref(asset)?;
+    let Some(binding) = bindings
+        .iter()
+        .find(|binding| binding.id == asset.id && binding.revision == asset.revision)
+    else {
+        bail!(
+            "missing asset identity {} revision {}",
+            asset.id,
+            asset.revision
+        );
+    };
+    if binding.content_hash != asset.content_hash {
+        bail!(
+            "immutable asset identity {} revision {} is bound to a different hash",
+            asset.id,
+            asset.revision
+        );
+    }
+    Ok(())
+}
+
+fn validate_package_memory(package: &MacroPackage) -> Result<()> {
+    if package.schema_version != PACKAGE_SCHEMA_VERSION {
+        bail!("unsupported package schema {}", package.schema_version);
+    }
+    if package.definition.schema_version != MACRO_SCHEMA_VERSION {
+        bail!(
+            "unsupported macro schema {}",
+            package.definition.schema_version
+        );
+    }
+    validate_component("macro ID", &package.definition.id)?;
+    validate_identity_set(referenced_assets(&package.definition))?;
+    validate_identity_set(package.assets.iter().map(|asset| &asset.asset))?;
+    let mut package_refs = HashSet::new();
+    for package_asset in &package.assets {
+        if !package_refs.insert(package_asset.asset.clone()) {
+            bail!("duplicate asset entry in package");
+        }
+        if sha256_hex(&package_asset.bytes) != package_asset.asset.content_hash {
+            bail!(
+                "package asset hash mismatch: {}",
+                package_asset.asset.content_hash
+            );
+        }
+    }
+    let definition_refs: HashSet<_> = referenced_assets(&package.definition).cloned().collect();
+    if definition_refs != package_refs {
+        bail!("package asset references do not match definition");
+    }
+    Ok(())
+}
+
+fn lock_store(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>> {
+    lock.lock()
+        .map_err(|_| anyhow::anyhow!("macro store lock poisoned"))
+}
+
+fn package_file(root: &Path, relative: &Path) -> Result<PathBuf> {
+    validate_package_relative(relative)?;
     let joined = root.join(relative);
     let canonical = joined
         .canonicalize()
@@ -555,22 +903,15 @@ fn package_file(root: &Path, relative: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn package_output_file(root: &Path, relative: &Path) -> Result<PathBuf> {
+fn validate_package_relative(relative: &Path) -> Result<()> {
     if relative.is_absolute()
         || relative
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
     {
-        bail!("output points outside package");
+        bail!("reference points outside package");
     }
-    let output = root.join(relative);
-    let parent = output.parent().context("package output has no parent")?;
-    fs::create_dir_all(parent)?;
-    let canonical_parent = parent.canonicalize()?;
-    if !canonical_parent.starts_with(root) {
-        bail!("output points outside package");
-    }
-    Ok(output)
+    Ok(())
 }
 
 fn remap_id(id: &str, existing: &HashSet<String>) -> String {
@@ -600,6 +941,37 @@ fn validate_component(label: &str, value: &str) -> Result<()> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishOutcome {
+    Published,
+    Identical,
+}
+
+fn atomic_publish_noclobber(path: &Path, bytes: &[u8]) -> Result<PublishOutcome> {
+    let parent = path.parent().context("atomic publication has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(bytes)?;
+    temp.as_file_mut().flush()?;
+    temp.as_file_mut().sync_all()?;
+    match temp.persist_noclobber(path) {
+        Ok(_) => {
+            sync_directory(parent)?;
+            Ok(PublishOutcome::Published)
+        }
+        Err(error) => {
+            if path.exists() {
+                let existing = fs::read(path)?;
+                if existing == bytes {
+                    return Ok(PublishOutcome::Identical);
+                }
+                bail!("immutable content conflict at {}", path.display());
+            }
+            Err(error.error.into())
+        }
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -632,6 +1004,7 @@ mod tests {
     use crate::engine::macro_engine::{
         FocusLossPolicy, ImageRule, Limit, MatchSelectionPolicy, SafetyPolicy, TargetProfile,
     };
+    use std::sync::{Arc, Barrier};
 
     fn fixture_definition(asset: AssetRef) -> MacroDefinition {
         MacroDefinition {
@@ -674,6 +1047,13 @@ mod tests {
                 minimum_click_interval_ms: 100,
                 focus_loss: FocusLossPolicy::Stop,
             },
+        }
+    }
+
+    fn ready_journal(outcome: JournalOpenOutcome) -> RunJournal {
+        match outcome {
+            JournalOpenOutcome::Ready(journal) => journal,
+            JournalOpenOutcome::Disabled { diagnostic } => panic!("{diagnostic}"),
         }
     }
 
@@ -761,9 +1141,7 @@ mod tests {
     fn journal_caps_bytes_during_unlimited_runs() {
         let temp = tempfile::tempdir().unwrap();
         let store = MacroStore::open(temp.path()).unwrap();
-        let mut journal = store
-            .open_journal("run-one", JournalLimits::new(220, 3))
-            .unwrap();
+        let mut journal = ready_journal(store.open_journal("run-one", JournalLimits::new(220, 3)));
 
         let mut dropped = false;
         for sequence in 0..100 {
@@ -895,14 +1273,273 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = MacroStore::open(temp.path()).unwrap();
         for run in 0..5 {
-            store
-                .open_journal(&format!("run-{run}"), JournalLimits::new(1_024, 2))
-                .unwrap();
+            ready_journal(store.open_journal(&format!("run-{run}"), JournalLimits::new(1_024, 2)));
         }
 
         let runs = fs::read_dir(temp.path().join("macro_data/runs"))
             .unwrap()
             .count();
         assert_eq!(runs, 2);
+    }
+
+    #[test]
+    fn concurrent_first_revision_publication_never_overwrites_the_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MacroStore::open(temp.path()).unwrap());
+        let asset = store.assets().put_png(b"template").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for name in ["first", "second"] {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let asset = asset.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut definition = fixture_definition(asset);
+                definition.name = name.to_string();
+                barrier.wait();
+                store.save(definition)
+            }));
+        }
+        barrier.wait();
+        let outcomes = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        let winner = outcomes.into_iter().find_map(Result::ok).unwrap();
+        let revision: MacroDefinition = serde_json::from_slice(
+            &fs::read(temp.path().join("macro_data/definitions/macro-one/1.json")).unwrap(),
+        )
+        .unwrap();
+        let current: MacroDefinition = serde_json::from_slice(
+            &fs::read(
+                temp.path()
+                    .join("macro_data/definitions/macro-one/current.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(revision.name, winner.definition.name);
+        assert_eq!(current.name, winner.definition.name);
+    }
+
+    #[test]
+    fn asset_identity_is_immutable_but_distinct_identities_may_share_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let bytes = b"same bytes";
+        let hash = sha256_hex(bytes);
+        let first = AssetRef {
+            id: "first".to_string(),
+            revision: 1,
+            content_hash: hash.clone(),
+        };
+        let second = AssetRef {
+            id: "second".to_string(),
+            revision: 1,
+            content_hash: hash,
+        };
+        store
+            .assets()
+            .put_png_revision(first.clone(), bytes)
+            .unwrap();
+        store
+            .assets()
+            .put_png_revision(second.clone(), bytes)
+            .unwrap();
+        let mut definition = fixture_definition(first.clone());
+        definition.image_rules[0].transparent_mask = Some(second.clone());
+        let saved = store.save(definition).unwrap();
+        assert_eq!(saved.pinned_assets.len(), 2);
+        assert!(saved.pinned_assets.iter().any(|asset| asset.asset == first));
+        assert!(
+            saved
+                .pinned_assets
+                .iter()
+                .any(|asset| asset.asset == second)
+        );
+
+        let conflicting_bytes = b"different";
+        let conflicting = AssetRef {
+            id: "first".to_string(),
+            revision: 1,
+            content_hash: sha256_hex(conflicting_bytes),
+        };
+        let error = store
+            .assets()
+            .put_png_revision(conflicting, conflicting_bytes)
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable asset identity"));
+    }
+
+    #[test]
+    fn direct_save_rejects_conflicting_asset_identities() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let first_bytes = b"first";
+        let second_bytes = b"second";
+        let first = AssetRef {
+            id: "same".to_string(),
+            revision: 1,
+            content_hash: sha256_hex(first_bytes),
+        };
+        let second = AssetRef {
+            id: "same".to_string(),
+            revision: 1,
+            content_hash: sha256_hex(second_bytes),
+        };
+        // Seed corrupt durable state directly to prove save validates the
+        // definition independently of the identity installer.
+        atomic_write(
+            &store.assets.path_for_hash(&first.content_hash).unwrap(),
+            first_bytes,
+        )
+        .unwrap();
+        atomic_write(
+            &store.assets.path_for_hash(&second.content_hash).unwrap(),
+            second_bytes,
+        )
+        .unwrap();
+        let mut definition = fixture_definition(first);
+        definition.image_rules[0].transparent_mask = Some(second);
+
+        let error = store.save(definition).unwrap_err();
+        assert!(error.to_string().contains("conflicting asset identity"));
+    }
+
+    #[test]
+    fn package_rejects_duplicate_identity_with_different_hashes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let asset = store.assets().put_png(b"template").unwrap();
+        let saved = store.save(fixture_definition(asset)).unwrap();
+        let package = temp.path().join("package");
+        store.export_package(&saved, &package).unwrap();
+
+        let manifest_path = package.join("manifest.json");
+        let mut manifest: PackageManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let other_bytes = b"other";
+        let other_hash = sha256_hex(other_bytes);
+        let mut duplicate = manifest.assets[0].clone();
+        duplicate.asset.content_hash = other_hash.clone();
+        duplicate.path = PathBuf::from("assets").join(format!("{other_hash}.png"));
+        fs::write(package.join(&duplicate.path), other_bytes).unwrap();
+        manifest.assets.push(duplicate);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = MacroStore::validate_package(&package).unwrap_err();
+        assert!(error.to_string().contains("conflicting asset identity"));
+    }
+
+    #[test]
+    fn cleanup_aborts_without_deleting_when_saved_hash_is_parseably_corrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let saved_asset = store.assets().put_png(b"saved").unwrap();
+        let orphan = store.assets().put_png(b"orphan").unwrap();
+        store.save(fixture_definition(saved_asset)).unwrap();
+        let revision_path = temp.path().join("macro_data/definitions/macro-one/1.json");
+        let mut definition: MacroDefinition =
+            serde_json::from_slice(&fs::read(&revision_path).unwrap()).unwrap();
+        definition.image_rules[0].template.content_hash = "0".repeat(64);
+        fs::write(
+            &revision_path,
+            serde_json::to_vec_pretty(&definition).unwrap(),
+        )
+        .unwrap();
+
+        assert!(store.cleanup_orphan_assets(&HashSet::new()).is_err());
+        assert!(store.assets().read(&orphan).is_ok());
+    }
+
+    #[test]
+    fn failed_import_rolls_back_new_assets_and_identity_bindings() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let asset = source.assets().put_png(b"source").unwrap();
+        let saved = source.save(fixture_definition(asset.clone())).unwrap();
+        let package_path = source_temp.path().join("package");
+        source.export_package(&saved, &package_path).unwrap();
+
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+        destination.fail_next_import_after_asset_installs();
+        assert!(destination.import_package(&package_path).is_err());
+        assert!(destination.assets().read(&asset).is_err());
+        assert_eq!(
+            fs::read_dir(destination_temp.path().join("macro_data/definitions"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn validated_package_import_uses_captured_bytes_after_source_substitution() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let original = b"original";
+        let asset = source.assets().put_png(original).unwrap();
+        let saved = source.save(fixture_definition(asset.clone())).unwrap();
+        let package_path = source_temp.path().join("package");
+        source.export_package(&saved, &package_path).unwrap();
+        let package = MacroStore::validate_package(&package_path).unwrap();
+        fs::write(
+            package_path
+                .join("assets")
+                .join(format!("{}.png", asset.content_hash)),
+            b"substituted",
+        )
+        .unwrap();
+
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+        let imported = destination.import_validated_package(package).unwrap();
+        assert_eq!(
+            destination
+                .assets()
+                .read(&imported.definition.image_rules[0].template)
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn export_is_no_clobber_for_an_existing_package_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let asset = store.assets().put_png(b"template").unwrap();
+        let first = store.save(fixture_definition(asset.clone())).unwrap();
+        let package = temp.path().join("package");
+        store.export_package(&first, &package).unwrap();
+        let original = fs::read(package.join("macro.json")).unwrap();
+
+        let mut second_definition = fixture_definition(asset);
+        second_definition.revision = 2;
+        second_definition.name = "second".to_string();
+        let second = store.save(second_definition).unwrap();
+        assert!(store.export_package(&second, &package).is_err());
+        assert_eq!(fs::read(package.join("macro.json")).unwrap(), original);
+    }
+
+    #[test]
+    fn journal_initialization_failure_disables_persistence_without_run_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        fs::remove_dir(temp.path().join("macro_data/runs")).unwrap();
+        fs::write(temp.path().join("macro_data/runs"), b"not a directory").unwrap();
+
+        let outcome = store.open_journal("run-one", JournalLimits::new(1_024, 2));
+        assert!(matches!(
+            outcome,
+            JournalOpenOutcome::Disabled { diagnostic }
+                if diagnostic.contains("journal initialization failed")
+        ));
     }
 }

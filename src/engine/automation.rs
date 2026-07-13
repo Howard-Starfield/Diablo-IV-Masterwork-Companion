@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use super::{
     config::MouseMovementProfile,
@@ -15,9 +16,17 @@ pub trait InputSink {
     fn move_and_click(
         &self,
         point: Point,
+        button: MouseButton,
         movement: Option<&MouseMovementProfile>,
         stop: Option<&dyn StopSource>,
     ) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    Left,
+    Right,
 }
 
 pub trait StopSource {
@@ -119,5 +128,17 @@ mod tests {
         assert_eq!(FakeClock(42).now_ms(), 42);
         assert_eq!(target.snapshot().unwrap(), snapshot);
         target.validate(&snapshot).unwrap();
+    }
+
+    #[test]
+    fn mouse_buttons_keep_stable_serialized_names() {
+        assert_eq!(
+            serde_json::to_string(&MouseButton::Left).unwrap(),
+            r#""left""#
+        );
+        assert_eq!(
+            serde_json::to_string(&MouseButton::Right).unwrap(),
+            r#""right""#
+        );
     }
 }

@@ -1,6 +1,8 @@
 use crate::engine::types::{PointRatio, RectRatio};
 use serde::{Deserialize, Serialize};
 
+pub use crate::engine::automation::MouseButton;
+
 pub const MACRO_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -127,13 +129,6 @@ pub enum MatchSelectionPolicy {
     FirstReadingOrder,
     Topmost,
     Bottommost,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MouseButton {
-    Left,
-    Right,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -293,6 +288,15 @@ pub enum TimeoutOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_button_round_trip_remains_stable() {
+        let button: crate::engine::macro_engine::MouseButton = MouseButton::Right;
+        let json = serde_json::to_string(&button).unwrap();
+
+        assert_eq!(json, r#""right""#);
+        assert_eq!(serde_json::from_str::<MouseButton>(&json).unwrap(), button);
+    }
 
     #[test]
     fn limit_round_trips_with_explicit_unlimited_tag() {

@@ -32,8 +32,8 @@ use windows::{
             },
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
-                MOUSEEVENTF_LEFTUP, MOUSEINPUT, ReleaseCapture, SendInput, SetCapture, VK_ESCAPE,
-                VK_LBUTTON,
+                MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEINPUT,
+                ReleaseCapture, SendInput, SetCapture, VK_ESCAPE, VK_LBUTTON,
             },
             WindowsAndMessaging::{
                 CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
@@ -53,7 +53,7 @@ use windows::{
 use xcap::Monitor;
 
 use super::super::{
-    automation::{CaptureSource, InputSink, StopSource},
+    automation::{CaptureSource, InputSink, MouseButton, StopSource},
     config::{MouseMovementModel, MouseMovementProfile, MouseMovementSample, MouseMovementStep},
     enchant_loop::OcrReader,
     types::{Point, Rect, ScreenImage},
@@ -209,6 +209,7 @@ impl InputSink for SendInputController {
     fn move_and_click(
         &self,
         point: Point,
+        button: MouseButton,
         movement: Option<&MouseMovementProfile>,
         stop: Option<&dyn StopSource>,
     ) -> Result<()> {
@@ -221,17 +222,15 @@ impl InputSink for SendInputController {
         if stop.is_some_and(|stop| stop.is_stopped()) {
             return Ok(());
         }
-        click_at(point)
+        click_at(point, button)
     }
 }
 
-fn click_at(point: Point) -> Result<()> {
+fn click_at(point: Point, button: MouseButton) -> Result<()> {
     unsafe {
         SetCursorPos(point.x, point.y)?;
-        let inputs = [
-            mouse_input(MOUSEEVENTF_LEFTDOWN),
-            mouse_input(MOUSEEVENTF_LEFTUP),
-        ];
+        let (down, up) = mouse_button_flags(button);
+        let inputs = [mouse_input(down), mouse_input(up)];
         let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
         if sent != inputs.len() as u32 {
             return Err(anyhow!(
@@ -241,6 +240,18 @@ fn click_at(point: Point) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn mouse_button_flags(
+    button: MouseButton,
+) -> (
+    windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+    windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+) {
+    match button {
+        MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+    }
 }
 
 fn move_cursor_with_profile(
@@ -1078,4 +1089,17 @@ fn cursor_pos() -> Result<Point> {
         GetCursorPos(&mut point)?;
     }
     Ok(Point::new(point.x, point.y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn right_click_selects_right_button_flags() {
+        assert_eq!(
+            mouse_button_flags(MouseButton::Right),
+            (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
+        );
+    }
 }

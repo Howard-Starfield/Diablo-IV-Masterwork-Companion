@@ -5,7 +5,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    automation::{CaptureSource, InputSink, StopSource},
+    automation::{CaptureSource, InputSink, MouseButton, StopSource},
     config::{EnchantConfig, MouseMovementProfile},
     matcher::{MatchResult, match_affix},
     types::{Point, Rect, ScreenImage},
@@ -67,7 +67,7 @@ where
     T: InputSink,
 {
     fn click(&self, point: Point) -> Result<()> {
-        self.move_and_click(point, None, None)
+        self.move_and_click(point, MouseButton::Left, None, None)
     }
 
     fn click_with_movement(
@@ -79,9 +79,9 @@ where
         match stop {
             Some(stop) => {
                 let stop = StopSourceAdapter(stop);
-                self.move_and_click(point, movement, Some(&stop))
+                self.move_and_click(point, MouseButton::Left, movement, Some(&stop))
             }
-            None => self.move_and_click(point, movement, None),
+            None => self.move_and_click(point, MouseButton::Left, movement, None),
         }
     }
 }
@@ -325,6 +325,7 @@ mod tests {
     #[derive(Clone)]
     struct SharedInput {
         actions: Rc<RefCell<Vec<&'static str>>>,
+        buttons: Rc<RefCell<Vec<MouseButton>>>,
         stop_after_click: Option<Rc<Cell<bool>>>,
     }
 
@@ -332,6 +333,7 @@ mod tests {
         fn move_and_click(
             &self,
             point: Point,
+            button: MouseButton,
             _movement: Option<&MouseMovementProfile>,
             _stop: Option<&dyn StopSource>,
         ) -> Result<()> {
@@ -342,6 +344,7 @@ mod tests {
                 _ => "unknown",
             };
             self.actions.borrow_mut().push(action);
+            self.buttons.borrow_mut().push(button);
             if let Some(stop) = &self.stop_after_click {
                 stop.set(true);
             }
@@ -599,6 +602,7 @@ mod tests {
     #[test]
     fn shared_adapters_preserve_enchant_ocr_replace_close_order() {
         let actions = Rc::new(RefCell::new(Vec::new()));
+        let buttons = Rc::new(RefCell::new(Vec::new()));
         let mut run_config = config("Max Health");
         run_config.max_attempts = 1;
         let runner = EnchantRunner::new(
@@ -607,6 +611,7 @@ mod tests {
             RecordingOcr(actions.clone()),
             SharedInput {
                 actions: actions.clone(),
+                buttons: buttons.clone(),
                 stop_after_click: None,
             },
             SharedStop(Rc::new(Cell::new(false))),
@@ -622,11 +627,13 @@ mod tests {
             *actions.borrow(),
             vec!["enchant", "capture", "ocr", "replace", "close"]
         );
+        assert_eq!(*buttons.borrow(), vec![MouseButton::Left; 3]);
     }
 
     #[test]
     fn shared_adapters_preserve_stop_before_later_action() {
         let actions = Rc::new(RefCell::new(Vec::new()));
+        let buttons = Rc::new(RefCell::new(Vec::new()));
         let stopped = Rc::new(Cell::new(false));
         let runner = EnchantRunner::new(
             config("Max Health"),
@@ -634,6 +641,7 @@ mod tests {
             RecordingOcr(actions.clone()),
             SharedInput {
                 actions: actions.clone(),
+                buttons: buttons.clone(),
                 stop_after_click: Some(stopped.clone()),
             },
             SharedStop(stopped),
@@ -643,5 +651,6 @@ mod tests {
 
         assert!(matches!(outcome, EnchantOutcome::Stopped { attempts: 1 }));
         assert_eq!(*actions.borrow(), vec!["enchant"]);
+        assert_eq!(*buttons.borrow(), vec![MouseButton::Left]);
     }
 }

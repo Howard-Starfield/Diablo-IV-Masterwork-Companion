@@ -303,6 +303,7 @@ impl AssetStore {
             .map(|entry| (entry.successor.id.clone(), entry.successor.revision))
             .collect::<HashSet<_>>();
         let index = self.load_index_locked()?;
+        self.ensure_staged_revisions_are_not_durable_locked(&index, &descendants)?;
         if index.bindings.iter().any(|binding| {
             binding.id == previous.id
                 && binding.revision > previous.revision
@@ -396,7 +397,13 @@ impl AssetStore {
                 successor.revision
             );
         };
-        self.rollback_staged_revision_locked(&journal.entries[index])?;
+        let staged = journal.entries[index].clone();
+        let identities = self.load_index_locked()?;
+        self.ensure_staged_revisions_are_not_durable_locked(
+            &identities,
+            std::slice::from_ref(&staged),
+        )?;
+        self.rollback_staged_revision_locked(&staged)?;
         journal.entries.remove(index);
         self.write_staged_revision_journal_locked(&journal)
     }
@@ -591,6 +598,97 @@ impl AssetStore {
             sync_directory(&self.root)?;
         }
         Ok(())
+    }
+
+    fn ensure_staged_revisions_are_not_durable_locked(
+        &self,
+        index: &AssetIdentityIndex,
+        staged: &[StagedAssetRevision],
+    ) -> Result<()> {
+        let durable = self.durable_definition_asset_refs_locked(index)?;
+        let durable_latest = latest_asset_revisions(durable.iter());
+        if let Some(entry) = staged.iter().find(|entry| {
+            durable_latest
+                .get(entry.successor.id.as_str())
+                .is_some_and(|revision| *revision >= entry.successor.revision)
+        }) {
+            bail!(
+                "durable definition references template {} revision {}; staged rollback is blocked",
+                entry.successor.id,
+                entry.successor.revision
+            );
+        }
+        Ok(())
+    }
+
+    fn durable_definition_asset_refs_locked(
+        &self,
+        index: &AssetIdentityIndex,
+    ) -> Result<HashSet<AssetRef>> {
+        let mut durable = HashSet::new();
+        let definitions_root = self
+            .root
+            .parent()
+            .context("macro asset root has no store parent")?
+            .join("definitions");
+        for macro_directory in fs::read_dir(definitions_root)? {
+            let macro_directory = macro_directory?;
+            if !macro_directory.file_type()?.is_dir() {
+                continue;
+            }
+            let macro_id = macro_directory.file_name().to_string_lossy().into_owned();
+            validate_component("saved macro directory", &macro_id)?;
+            validate_revision_sidecars(&macro_directory.path())?;
+            for revision_file in fs::read_dir(macro_directory.path())? {
+                let revision_file = revision_file?;
+                if !revision_file.file_type()?.is_file()
+                    || revision_file
+                        .path()
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        != Some("json")
+                {
+                    continue;
+                }
+                let file_name = revision_file.file_name().to_string_lossy().into_owned();
+                let bytes = fs::read(revision_file.path())?;
+                let definition: MacroDefinition = serde_json::from_slice(&bytes)
+                    .context("corrupt saved macro definition blocks staged asset recovery")?;
+                if definition.schema_version != MACRO_SCHEMA_VERSION {
+                    bail!(
+                        "unsupported macro schema {} blocks staged asset recovery",
+                        definition.schema_version
+                    );
+                }
+                if definition.id != macro_id {
+                    bail!("saved macro ID does not match definition directory");
+                }
+                if file_name == "current.json" {
+                    let immutable = macro_directory
+                        .path()
+                        .join(format!("{}.json", definition.revision));
+                    if fs::read(&immutable).context("current revision file is missing")? != bytes {
+                        bail!("current definition does not match immutable revision");
+                    }
+                } else {
+                    verify_revision_checksum(&revision_file.path(), &bytes)?;
+                    let file_revision = file_name
+                        .strip_suffix(".json")
+                        .and_then(|stem| stem.parse::<u64>().ok())
+                        .context("saved revision filename is invalid")?;
+                    if definition.revision != file_revision {
+                        bail!("saved revision does not match revision filename");
+                    }
+                }
+                validate_identity_set(referenced_assets(&definition))?;
+                for asset in referenced_assets(&definition) {
+                    validate_identity_binding(&index.bindings, asset)?;
+                    self.verify_hash_file_locked(&asset.content_hash)?;
+                    durable.insert(asset.clone());
+                }
+            }
+        }
+        Ok(durable)
     }
 
     fn verify_hash_file_locked(&self, hash: &str) -> Result<Vec<u8>> {
@@ -815,66 +913,7 @@ impl MacroStore {
         &self,
         index: &AssetIdentityIndex,
     ) -> Result<HashSet<AssetRef>> {
-        let mut durable = HashSet::new();
-        let definitions_root = self.root.join("definitions");
-        for macro_directory in fs::read_dir(definitions_root)? {
-            let macro_directory = macro_directory?;
-            if !macro_directory.file_type()?.is_dir() {
-                continue;
-            }
-            let macro_id = macro_directory.file_name().to_string_lossy().into_owned();
-            validate_component("saved macro directory", &macro_id)?;
-            validate_revision_sidecars(&macro_directory.path())?;
-            for revision_file in fs::read_dir(macro_directory.path())? {
-                let revision_file = revision_file?;
-                if !revision_file.file_type()?.is_file()
-                    || revision_file
-                        .path()
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        != Some("json")
-                {
-                    continue;
-                }
-                let file_name = revision_file.file_name().to_string_lossy().into_owned();
-                let bytes = fs::read(revision_file.path())?;
-                let definition: MacroDefinition = serde_json::from_slice(&bytes)
-                    .context("corrupt saved macro definition blocks staged asset recovery")?;
-                if definition.schema_version != MACRO_SCHEMA_VERSION {
-                    bail!(
-                        "unsupported macro schema {} blocks staged asset recovery",
-                        definition.schema_version
-                    );
-                }
-                if definition.id != macro_id {
-                    bail!("saved macro ID does not match definition directory");
-                }
-                if file_name == "current.json" {
-                    let immutable = macro_directory
-                        .path()
-                        .join(format!("{}.json", definition.revision));
-                    if fs::read(&immutable).context("current revision file is missing")? != bytes {
-                        bail!("current definition does not match immutable revision");
-                    }
-                } else {
-                    verify_revision_checksum(&revision_file.path(), &bytes)?;
-                    let file_revision = file_name
-                        .strip_suffix(".json")
-                        .and_then(|stem| stem.parse::<u64>().ok())
-                        .context("saved revision filename is invalid")?;
-                    if definition.revision != file_revision {
-                        bail!("saved revision does not match revision filename");
-                    }
-                }
-                validate_identity_set(referenced_assets(&definition))?;
-                for asset in referenced_assets(&definition) {
-                    validate_identity_binding(&index.bindings, asset)?;
-                    self.assets.verify_hash_file_locked(&asset.content_hash)?;
-                    durable.insert(asset.clone());
-                }
-            }
-        }
-        Ok(durable)
+        self.assets.durable_definition_asset_refs_locked(index)
     }
 
     pub fn validate_package(package_root: &Path) -> Result<MacroPackage> {
@@ -2693,6 +2732,102 @@ mod tests {
             b"durable successor"
         );
         assert!(!reopened.assets.staged_revision_journal.exists());
+    }
+
+    #[test]
+    fn same_process_replace_cannot_rollback_durable_successor_after_cleanup_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let original = store.assets().put_png(b"original").unwrap();
+        let staged = store
+            .assets()
+            .stage_next_png_revision(&original, b"durable successor")
+            .unwrap();
+        store
+            .fail_staged_finalize_cleanup
+            .store(true, Ordering::SeqCst);
+        store.save(fixture_definition(staged.clone())).unwrap();
+
+        let error = store
+            .assets()
+            .replace_staged_png_revision(&original, b"must not replace durable bytes")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("durable"));
+        assert_eq!(store.assets().read(&staged).unwrap(), b"durable successor");
+        let current: MacroDefinition = serde_json::from_slice(
+            &fs::read(
+                temp.path()
+                    .join("macro_data/definitions/macro-one/current.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(current.image_rules[0].template, staged);
+    }
+
+    #[test]
+    fn same_process_discard_cannot_rollback_durable_successor_after_cleanup_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let original = store.assets().put_png(b"original").unwrap();
+        let staged = store
+            .assets()
+            .stage_next_png_revision(&original, b"durable successor")
+            .unwrap();
+        store
+            .fail_staged_finalize_cleanup
+            .store(true, Ordering::SeqCst);
+        store.save(fixture_definition(staged.clone())).unwrap();
+
+        let error = store
+            .assets()
+            .discard_staged_png_revision(&staged)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("durable"));
+        assert_eq!(store.assets().read(&staged).unwrap(), b"durable successor");
+        let current: MacroDefinition = serde_json::from_slice(
+            &fs::read(
+                temp.path()
+                    .join("macro_data/definitions/macro-one/current.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(current.image_rules[0].template, staged);
+    }
+
+    #[test]
+    fn staged_discard_and_replace_fail_closed_when_durable_definition_scan_is_corrupt() {
+        for replace in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = MacroStore::open(temp.path()).unwrap();
+            let original = store.assets().put_png(b"original").unwrap();
+            let staged = store
+                .assets()
+                .stage_next_png_revision(&original, b"staged successor")
+                .unwrap();
+            let definition_dir = temp.path().join("macro_data/definitions/corrupt-macro");
+            fs::create_dir_all(&definition_dir).unwrap();
+            fs::write(definition_dir.join("current.json"), b"{not valid json").unwrap();
+
+            let error = if replace {
+                store
+                    .assets()
+                    .replace_staged_png_revision(&original, b"replacement")
+                    .map(|_| ())
+                    .unwrap_err()
+            } else {
+                store
+                    .assets()
+                    .discard_staged_png_revision(&staged)
+                    .unwrap_err()
+            };
+
+            assert!(error.to_string().contains("corrupt saved macro definition"));
+            assert_eq!(store.assets().read(&staged).unwrap(), b"staged successor");
+        }
     }
 
     #[test]

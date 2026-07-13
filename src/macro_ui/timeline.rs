@@ -265,6 +265,17 @@ fn format_duration(duration_ms: u64) -> String {
     }
 }
 
+fn row_is_active(
+    row: &TimelineRow,
+    active_block: Option<&str>,
+    current_selection: Option<&TimelineSelection>,
+) -> bool {
+    row.identity
+        .as_deref()
+        .is_some_and(|identity| Some(identity) == active_block)
+        || current_selection.is_some_and(|selection| row.selection.as_ref() == Some(selection))
+}
+
 pub fn show(
     ui: &mut Ui,
     rows: &[TimelineRow],
@@ -294,8 +305,7 @@ pub fn show(
 
     let mut clicked_selection = None;
     for row in rows {
-        let active =
-            row.identity.as_deref() == active_block || row.selection.as_ref() == current_selection;
+        let active = row_is_active(row, active_block, current_selection);
         let fill = if active {
             Color32::from_rgb(58, 37, 24)
         } else if row.is_loop_marker {
@@ -525,5 +535,100 @@ mod tests {
                     owner_id: "owner".into(),
                 })
         }));
+    }
+
+    fn active_fixture() -> Vec<Block> {
+        vec![
+            Block {
+                id: "if".into(),
+                enabled: true,
+                kind: BlockKind::If {
+                    condition: Condition::Text {
+                        source_block_id: "if".into(),
+                        rule_id: "rule".into(),
+                        mode: ObserveMode::CheckNow,
+                    },
+                    then_body: vec![],
+                    else_body: vec![],
+                },
+            },
+            Block {
+                id: "loop".into(),
+                enabled: true,
+                kind: BlockKind::Continuous {
+                    body: vec![Block {
+                        id: "inside".into(),
+                        enabled: true,
+                        kind: BlockKind::Comment {
+                            text: "inside".into(),
+                        },
+                    }],
+                },
+            },
+            Block {
+                id: "observe".into(),
+                enabled: true,
+                kind: BlockKind::Observe {
+                    condition: Condition::Text {
+                        source_block_id: "observe".into(),
+                        rule_id: "rule".into(),
+                        mode: ObserveMode::WaitForTrue {
+                            timeout_ms: Limit::Finite(100),
+                            timeout_outcome: TimeoutOutcome::RunBody { body: vec![] },
+                        },
+                    },
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn idle_state_never_marks_identityless_structural_rows_active() {
+        let rows = project_timeline(&active_fixture());
+        assert!(rows.iter().all(|row| !row_is_active(row, None, None)));
+        assert!(rows.iter().any(|row| row.label == "THEN"));
+        assert!(rows.iter().any(|row| row.label == "ELSE"));
+        assert!(rows.iter().any(|row| row.is_loop_marker));
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row.selection, Some(TimelineSelection::TimeoutBody { .. })))
+        );
+    }
+
+    #[test]
+    fn real_and_typed_selection_activate_only_their_exact_rows() {
+        let rows = project_timeline(&active_fixture());
+        let real = TimelineSelection::Identity("inside".into());
+        let active = rows
+            .iter()
+            .filter(|row| row_is_active(row, None, Some(&real)))
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].identity.as_deref(), Some("inside"));
+
+        let timeout = TimelineSelection::TimeoutBody {
+            owner_id: "observe".into(),
+        };
+        let active = rows
+            .iter()
+            .filter(|row| row_is_active(row, Some("inside"), Some(&timeout)))
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 2);
+        assert!(
+            active
+                .iter()
+                .any(|row| row.identity.as_deref() == Some("inside"))
+        );
+        assert!(
+            active
+                .iter()
+                .any(|row| row.selection.as_ref() == Some(&timeout))
+        );
+        assert!(
+            active
+                .iter()
+                .all(|row| row.label != "THEN" && row.label != "ELSE")
+        );
+        assert!(active.iter().all(|row| !row.is_loop_marker));
     }
 }

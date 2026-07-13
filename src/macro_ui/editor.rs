@@ -439,7 +439,10 @@ fn action_dependency_problems(
         .filter(|problem| {
             matches!(
                 problem.code.as_str(),
-                "action.invalid_source" | "action.detector_family_mismatch"
+                "action.invalid_source"
+                    | "action.detector_family_mismatch"
+                    | "action.disabled_source"
+                    | "action.text_absent_match"
             )
         })
         .map(|problem| (problem.code, problem.block_id, problem.message))
@@ -2487,6 +2490,70 @@ mod tests {
             ),
             Ok(EditOutcome::Changed)
         );
+    }
+
+    #[test]
+    fn direct_command_rejects_text_absent_matched_click_source() {
+        let source = Block {
+            id: "source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "source".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        };
+        let mut definition = def(vec![source, comment("target")]);
+        definition.text_rules.push(TextRule {
+            id: "r".into(),
+            revision: 1,
+            region_id: "region".into(),
+            language: "en-US".into(),
+            preprocess: PreprocessProfile::Original,
+            expected: "missing".into(),
+            match_mode: TextMatchMode::Absent,
+            threshold: 0.9,
+            case_sensitive: false,
+            allow_cross_line: false,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 250,
+            timeout_ms: Limit::Unlimited,
+            stable_frames: 1,
+        });
+        let mut draft = EditorDraft::new(definition);
+        let before = draft.clone();
+        let action = |id: &str| Block {
+            id: id.into(),
+            enabled: true,
+            kind: BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: "source".into(),
+                    button: MouseButton::Left,
+                },
+            },
+        };
+        for command in [
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 2,
+                },
+                block: action("inserted"),
+            },
+            EditorCommand::ReplaceBlock {
+                path: path("target"),
+                replacement: action("target"),
+                children: ChildDisposition::DeleteOwnedContents,
+            },
+        ] {
+            assert_eq!(
+                apply_editor_command(&mut draft, command),
+                Err(EditorError::ValidationFailed)
+            );
+            assert_eq!(draft, before);
+        }
     }
 
     #[test]

@@ -1493,7 +1493,7 @@ fn replacement_choices(
         )
     }));
     kinds.extend(
-        observation_sources(draft)
+        matched_observation_sources(draft)
             .into_iter()
             .map(|(id, condition)| match condition {
                 crate::engine::macro_engine::Condition::Text { .. } => (
@@ -1635,6 +1635,7 @@ fn palette_command_for_selection(
         },
     );
     let source = observation_source(draft, selected_id);
+    let matched_source = matched_observation_source(draft, selected_id);
     let kind = match kind {
         PaletteKind::Observe => {
             if let Some(rule) = draft.text_rules.first() {
@@ -1657,7 +1658,7 @@ fn palette_command_for_selection(
                 return Err("Add a text or image rule before inserting an observation.".into());
             }
         }
-        PaletteKind::Action => match source {
+        PaletteKind::Action => match matched_source {
             Some((source_id, Condition::Text { .. })) => BlockKind::Action {
                 action: Action::ClickTextMatch {
                     source_block_id: source_id,
@@ -1811,65 +1812,123 @@ fn observation_source(
             return Some((block.id.clone(), condition.clone()));
         }
     }
-    fn find(
-        blocks: &[crate::engine::macro_engine::Block],
-    ) -> Option<(String, crate::engine::macro_engine::Condition)> {
-        for block in blocks {
-            if let BlockKind::Observe { condition } = &block.kind {
-                return Some((block.id.clone(), condition.clone()));
-            }
-            for child in palette_child_slices(block) {
-                if let Some(found) = find(child) {
-                    return Some(found);
-                }
-            }
-        }
-        None
-    }
-    find(&draft.blocks)
+    observation_sources(draft).into_iter().next()
 }
 
 fn observation_sources(
     draft: &EditorDraft,
 ) -> Vec<(String, crate::engine::macro_engine::Condition)> {
     use crate::engine::macro_engine::BlockKind;
-    fn collect(
-        blocks: &[crate::engine::macro_engine::Block],
-        out: &mut Vec<(String, crate::engine::macro_engine::Condition)>,
-    ) {
-        for block in blocks {
-            if let BlockKind::Observe { condition } = &block.kind {
-                out.push((block.id.clone(), condition.clone()));
-            }
-            for child in palette_child_slices(block) {
-                collect(child, out);
-            }
-        }
-    }
     let mut out = Vec::new();
-    collect(&draft.blocks, &mut out);
+    for_each_canonical_block(&draft.blocks, &mut |block| {
+        if let BlockKind::Observe { condition } = &block.kind {
+            out.push((block.id.clone(), condition.clone()));
+        }
+    });
     out
 }
 
-fn palette_child_slices(
+fn matched_observation_source(
+    draft: &EditorDraft,
+    selected_id: Option<&str>,
+) -> Option<(String, crate::engine::macro_engine::Condition)> {
+    let sources = matched_observation_sources(draft);
+    selected_id
+        .and_then(|selected| sources.iter().find(|(id, _)| id == selected).cloned())
+        .or_else(|| sources.into_iter().next())
+}
+
+fn matched_observation_sources(
+    draft: &EditorDraft,
+) -> Vec<(String, crate::engine::macro_engine::Condition)> {
+    observation_sources(draft)
+        .into_iter()
+        .filter(|(_, condition)| observation_has_match_geometry(draft, condition))
+        .collect()
+}
+
+fn observation_has_match_geometry(
+    draft: &EditorDraft,
+    condition: &crate::engine::macro_engine::Condition,
+) -> bool {
+    use crate::engine::macro_engine::{Condition, TextMatchMode};
+    match condition {
+        Condition::Image { .. } => true,
+        Condition::Text { rule_id, .. } => draft
+            .text_rules
+            .iter()
+            .find(|rule| rule.id == *rule_id)
+            .is_some_and(|rule| rule.match_mode != TextMatchMode::Absent),
+    }
+}
+
+fn for_each_canonical_block<'a>(
+    blocks: &'a [crate::engine::macro_engine::Block],
+    visit: &mut impl FnMut(&'a crate::engine::macro_engine::Block),
+) {
+    for block in blocks {
+        visit(block);
+        for children in canonical_child_slices(block) {
+            for_each_canonical_block(children, visit);
+        }
+    }
+}
+
+fn canonical_child_slices(
     block: &crate::engine::macro_engine::Block,
 ) -> Vec<&[crate::engine::macro_engine::Block]> {
-    use crate::engine::macro_engine::BlockKind;
-    match &block.kind {
+    use crate::engine::macro_engine::{BlockKind, TimeoutOutcome};
+    let mut children: Vec<&[crate::engine::macro_engine::Block]> = match &block.kind {
         BlockKind::If {
             then_body,
             else_body,
             ..
-        } => vec![then_body, else_body],
+        } => vec![then_body.as_slice(), else_body.as_slice()],
         BlockKind::RepeatN { body, .. }
         | BlockKind::RepeatUntil { body, .. }
-        | BlockKind::Continuous { body } => vec![body],
+        | BlockKind::Continuous { body } => vec![body.as_slice()],
         BlockKind::WatchGroup { group } => group
             .lanes
             .iter()
             .map(|lane| lane.then_body.as_slice())
             .collect(),
         _ => vec![],
+    };
+    match &block.kind {
+        BlockKind::Observe { condition }
+        | BlockKind::If { condition, .. }
+        | BlockKind::RepeatUntil { condition, .. } => {
+            if let Some(body) = condition_timeout_slice(condition) {
+                children.push(body);
+            }
+        }
+        BlockKind::WatchGroup { group } => {
+            if let TimeoutOutcome::RunBody { body } = &group.timeout_outcome {
+                children.push(body);
+            }
+        }
+        _ => {}
+    }
+    children
+}
+
+fn condition_timeout_slice(
+    condition: &crate::engine::macro_engine::Condition,
+) -> Option<&[crate::engine::macro_engine::Block]> {
+    use crate::engine::macro_engine::{Condition, ObserveMode, TimeoutOutcome};
+    let mode = match condition {
+        Condition::Text { mode, .. } | Condition::Image { mode, .. } => mode,
+    };
+    match mode {
+        ObserveMode::WaitForTrue {
+            timeout_outcome: TimeoutOutcome::RunBody { body },
+            ..
+        }
+        | ObserveMode::WaitForFalse {
+            timeout_outcome: TimeoutOutcome::RunBody { body },
+            ..
+        } => Some(body),
+        _ => None,
     }
 }
 
@@ -2441,6 +2500,139 @@ mod tests {
         let pending =
             replace_block_preview(block, path, ReplacementKind::ActionText(block.id.clone()));
         assert!(!pending_conversion_valid(&draft, &pending));
+    }
+
+    #[test]
+    fn observation_source_discovery_traverses_every_canonical_owned_container() {
+        let observe = |id: &str| Block {
+            id: id.into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: id.into(),
+                    rule_id: "rule".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        };
+        let timeout_condition = |owner: &str, child: &str| Condition::Text {
+            source_block_id: owner.into(),
+            rule_id: "rule".into(),
+            mode: ObserveMode::WaitForTrue {
+                timeout_ms: Limit::Finite(100),
+                timeout_outcome: TimeoutOutcome::RunBody {
+                    body: vec![observe(child)],
+                },
+            },
+        };
+        let mut draft = fixture();
+        draft.blocks = vec![
+            Block {
+                id: "observe-owner".into(),
+                enabled: true,
+                kind: BlockKind::Observe {
+                    condition: timeout_condition("observe-owner", "observe-timeout-source"),
+                },
+            },
+            Block {
+                id: "if-owner".into(),
+                enabled: true,
+                kind: BlockKind::If {
+                    condition: timeout_condition("if-owner", "if-timeout-source"),
+                    then_body: vec![observe("if-then-source")],
+                    else_body: vec![observe("if-else-source")],
+                },
+            },
+            Block {
+                id: "repeat-n".into(),
+                enabled: true,
+                kind: BlockKind::RepeatN {
+                    count: 2,
+                    body: vec![observe("repeat-n-source")],
+                },
+            },
+            Block {
+                id: "repeat-until".into(),
+                enabled: true,
+                kind: BlockKind::RepeatUntil {
+                    condition: timeout_condition("repeat-until", "repeat-timeout-source"),
+                    max_iterations: Limit::Finite(2),
+                    body: vec![observe("repeat-body-source")],
+                },
+            },
+            Block {
+                id: "continuous".into(),
+                enabled: true,
+                kind: BlockKind::Continuous {
+                    body: vec![observe("continuous-source")],
+                },
+            },
+            Block {
+                id: "watch".into(),
+                enabled: true,
+                kind: BlockKind::WatchGroup {
+                    group: WatchGroup {
+                        lanes: vec![WatchLane {
+                            id: "lane".into(),
+                            enabled: true,
+                            condition: PassiveCondition::Text {
+                                source_block_id: "lane".into(),
+                                rule_id: "rule".into(),
+                            },
+                            then_body: vec![observe("watch-lane-source")],
+                        }],
+                        timeout_ms: Limit::Finite(100),
+                        timeout_outcome: TimeoutOutcome::RunBody {
+                            body: vec![observe("watch-timeout-source")],
+                        },
+                        cooldown_ms: 0,
+                    },
+                },
+            },
+        ];
+
+        let sources = observation_sources(&draft)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for expected in [
+            "observe-timeout-source",
+            "if-then-source",
+            "if-else-source",
+            "if-timeout-source",
+            "repeat-n-source",
+            "repeat-body-source",
+            "repeat-timeout-source",
+            "continuous-source",
+            "watch-lane-source",
+            "watch-timeout-source",
+        ] {
+            assert!(sources.contains(expected), "missing {expected}");
+        }
+
+        let owner = &draft.blocks[0];
+        let path = locate_block_path(&draft, &owner.id).unwrap();
+        let pending = replacement_choices(&draft, owner, &path)
+            .into_iter()
+            .find(|(label, _)| label == "Action: Text source observe-timeout-source")
+            .map(|(_, pending)| pending)
+            .expect("timeout source replacement choice");
+        assert!(pending_conversion_valid(&draft, &pending));
+    }
+
+    #[test]
+    fn text_absent_observations_are_not_offered_as_matched_click_sources() {
+        let mut draft = fixture();
+        draft.text_rules[0].match_mode = TextMatchMode::Absent;
+
+        assert!(palette_command(&draft, Some("observe-1"), PaletteKind::Action).is_err());
+        let block = &draft.blocks[0];
+        let path = locate_block_path(&draft, &block.id).unwrap();
+        let labels = replacement_choices(&draft, block, &path)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>();
+        assert!(!labels.contains(&"Action: Text source observe-1".into()));
     }
 
     #[test]

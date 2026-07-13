@@ -20,11 +20,12 @@ use crate::engine::{
 };
 
 use super::{
-    Action, Block, BlockKind, CandidateEvent, Condition, ConditionDetector, DetectorEvidence,
-    DetectorKind, JournalKind, JournalRecord, LatchDecision, Limit, MacroDefinition,
-    ObservationRequest, ObservationToken, ObserveMode, PassiveCondition, PinnedAsset, SafetyBypass,
-    SavedRevision, TimeoutOutcome, WatchGroup, WatchGroupRunner, if_once_decision,
-    observation_satisfies_mode, repeat_n_decision, validate_macro,
+    Action, ActiveRunLease, Block, BlockKind, CandidateEvent, Condition, ConditionDetector,
+    DetectorEvidence, DetectorKind, JournalKind, JournalLimits, JournalOpenOutcome, JournalRecord,
+    LatchDecision, Limit, MacroDefinition, MacroStore, ObservationRequest, ObservationToken,
+    ObserveMode, PassiveCondition, PinnedAsset, RunJournal, SafetyBypass, SavedRevision,
+    TimeoutOutcome, WatchGroup, WatchGroupRunner, if_once_decision, observation_satisfies_mode,
+    repeat_n_decision, validate_macro,
 };
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
@@ -2651,13 +2652,32 @@ impl MacroRuntime {
     }
 
     pub fn run(&self, saved: SavedRevision, mode: RunMode) -> Result<Vec<RunEvent>> {
+        self.run_with_sink(saved, mode, None)
+    }
+
+    fn run_streaming(
+        &self,
+        saved: SavedRevision,
+        mode: RunMode,
+        sink: Arc<dyn RunEventSink>,
+    ) -> Result<Vec<RunEvent>> {
+        self.run_with_sink(saved, mode, Some(sink))
+    }
+
+    fn run_with_sink(
+        &self,
+        saved: SavedRevision,
+        mode: RunMode,
+        sink: Option<Arc<dyn RunEventSink>>,
+    ) -> Result<Vec<RunEvent>> {
         let _active =
             ActiveRunGuard::acquire_and_reset(&self.active, &self.emergency_stop, &self.control)?;
         let compiled = CompiledMacro::compile(saved)?;
         let started_at = self.clock.now_ms();
         let run_number = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
         let run_id = format!("{}-{}-{run_number}", compiled.definition().id, started_at);
-        let mut emitter = EventEmitter::new(&*self.clock, started_at, run_id, self.event_capacity);
+        let mut emitter =
+            EventEmitter::with_sink(&*self.clock, started_at, run_id, self.event_capacity, sink);
         emitter.run_started(&compiled, mode);
         emitter.status(RunStatus::Running);
         let blocks = compiled.definition().blocks.clone();
@@ -2741,6 +2761,372 @@ impl MacroRuntime {
 
     pub fn emergency_stop(&self) {
         self.control_handle().emergency_stop();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerRunExtent {
+    Once,
+    Continuous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControllerRunRequest {
+    pub extent: ControllerRunExtent,
+    /// `ObservationOnly` performs no input. `DryRun` plans actions but performs no input.
+    /// A live-input mode is intentionally absent until an inline `ActionCommitter` executor
+    /// is configured by the native composition root.
+    pub mode: RunMode,
+}
+
+impl ControllerRunRequest {
+    pub const fn once(mode: RunMode) -> Self {
+        Self {
+            extent: ControllerRunExtent::Once,
+            mode,
+        }
+    }
+
+    pub const fn continuous(mode: RunMode) -> Self {
+        Self {
+            extent: ControllerRunExtent::Continuous,
+            mode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacroControllerStatus {
+    Idle,
+    Running,
+    Paused,
+    Stopping,
+}
+
+struct ControllerState {
+    active_revision: Option<SavedRevision>,
+    status: MacroControllerStatus,
+    stop_requested: bool,
+    completed_cycles: u64,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Default for ControllerState {
+    fn default() -> Self {
+        Self {
+            active_revision: None,
+            status: MacroControllerStatus::Idle,
+            stop_requested: false,
+            completed_cycles: 0,
+            worker: None,
+        }
+    }
+}
+
+struct ControllerEventBuffer {
+    capacity: usize,
+    events: Mutex<VecDeque<RunEvent>>,
+}
+
+impl ControllerEventBuffer {
+    fn push(&self, event: RunEvent) {
+        let mut events = self
+            .events
+            .lock()
+            .expect("controller event buffer poisoned");
+        if event.is_progress() {
+            if let Some(existing) = events.back_mut().filter(|queued| {
+                matches!(
+                    (&**queued, &event),
+                    (
+                        RunEvent::ObservationProgress { run_id: old_run, block_id: old_block, .. },
+                        RunEvent::ObservationProgress { run_id: new_run, block_id: new_block, .. }
+                    ) if old_run == new_run && old_block == new_block
+                ) || matches!(
+                    (&**queued, &event),
+                    (
+                        RunEvent::PollingDelayed { run_id: old_run, block_id: old_block, lane_id: old_lane, .. },
+                        RunEvent::PollingDelayed { run_id: new_run, block_id: new_block, lane_id: new_lane, .. }
+                    ) if old_run == new_run && old_block == new_block && old_lane == new_lane
+                )
+            }) {
+                *existing = event;
+                return;
+            }
+            if events.len() >= self.capacity {
+                return;
+            }
+        } else if events.len() >= self.capacity {
+            if let Some(progress) = events.iter().position(RunEvent::is_progress) {
+                events.remove(progress);
+            } else {
+                // Critical events have already been written to the checked bounded run journal.
+                events.pop_front();
+            }
+        }
+        events.push_back(event);
+    }
+}
+
+struct ControllerEventSink {
+    store: Arc<MacroStore>,
+    buffer: Arc<ControllerEventBuffer>,
+    journal: Mutex<Option<(String, RunJournal)>>,
+    active_run: Mutex<Option<ActiveRunLease>>,
+    startup: Mutex<Option<mpsc::Sender<bool>>>,
+}
+
+impl RunEventSink for ControllerEventSink {
+    fn emit(&self, event: &RunEvent) {
+        let mut journal = self.journal.lock().expect("controller journal poisoned");
+        if let RunEvent::RunStarted { run_id, .. } = event {
+            *self
+                .active_run
+                .lock()
+                .expect("controller run lease poisoned") =
+                self.store.acquire_active_run(run_id).ok();
+            *journal = match self
+                .store
+                .open_journal(run_id, JournalLimits::new(8 * 1024 * 1024, 128))
+            {
+                JournalOpenOutcome::Ready(journal) => Some((run_id.clone(), journal)),
+                JournalOpenOutcome::Disabled { .. } => None,
+            };
+            if let Some(startup) = self.startup.lock().expect("startup signal poisoned").take() {
+                let _ = startup.send(true);
+            }
+        }
+        if let Some((_, active)) = journal.as_mut() {
+            let _ = active.append(&JournalRecord::from(event.clone()));
+        }
+        let stopped = matches!(event, RunEvent::RunStopped { .. });
+        drop(journal);
+        self.buffer.push(event.clone());
+        if stopped {
+            *self.journal.lock().expect("controller journal poisoned") = None;
+            *self
+                .active_run
+                .lock()
+                .expect("controller run lease poisoned") = None;
+        }
+    }
+}
+
+pub struct MacroController {
+    runtime: MacroRuntime,
+    store: Arc<MacroStore>,
+    state: Arc<Mutex<ControllerState>>,
+    events: Arc<ControllerEventBuffer>,
+}
+
+impl MacroController {
+    pub fn new(runtime: MacroRuntime, store: Arc<MacroStore>, event_capacity: usize) -> Self {
+        assert!(
+            event_capacity > 0,
+            "controller event capacity must be positive"
+        );
+        Self {
+            runtime,
+            store,
+            state: Arc::new(Mutex::new(ControllerState::default())),
+            events: Arc::new(ControllerEventBuffer {
+                capacity: event_capacity,
+                events: Mutex::new(VecDeque::with_capacity(event_capacity)),
+            }),
+        }
+    }
+
+    pub fn start_saved(&self, macro_id: &str, request: ControllerRunRequest) -> Result<()> {
+        let mut state = self.state.lock().expect("macro controller state poisoned");
+        if state.active_revision.is_some() {
+            bail!("macro controller already active");
+        }
+        let (saved, active_revision_lease) = self.store.acquire_current_for_run(macro_id)?;
+        state.active_revision = Some(saved.clone());
+        state.status = MacroControllerStatus::Running;
+        state.stop_requested = false;
+        state.completed_cycles = 0;
+
+        let runtime = self.runtime.clone();
+        let shared_state = Arc::clone(&self.state);
+        let (startup_sender, startup_receiver) = mpsc::channel();
+        let sink: Arc<dyn RunEventSink> = Arc::new(ControllerEventSink {
+            store: Arc::clone(&self.store),
+            buffer: Arc::clone(&self.events),
+            journal: Mutex::new(None),
+            active_run: Mutex::new(None),
+            startup: Mutex::new(Some(startup_sender.clone())),
+        });
+        let worker = match thread::Builder::new()
+            .name("macro-controller".to_string())
+            .spawn(move || {
+                let _active_revision_lease = active_revision_lease;
+                let mut first_cycle = true;
+                'cycles: loop {
+                    let result =
+                        runtime.run_streaming(saved.clone(), request.mode, Arc::clone(&sink));
+                    if first_cycle && result.is_err() {
+                        let _ = startup_sender.send(false);
+                    }
+                    first_cycle = false;
+                    let mut state = shared_state
+                        .lock()
+                        .expect("macro controller state poisoned");
+                    state.completed_cycles = state.completed_cycles.saturating_add(1);
+                    let stop = state.stop_requested
+                        || matches!(request.extent, ControllerRunExtent::Once)
+                        || result.is_err();
+                    drop(state);
+                    if stop {
+                        break;
+                    }
+                    // A controller-level continuous extent is paced even when its canonical
+                    // body contains only comments or disabled blocks.
+                    thread::sleep(Duration::from_millis(1));
+                    loop {
+                        let state = shared_state
+                            .lock()
+                            .expect("macro controller state poisoned");
+                        if state.stop_requested {
+                            break 'cycles;
+                        }
+                        let paused = state.status == MacroControllerStatus::Paused;
+                        drop(state);
+                        if !paused {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                let mut state = shared_state
+                    .lock()
+                    .expect("macro controller state poisoned");
+                state.active_revision = None;
+                state.status = MacroControllerStatus::Idle;
+                state.stop_requested = false;
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                state.active_revision = None;
+                state.status = MacroControllerStatus::Idle;
+                return Err(error).context("could not spawn macro controller worker");
+            }
+        };
+        state.worker = Some(worker);
+        match startup_receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                state.stop_requested = true;
+                Err(anyhow::anyhow!(
+                    "macro controller worker failed before startup"
+                ))
+            }
+            Err(error) => {
+                state.stop_requested = true;
+                self.runtime.emergency_stop();
+                Err(anyhow::anyhow!("macro controller startup failed: {error}"))
+            }
+        }
+    }
+
+    pub fn pause(&self) {
+        let mut state = self.state.lock().expect("macro controller state poisoned");
+        if state.active_revision.is_some() && state.status == MacroControllerStatus::Running {
+            self.runtime.pause();
+            state.status = MacroControllerStatus::Paused;
+        }
+    }
+
+    pub fn resume(&self) -> Result<()> {
+        let mut state = self.state.lock().expect("macro controller state poisoned");
+        if state.status != MacroControllerStatus::Paused {
+            bail!("macro controller is not paused");
+        }
+        // Observation-only and dry-run modes have no live target session to reauthorize.
+        self.runtime.resume();
+        state.status = MacroControllerStatus::Running;
+        Ok(())
+    }
+
+    pub fn stop(&self) {
+        let mut state = self.state.lock().expect("macro controller state poisoned");
+        if state.active_revision.is_some() {
+            state.stop_requested = true;
+            state.status = MacroControllerStatus::Stopping;
+            self.runtime.stop();
+        }
+    }
+
+    pub fn emergency_stop(&self) {
+        let mut state = self.state.lock().expect("macro controller state poisoned");
+        if state.active_revision.is_some() {
+            state.stop_requested = true;
+            state.status = MacroControllerStatus::Stopping;
+        }
+        drop(state);
+        self.runtime.emergency_stop();
+    }
+
+    pub fn active_revision(&self) -> Option<SavedRevision> {
+        self.state
+            .lock()
+            .expect("macro controller state poisoned")
+            .active_revision
+            .clone()
+    }
+
+    pub fn status(&self) -> MacroControllerStatus {
+        self.state
+            .lock()
+            .expect("macro controller state poisoned")
+            .status
+    }
+
+    pub fn completed_cycles(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("macro controller state poisoned")
+            .completed_cycles
+    }
+
+    pub fn try_next_event(&self) -> Option<RunEvent> {
+        self.events
+            .events
+            .lock()
+            .expect("controller event buffer poisoned")
+            .pop_front()
+    }
+
+    pub fn buffered_event_count(&self) -> usize {
+        self.events
+            .events
+            .lock()
+            .expect("controller event buffer poisoned")
+            .len()
+    }
+
+    pub fn wait_until_idle(&self, timeout: Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let worker = {
+                let mut state = self.state.lock().expect("macro controller state poisoned");
+                if state.status == MacroControllerStatus::Idle {
+                    state.worker.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(worker) = worker {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("macro controller worker panicked"))?;
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("timed out waiting for macro controller to stop");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -4477,10 +4863,25 @@ struct EventEmitter<'a> {
     events: Vec<RunEvent>,
     capacity: usize,
     capacity_exhausted: bool,
+    sink: Option<Arc<dyn RunEventSink>>,
+}
+
+trait RunEventSink: Send + Sync {
+    fn emit(&self, event: &RunEvent);
 }
 
 impl<'a> EventEmitter<'a> {
     fn new(clock: &'a dyn Clock, started_at: u64, run_id: String, capacity: usize) -> Self {
+        Self::with_sink(clock, started_at, run_id, capacity, None)
+    }
+
+    fn with_sink(
+        clock: &'a dyn Clock,
+        started_at: u64,
+        run_id: String,
+        capacity: usize,
+        sink: Option<Arc<dyn RunEventSink>>,
+    ) -> Self {
         Self {
             clock,
             started_at,
@@ -4490,6 +4891,7 @@ impl<'a> EventEmitter<'a> {
             events: Vec::with_capacity(capacity),
             capacity,
             capacity_exhausted: false,
+            sink,
         }
     }
 
@@ -4498,6 +4900,9 @@ impl<'a> EventEmitter<'a> {
             self.events.len() < self.capacity,
             "critical event reserve invariant violated"
         );
+        if let Some(sink) = &self.sink {
+            sink.emit(&event);
+        }
         self.events.push(event);
         if self.events.len() >= self.capacity - FINAL_EVENT_RESERVE {
             self.capacity_exhausted = true;
@@ -4699,8 +5104,14 @@ impl<'a> EventEmitter<'a> {
                 ) if previous_run == current_run && previous_block == current_block
             )
         }) {
+            if let Some(sink) = &self.sink {
+                sink.emit(&event);
+            }
             *last = event;
         } else if self.events.len() + 1 < self.capacity - FINAL_EVENT_RESERVE {
+            if let Some(sink) = &self.sink {
+                sink.emit(&event);
+            }
             self.events.push(event);
         }
     }
@@ -4796,8 +5207,14 @@ impl<'a> EventEmitter<'a> {
                 ) if previous_run == current_run && previous_block == current_block && previous_lane == current_lane
             )
         }) {
+            if let Some(sink) = &self.sink {
+                sink.emit(&event);
+            }
             *last = event;
         } else if self.events.len() + 1 < self.capacity - FINAL_EVENT_RESERVE {
+            if let Some(sink) = &self.sink {
+                sink.emit(&event);
+            }
             self.events.push(event);
         }
     }
@@ -4849,6 +5266,25 @@ mod tests {
 
     const NEGATIVE_CORPUS_SHA256: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn wait_for_controller_event(
+        controller: &MacroController,
+        predicate: impl Fn(&RunEvent) -> bool,
+    ) -> RunEvent {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(event) = controller.try_next_event() {
+                if predicate(&event) {
+                    return event;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "controller event timed out"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[derive(Debug, Default)]
     struct FakeCapture;
@@ -10070,6 +10506,207 @@ mod tests {
             status: RunStatus::Stopped,
             reason: StopReason::Completed,
         }
+    }
+
+    #[test]
+    fn editing_draft_does_not_mutate_active_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MacroStore::open(temp.path()).unwrap());
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeCapture),
+            Arc::new(FakeDetector::default()),
+            Arc::new(SystemClock::default()),
+        );
+        let controller = MacroController::new(runtime, Arc::clone(&store), 128);
+        let mut draft = fixture_definition(vec![block(
+            "wait",
+            BlockKind::Wait {
+                duration_ms: 60_000,
+            },
+        )]);
+        draft.name = "Original".to_string();
+        store.save_validated(draft.clone()).unwrap();
+
+        controller
+            .start_saved("macro", ControllerRunRequest::once(RunMode::DryRun))
+            .unwrap();
+        let started = wait_for_controller_event(&controller, |event| {
+            matches!(event, RunEvent::RunStarted { .. })
+        });
+        let active_run_id = event_run_id(&started).to_string();
+        draft.name = "Edited draft".to_string();
+
+        assert_eq!(
+            controller.active_revision().unwrap().definition.name,
+            "Original"
+        );
+        assert!(
+            store
+                .delete_macro("macro")
+                .unwrap_err()
+                .to_string()
+                .contains("active")
+        );
+        assert!(
+            store
+                .delete_run_history(&active_run_id)
+                .unwrap_err()
+                .to_string()
+                .contains("active")
+        );
+        assert!(
+            controller
+                .start_saved("macro", ControllerRunRequest::once(RunMode::DryRun))
+                .unwrap_err()
+                .to_string()
+                .contains("already active")
+        );
+        controller.stop();
+        wait_for_controller_event(&controller, |event| {
+            matches!(event, RunEvent::RunStopped { .. })
+        });
+        controller.wait_until_idle(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn controller_run_once_preserves_nested_repeat_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MacroStore::open(temp.path()).unwrap());
+        let controller = MacroController::new(fixture_runtime(), Arc::clone(&store), 128);
+        let definition = fixture_definition(vec![block(
+            "outer",
+            BlockKind::RepeatN {
+                count: 2,
+                body: vec![block(
+                    "inner",
+                    BlockKind::RepeatN {
+                        count: 3,
+                        body: vec![point_action("nested-action")],
+                    },
+                )],
+            },
+        )]);
+
+        store.save_validated(definition).unwrap();
+        controller
+            .start_saved("macro", ControllerRunRequest::once(RunMode::DryRun))
+            .unwrap();
+        let mut planned = 0;
+        loop {
+            let event = wait_for_controller_event(&controller, |_| true);
+            if matches!(event, RunEvent::ActionPlanned { .. }) {
+                planned += 1;
+            }
+            if matches!(event, RunEvent::RunStopped { .. }) {
+                break;
+            }
+        }
+
+        assert_eq!(planned, 6);
+        controller.wait_until_idle(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn continuous_dry_run_is_cooperatively_paced_bounded_and_stoppable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MacroStore::open(temp.path()).unwrap());
+        let controller = MacroController::new(fixture_runtime(), Arc::clone(&store), 64);
+        let definition = fixture_definition(vec![block(
+            "comment",
+            BlockKind::Comment {
+                text: "yield".to_string(),
+            },
+        )]);
+        store.save_validated(definition).unwrap();
+        controller
+            .start_saved("macro", ControllerRunRequest::continuous(RunMode::DryRun))
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+
+        assert!(controller.buffered_event_count() <= 64);
+        controller.stop();
+        controller.wait_until_idle(Duration::from_secs(2)).unwrap();
+        assert!(controller.completed_cycles() > 0);
+    }
+
+    #[test]
+    fn controller_emergency_stop_bypasses_normal_run_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MacroStore::open(temp.path()).unwrap());
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeCapture),
+            Arc::new(FakeDetector::default()),
+            Arc::new(SystemClock::default()),
+        );
+        let controller = MacroController::new(runtime, Arc::clone(&store), 128);
+        let definition = fixture_definition(vec![block(
+            "wait",
+            BlockKind::Wait {
+                duration_ms: 60_000,
+            },
+        )]);
+        store.save_validated(definition).unwrap();
+        controller
+            .start_saved(
+                "macro",
+                ControllerRunRequest::once(RunMode::ObservationOnly),
+            )
+            .unwrap();
+        wait_for_controller_event(&controller, |event| {
+            matches!(event, RunEvent::RunStarted { .. })
+        });
+
+        controller.pause();
+        assert_eq!(controller.status(), MacroControllerStatus::Paused);
+        controller.resume().unwrap();
+        controller.emergency_stop();
+        let stopped = wait_for_controller_event(&controller, |event| {
+            matches!(event, RunEvent::RunStopped { .. })
+        });
+
+        assert!(matches!(
+            stopped,
+            RunEvent::RunStopped {
+                reason: StopReason::EmergencyStopped,
+                ..
+            }
+        ));
+        controller.wait_until_idle(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn immediate_emergency_stop_after_start_cannot_be_reset_by_worker_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MacroStore::open(temp.path()).unwrap());
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeCapture),
+            Arc::new(FakeDetector::default()),
+            Arc::new(SystemClock::default()),
+        );
+        let controller = MacroController::new(runtime, Arc::clone(&store), 128);
+        let definition =
+            fixture_definition(vec![block("wait", BlockKind::Wait { duration_ms: 100 })]);
+        store.save_validated(definition).unwrap();
+
+        controller
+            .start_saved(
+                "macro",
+                ControllerRunRequest::once(RunMode::ObservationOnly),
+            )
+            .unwrap();
+        controller.emergency_stop();
+        let stopped = wait_for_controller_event(&controller, |event| {
+            matches!(event, RunEvent::RunStopped { .. })
+        });
+
+        assert!(matches!(
+            stopped,
+            RunEvent::RunStopped {
+                reason: StopReason::EmergencyStopped,
+                ..
+            }
+        ));
+        controller.wait_until_idle(Duration::from_secs(2)).unwrap();
     }
 
     fn event_run_id(event: &RunEvent) -> &str {

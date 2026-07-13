@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
@@ -14,12 +14,106 @@ use sha2::{Digest, Sha256};
 use super::{AssetRef, MACRO_SCHEMA_VERSION, MacroDefinition};
 
 static STORE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+static STORE_ACTIVITY: OnceLock<Mutex<HashMap<PathBuf, Weak<StoreActivity>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedRevision {
     pub definition: MacroDefinition,
     pub definition_hash: String,
     pub pinned_assets: Vec<PinnedAsset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActiveRevisionIdentity {
+    pub macro_id: String,
+    pub revision: u64,
+    pub definition_hash: String,
+}
+
+impl From<&SavedRevision> for ActiveRevisionIdentity {
+    fn from(saved: &SavedRevision) -> Self {
+        Self {
+            macro_id: saved.definition.id.clone(),
+            revision: saved.definition.revision,
+            definition_hash: saved.definition_hash.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActiveRunIdentity {
+    pub run_id: String,
+}
+
+impl ActiveRunIdentity {
+    pub fn new(run_id: &str) -> Result<Self> {
+        validate_component("run ID", run_id)?;
+        Ok(Self {
+            run_id: run_id.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedMacroSummary {
+    pub id: String,
+    pub name: String,
+    pub current_revision: u64,
+    pub definition_hash: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedRevisionSummary {
+    pub revision: u64,
+    pub definition_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunHistorySummary {
+    pub run_id: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MacroLifecycleMetadata {
+    enabled: bool,
+}
+
+#[derive(Debug, Default)]
+struct StoreActivity {
+    revisions: Mutex<HashSet<ActiveRevisionIdentity>>,
+    runs: Mutex<HashSet<ActiveRunIdentity>>,
+}
+
+pub(crate) struct ActiveRevisionLease {
+    activity: Arc<StoreActivity>,
+    identity: ActiveRevisionIdentity,
+}
+
+impl Drop for ActiveRevisionLease {
+    fn drop(&mut self) {
+        self.activity
+            .revisions
+            .lock()
+            .expect("store activity poisoned")
+            .remove(&self.identity);
+    }
+}
+
+pub(crate) struct ActiveRunLease {
+    activity: Arc<StoreActivity>,
+    identity: ActiveRunIdentity,
+}
+
+impl Drop for ActiveRunLease {
+    fn drop(&mut self) {
+        self.activity
+            .runs
+            .lock()
+            .expect("store activity poisoned")
+            .remove(&self.identity);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -726,6 +820,7 @@ pub struct MacroStore {
     root: PathBuf,
     assets: AssetStore,
     lock: Arc<Mutex<()>>,
+    activity: Arc<StoreActivity>,
     #[cfg(test)]
     fail_import_after_assets: Arc<AtomicBool>,
     #[cfg(test)]
@@ -738,6 +833,7 @@ impl MacroStore {
         fs::create_dir_all(&root)?;
         let root = root.canonicalize()?;
         let (lock, first_live_owner) = shared_store_lock(&root)?;
+        let activity = shared_store_activity(&root)?;
         let assets = AssetStore {
             root: root.join("assets"),
             identity_index: root.join("asset_identities.json"),
@@ -751,6 +847,7 @@ impl MacroStore {
             root,
             assets,
             lock,
+            activity,
             #[cfg(test)]
             fail_import_after_assets: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -780,6 +877,411 @@ impl MacroStore {
     pub fn save(&self, definition: MacroDefinition) -> Result<SavedRevision> {
         let _guard = lock_store(&self.lock)?;
         self.save_locked(definition)
+    }
+
+    /// Validates and compiles the exact immutable candidate before publishing it.
+    /// This is the application-facing save path; `save` remains the low-level
+    /// persistence primitive used by migration-free fixture and recovery tests.
+    pub fn save_validated(&self, definition: MacroDefinition) -> Result<SavedRevision> {
+        let _guard = lock_store(&self.lock)?;
+        self.save_validated_locked(definition)
+    }
+
+    fn save_validated_locked(&self, definition: MacroDefinition) -> Result<SavedRevision> {
+        validate_macro_name(&definition.name)?;
+        let directory = self.root.join("definitions").join(&definition.id);
+        if directory.join("current.json").exists() {
+            let current = self.load_current_locked(&definition.id)?;
+            if definition.revision <= current.definition.revision {
+                bail!(
+                    "validated save revision {} must be newer than current revision {}",
+                    definition.revision,
+                    current.definition.revision
+                );
+            }
+        } else if definition.revision == 0 {
+            bail!("validated save revision must be positive");
+        }
+        let candidate = self.assemble_saved_locked(definition.clone())?;
+        super::CompiledMacro::compile(candidate)
+            .context("validated save candidate does not compile")?;
+        self.save_locked(definition)
+    }
+
+    pub fn list_macros(&self) -> Result<Vec<SavedMacroSummary>> {
+        let _guard = lock_store(&self.lock)?;
+        let mut summaries = Vec::new();
+        for entry in fs::read_dir(self.root.join("definitions"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if id.starts_with(".deleting-") {
+                continue;
+            }
+            validate_component("saved macro directory", &id)?;
+            let saved = self.load_current_locked(&id)?;
+            summaries.push(SavedMacroSummary {
+                id,
+                name: saved.definition.name,
+                current_revision: saved.definition.revision,
+                definition_hash: saved.definition_hash,
+                enabled: self.load_enabled_locked(&saved.definition.id)?,
+            });
+        }
+        summaries.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(summaries)
+    }
+
+    pub fn load_current(&self, macro_id: &str) -> Result<SavedRevision> {
+        let _guard = lock_store(&self.lock)?;
+        self.load_current_locked(macro_id)
+    }
+
+    fn load_current_locked(&self, macro_id: &str) -> Result<SavedRevision> {
+        validate_component("macro ID", macro_id)?;
+        let directory = self.root.join("definitions").join(macro_id);
+        let current_path = directory.join("current.json");
+        let current_bytes = fs::read(&current_path)
+            .with_context(|| format!("current revision is unavailable for macro '{macro_id}'"))?;
+        let definition: MacroDefinition =
+            serde_json::from_slice(&current_bytes).context("current revision JSON is corrupt")?;
+        if definition.id != macro_id {
+            bail!("current revision macro ID does not match its directory");
+        }
+        let immutable_path = directory.join(format!("{}.json", definition.revision));
+        let immutable_bytes =
+            fs::read(&immutable_path).context("current immutable revision file is missing")?;
+        if current_bytes != immutable_bytes {
+            bail!("current revision does not match immutable revision bytes");
+        }
+        self.load_revision_bytes_locked(macro_id, definition.revision, immutable_bytes)
+    }
+
+    pub fn load_revision(&self, macro_id: &str, revision: u64) -> Result<SavedRevision> {
+        let _guard = lock_store(&self.lock)?;
+        self.load_revision_locked(macro_id, revision)
+    }
+
+    fn load_revision_locked(&self, macro_id: &str, revision: u64) -> Result<SavedRevision> {
+        validate_component("macro ID", macro_id)?;
+        if revision == 0 {
+            bail!("revision must be positive");
+        }
+        let path = self
+            .root
+            .join("definitions")
+            .join(macro_id)
+            .join(format!("{revision}.json"));
+        let bytes = fs::read(&path).context("immutable revision is unavailable")?;
+        self.load_revision_bytes_locked(macro_id, revision, bytes)
+    }
+
+    fn load_revision_bytes_locked(
+        &self,
+        macro_id: &str,
+        revision: u64,
+        bytes: Vec<u8>,
+    ) -> Result<SavedRevision> {
+        let directory = self.root.join("definitions").join(macro_id);
+        let path = directory.join(format!("{revision}.json"));
+        let checksum = fs::read_to_string(revision_checksum_path(&path)?)
+            .context("immutable revision checksum is unavailable")?;
+        let actual_hash = sha256_hex(&bytes);
+        if checksum.trim() != actual_hash {
+            bail!("immutable revision checksum mismatch");
+        }
+        let definition: MacroDefinition =
+            serde_json::from_slice(&bytes).context("immutable revision JSON is corrupt")?;
+        if definition.schema_version != MACRO_SCHEMA_VERSION {
+            bail!("unsupported macro schema {}", definition.schema_version);
+        }
+        if definition.id != macro_id || definition.revision != revision {
+            bail!("immutable revision identity does not match its path");
+        }
+        let saved = self.assemble_saved_locked(definition)?;
+        if saved.definition_hash != actual_hash {
+            bail!("immutable revision canonical hash mismatch");
+        }
+        super::CompiledMacro::compile(saved.clone())
+            .context("stored immutable revision does not compile")?;
+        Ok(saved)
+    }
+
+    fn assemble_saved_locked(&self, definition: MacroDefinition) -> Result<SavedRevision> {
+        validate_component("macro ID", &definition.id)?;
+        validate_identity_set(referenced_assets(&definition))?;
+        let mut pinned_assets = Vec::new();
+        let mut pinned_refs = HashSet::new();
+        for asset in referenced_assets(&definition) {
+            let bytes = self.assets.read_locked(asset)?;
+            if pinned_refs.insert(asset.clone()) {
+                pinned_assets.push(PinnedAsset {
+                    asset: asset.clone(),
+                    bytes,
+                });
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&definition)?;
+        Ok(SavedRevision {
+            definition,
+            definition_hash: sha256_hex(&bytes),
+            pinned_assets,
+        })
+    }
+
+    pub fn revision_history(&self, macro_id: &str) -> Result<Vec<SavedRevisionSummary>> {
+        let _guard = lock_store(&self.lock)?;
+        validate_component("macro ID", macro_id)?;
+        let mut revisions = Vec::new();
+        let directory = self.root.join("definitions").join(macro_id);
+        for entry in fs::read_dir(&directory).context("macro is unavailable")? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Ok(revision) = stem.parse::<u64>() else {
+                continue;
+            };
+            let saved = self.load_revision_locked(macro_id, revision)?;
+            revisions.push(SavedRevisionSummary {
+                revision,
+                definition_hash: saved.definition_hash,
+            });
+        }
+        revisions.sort_by_key(|entry| std::cmp::Reverse(entry.revision));
+        Ok(revisions)
+    }
+
+    pub fn rename_macro(
+        &self,
+        macro_id: &str,
+        expected_current_hash: &str,
+        new_name: &str,
+    ) -> Result<SavedRevision> {
+        let _guard = lock_store(&self.lock)?;
+        validate_macro_name(new_name)?;
+        let current = self.load_current_locked(macro_id)?;
+        if current.definition_hash != expected_current_hash {
+            bail!("macro changed since it was loaded");
+        }
+        let mut definition = current.definition;
+        definition.name = new_name.trim().to_string();
+        definition.revision = definition
+            .revision
+            .checked_add(1)
+            .context("macro revision overflow")?;
+        self.save_validated_locked(definition)
+    }
+
+    pub fn duplicate_macro(
+        &self,
+        source_macro_id: &str,
+        new_macro_id: &str,
+        new_name: &str,
+    ) -> Result<SavedRevision> {
+        let _guard = lock_store(&self.lock)?;
+        validate_component("new macro ID", new_macro_id)?;
+        validate_macro_name(new_name)?;
+        if self.root.join("definitions").join(new_macro_id).exists() {
+            bail!("macro ID already exists: {new_macro_id}");
+        }
+        let mut definition = self.load_current_locked(source_macro_id)?.definition;
+        definition.id = new_macro_id.to_string();
+        definition.name = new_name.trim().to_string();
+        definition.revision = 1;
+        self.save_validated_locked(definition)
+    }
+
+    pub fn set_macro_enabled(&self, macro_id: &str, enabled: bool) -> Result<()> {
+        let _guard = lock_store(&self.lock)?;
+        self.load_current_locked(macro_id)?;
+        atomic_write(
+            &self
+                .root
+                .join("definitions")
+                .join(macro_id)
+                .join("lifecycle.json"),
+            &serde_json::to_vec_pretty(&MacroLifecycleMetadata { enabled })?,
+        )
+    }
+
+    pub(crate) fn acquire_active_revision(
+        &self,
+        saved: &SavedRevision,
+    ) -> Result<ActiveRevisionLease> {
+        let identity = ActiveRevisionIdentity::from(saved);
+        let mut active = self
+            .activity
+            .revisions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("store activity poisoned"))?;
+        if !active.insert(identity.clone()) {
+            bail!("saved revision is already active");
+        }
+        drop(active);
+        Ok(ActiveRevisionLease {
+            activity: Arc::clone(&self.activity),
+            identity,
+        })
+    }
+
+    pub(crate) fn acquire_current_for_run(
+        &self,
+        macro_id: &str,
+    ) -> Result<(SavedRevision, ActiveRevisionLease)> {
+        let _guard = lock_store(&self.lock)?;
+        validate_component("macro ID", macro_id)?;
+        if !self.load_enabled_locked(macro_id)? {
+            bail!("saved macro is disabled");
+        }
+        let saved = self.load_current_locked(macro_id)?;
+        let lease = self.acquire_active_revision(&saved)?;
+        Ok((saved, lease))
+    }
+
+    pub(crate) fn acquire_active_run(&self, run_id: &str) -> Result<ActiveRunLease> {
+        let identity = ActiveRunIdentity::new(run_id)?;
+        let mut active = self
+            .activity
+            .runs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("store activity poisoned"))?;
+        if !active.insert(identity.clone()) {
+            bail!("run history is already active");
+        }
+        drop(active);
+        Ok(ActiveRunLease {
+            activity: Arc::clone(&self.activity),
+            identity,
+        })
+    }
+
+    fn load_enabled_locked(&self, macro_id: &str) -> Result<bool> {
+        let path = self
+            .root
+            .join("definitions")
+            .join(macro_id)
+            .join("lifecycle.json");
+        if !path.exists() {
+            return Ok(true);
+        }
+        let metadata: MacroLifecycleMetadata = serde_json::from_slice(&fs::read(path)?)
+            .context("macro lifecycle metadata is corrupt")?;
+        Ok(metadata.enabled)
+    }
+
+    pub fn delete_macro(&self, macro_id: &str) -> Result<()> {
+        let _guard = lock_store(&self.lock)?;
+        validate_component("macro ID", macro_id)?;
+        if self
+            .activity
+            .revisions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("store activity poisoned"))?
+            .iter()
+            .any(|active| active.macro_id == macro_id)
+        {
+            bail!("cannot delete the active macro snapshot");
+        }
+        self.load_current_locked(macro_id)?;
+        let definitions = self.root.join("definitions");
+        let source = definitions.join(macro_id);
+        let mut ordinal = 1_u64;
+        let tombstone = loop {
+            let candidate = definitions.join(format!(".deleting-{macro_id}-{ordinal}"));
+            if !candidate.exists() {
+                break candidate;
+            }
+            ordinal = ordinal
+                .checked_add(1)
+                .context("delete tombstone overflow")?;
+        };
+        fs::rename(&source, &tombstone).context("could not stage macro deletion")?;
+        if let Err(error) = fs::remove_dir_all(&tombstone) {
+            let _ = fs::rename(&tombstone, &source);
+            return Err(error).context("could not delete macro directory");
+        }
+        sync_directory(&definitions)?;
+        Ok(())
+    }
+
+    pub fn list_run_history(&self) -> Result<Vec<RunHistorySummary>> {
+        let _guard = lock_store(&self.lock)?;
+        let mut history = Vec::new();
+        for entry in fs::read_dir(self.root.join("runs"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("jsonl")
+            {
+                continue;
+            }
+            let run_id = entry
+                .path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .context("run history filename is invalid")?
+                .to_string();
+            validate_component("run ID", &run_id)?;
+            history.push(RunHistorySummary {
+                run_id,
+                bytes: entry.metadata()?.len(),
+            });
+        }
+        history.sort_by(|left, right| right.run_id.cmp(&left.run_id));
+        Ok(history)
+    }
+
+    pub fn load_run_history(&self, run_id: &str) -> Result<Vec<JournalRecord>> {
+        let _guard = lock_store(&self.lock)?;
+        validate_component("run ID", run_id)?;
+        let path = self.root.join("runs").join(format!("{run_id}.jsonl"));
+        let file = File::open(path).context("run history is unavailable")?;
+        let mut records: Vec<JournalRecord> = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            records.push(serde_json::from_str(&line).context("run history record is corrupt")?);
+        }
+        for pair in records.windows(2) {
+            if pair[0].sequence >= pair[1].sequence {
+                bail!("run history sequence is not strictly ordered");
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn delete_run_history(&self, run_id: &str) -> Result<()> {
+        let _guard = lock_store(&self.lock)?;
+        validate_component("run ID", run_id)?;
+        if self
+            .activity
+            .runs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("store activity poisoned"))?
+            .contains(&ActiveRunIdentity::new(run_id)?)
+        {
+            bail!("cannot delete active run history");
+        }
+        fs::remove_file(self.root.join("runs").join(format!("{run_id}.jsonl")))
+            .context("run history is unavailable")?;
+        Ok(())
     }
 
     fn save_locked(&self, definition: MacroDefinition) -> Result<SavedRevision> {
@@ -1512,6 +2014,20 @@ fn shared_store_lock(root: &Path) -> Result<(Arc<Mutex<()>>, bool)> {
     Ok((lock, true))
 }
 
+fn shared_store_activity(root: &Path) -> Result<Arc<StoreActivity>> {
+    let registry = STORE_ACTIVITY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .map_err(|_| anyhow::anyhow!("macro store activity registry poisoned"))?;
+    registry.retain(|_, activity| activity.strong_count() > 0);
+    if let Some(activity) = registry.get(root).and_then(Weak::upgrade) {
+        return Ok(activity);
+    }
+    let activity = Arc::new(StoreActivity::default());
+    registry.insert(root.to_path_buf(), Arc::downgrade(&activity));
+    Ok(activity)
+}
+
 fn package_file(root: &Path, relative: &Path) -> Result<PathBuf> {
     validate_package_relative(relative)?;
     let joined = root.join(relative);
@@ -1556,6 +2072,20 @@ fn validate_component(label: &str, value: &str) -> Result<()> {
         || value.contains('\\')
     {
         bail!("invalid {label}");
+    }
+    Ok(())
+}
+
+fn validate_macro_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("macro name must not be empty");
+    }
+    if trimmed.chars().count() > 200 {
+        bail!("macro name is too long");
+    }
+    if trimmed.chars().any(char::is_control) {
+        bail!("macro name contains control characters");
     }
     Ok(())
 }
@@ -3338,5 +3868,140 @@ mod tests {
         let error = store.cleanup_orphan_assets(&HashSet::new()).unwrap_err();
         assert!(error.to_string().contains("checksum filename is invalid"));
         assert!(store.assets().read(&orphan).is_ok());
+    }
+
+    #[test]
+    fn checked_lifecycle_loads_current_revision_and_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let first = store.save_validated(compilable_text_definition()).unwrap();
+        let second = store
+            .rename_macro(
+                &first.definition.id,
+                &first.definition_hash,
+                "Renamed macro",
+            )
+            .unwrap();
+
+        let summaries = store.list_macros().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "macro-one");
+        assert_eq!(summaries[0].name, "Renamed macro");
+        assert_eq!(summaries[0].current_revision, 2);
+        assert!(summaries[0].enabled);
+        assert_eq!(store.load_current("macro-one").unwrap(), second);
+        assert_eq!(store.load_revision("macro-one", 1).unwrap(), first);
+        assert_eq!(
+            store
+                .revision_history("macro-one")
+                .unwrap()
+                .iter()
+                .map(|revision| revision.revision)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+    }
+
+    #[test]
+    fn duplicate_disable_and_typed_active_delete_are_transactional() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let original = store.save_validated(compilable_text_definition()).unwrap();
+        let duplicate = store
+            .duplicate_macro(&original.definition.id, "macro-copy", "Macro copy")
+            .unwrap();
+        assert_eq!(duplicate.definition.id, "macro-copy");
+        assert_eq!(duplicate.definition.revision, 1);
+        assert_eq!(duplicate.definition.name, "Macro copy");
+        store.set_macro_enabled("macro-copy", false).unwrap();
+        assert!(
+            !store
+                .list_macros()
+                .unwrap()
+                .iter()
+                .find(|summary| summary.id == "macro-copy")
+                .unwrap()
+                .enabled
+        );
+
+        let active = store.acquire_active_revision(&duplicate).unwrap();
+        assert!(
+            store
+                .delete_macro("macro-copy")
+                .unwrap_err()
+                .to_string()
+                .contains("active")
+        );
+        assert!(store.load_current("macro-copy").is_ok());
+        drop(active);
+        store.delete_macro("macro-copy").unwrap();
+        assert!(store.load_current("macro-copy").is_err());
+        assert!(store.load_current("macro-one").is_ok());
+    }
+
+    #[test]
+    fn checked_load_fails_closed_when_current_or_checksum_is_corrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        store.save_validated(compilable_text_definition()).unwrap();
+        let current = temp
+            .path()
+            .join("macro_data/definitions/macro-one/current.json");
+        let mut definition: MacroDefinition =
+            serde_json::from_slice(&fs::read(&current).unwrap()).unwrap();
+        definition.name = "tampered".to_string();
+        fs::write(&current, serde_json::to_vec_pretty(&definition).unwrap()).unwrap();
+
+        assert!(
+            store
+                .load_current("macro-one")
+                .unwrap_err()
+                .to_string()
+                .contains("current")
+        );
+
+        fs::write(
+            temp.path()
+                .join("macro_data/definitions/macro-one/current.json"),
+            fs::read(temp.path().join("macro_data/definitions/macro-one/1.json")).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            temp.path()
+                .join("macro_data/definitions/macro-one/1.json.sha256"),
+            "0".repeat(64),
+        )
+        .unwrap();
+        assert!(store.load_current("macro-one").is_err());
+    }
+
+    #[test]
+    fn run_history_is_checked_and_active_identity_blocks_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let mut journal =
+            ready_journal(store.open_journal("run-one", JournalLimits::new(1_024, 4)));
+        journal.append(&JournalRecord {
+            sequence: 1,
+            elapsed_ms: 2,
+            kind: JournalKind::StateChange,
+            message: "started".to_string(),
+            fields: serde_json::json!({}),
+        });
+        drop(journal);
+
+        assert_eq!(store.list_run_history().unwrap()[0].run_id, "run-one");
+        assert_eq!(store.load_run_history("run-one").unwrap().len(), 1);
+        let active = store.acquire_active_run("run-one").unwrap();
+        assert!(
+            store
+                .delete_run_history("run-one")
+                .unwrap_err()
+                .to_string()
+                .contains("active")
+        );
+        drop(active);
+        store.delete_run_history("run-one").unwrap();
+        assert!(store.list_run_history().unwrap().is_empty());
     }
 }

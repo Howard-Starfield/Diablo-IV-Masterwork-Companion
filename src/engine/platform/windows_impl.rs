@@ -1,7 +1,5 @@
 use std::{
-    collections::hash_map::DefaultHasher,
     future::IntoFuture,
-    hash::{Hash, Hasher},
     path::PathBuf,
     sync::{
         Arc,
@@ -20,18 +18,13 @@ use windows::{
     Media::Ocr::OcrEngine,
     Storage::{FileAccessMode, StorageFile},
     Win32::{
-        Foundation::{
-            COLORREF, CloseHandle, FILETIME, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
-        },
+        Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
-            BLACK_BRUSH, BeginPaint, ClientToScreen, CreatePen, DeleteObject, EndPaint, FillRect,
-            GetStockObject, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, Rectangle, SelectObject, SetBkMode,
-            SetTextColor, TRANSPARENT, TextOutW,
+            BLACK_BRUSH, BeginPaint, CreatePen, DeleteObject, EndPaint, FillRect, GetStockObject,
+            NULL_BRUSH, PAINTSTRUCT, PS_SOLID, Rectangle, SelectObject, SetBkMode, SetTextColor,
+            TRANSPARENT, TextOutW,
         },
-        System::{
-            LibraryLoader::GetModuleHandleW,
-            Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
-        },
+        System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::{
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -44,9 +37,9 @@ use windows::{
             },
             WindowsAndMessaging::{
                 CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-                DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos,
-                GetSystemMetrics, GetWindowLongPtrW, HTCLIENT, IDC_CROSS, LWA_ALPHA, LoadCursorW,
-                MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SM_CXVIRTUALSCREEN,
+                DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetSystemMetrics,
+                GetWindowLongPtrW, HTCLIENT, IDC_CROSS, LWA_ALPHA, LoadCursorW, MSG, PM_REMOVE,
+                PeekMessageW, PostQuitMessage, RegisterClassW, SM_CXVIRTUALSCREEN,
                 SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOW, SetCursorPos,
                 SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, ShowWindow,
                 TranslateMessage, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
@@ -57,7 +50,7 @@ use windows::{
     },
     core::{HSTRING, PCWSTR, w},
 };
-use xcap::{Monitor, Window};
+use xcap::Monitor;
 
 use super::super::{
     automation::{
@@ -67,6 +60,10 @@ use super::super::{
     config::{MouseMovementModel, MouseMovementProfile, MouseMovementSample, MouseMovementStep},
     enchant_loop::OcrReader,
     types::{Point, Rect, ScreenImage},
+};
+use super::windows_snapshot::{
+    CanonicalWindowIdentity, Win32WindowsSnapshotSource, WindowsSnapshotSource,
+    client_rect_in_screen,
 };
 use super::windows_target::{DurableTargetHints, WindowsTargetGuard};
 
@@ -115,43 +112,9 @@ pub struct Win32ClientGeometrySource;
 
 impl WindowClientGeometrySource for Win32ClientGeometrySource {
     fn client_rect(&self, window_id: u32) -> Result<Rect> {
-        let hwnd = hwnd_from_xcap_window_id(window_id);
-        let mut client = RECT::default();
-        unsafe {
-            GetClientRect(hwnd, &mut client).with_context(|| {
-                format!("failed to query client rect for xcap window {window_id}")
-            })?;
-        }
-
-        let width = client
-            .right
-            .checked_sub(client.left)
-            .and_then(|value| u32::try_from(value).ok())
-            .context("window client width is invalid")?;
-        let height = client
-            .bottom
-            .checked_sub(client.top)
-            .and_then(|value| u32::try_from(value).ok())
-            .context("window client height is invalid")?;
-        anyhow::ensure!(width > 0 && height > 0, "window client area is empty");
-
-        let mut origin = POINT {
-            x: client.left,
-            y: client.top,
-        };
-        unsafe {
-            ClientToScreen(hwnd, &mut origin).ok().with_context(|| {
-                format!("failed to map client origin for xcap window {window_id}")
-            })?;
-        }
-        Ok(Rect::new(origin.x, origin.y, width, height))
+        client_rect_in_screen(CanonicalWindowIdentity::from_xcap_window_id(window_id))
+            .with_context(|| format!("failed to query client rect for xcap window {window_id}"))
     }
-}
-
-fn hwnd_from_xcap_window_id(window_id: u32) -> HWND {
-    // xcap publishes the low 32 bits of HWND as u32. Windows user handles are 32-bit values
-    // sign-extended to pointer width, so preserve bit 31 when reconstructing the concrete HWND.
-    HWND((window_id as i32 as isize) as *mut core::ffi::c_void)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,98 +153,42 @@ impl<G: WindowClientGeometrySource> CaptureSource for XcapWindowRegionCapture<G>
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowsXcapWindowSnapshotSource<G = Win32ClientGeometrySource> {
-    window_id: u32,
-    geometry: G,
+#[derive(Debug, Clone)]
+pub struct WindowsXcapWindowSnapshotSource<S = Win32WindowsSnapshotSource> {
+    identity: CanonicalWindowIdentity,
+    snapshots: S,
 }
 
-impl WindowsXcapWindowSnapshotSource<Win32ClientGeometrySource> {
+impl WindowsXcapWindowSnapshotSource<Win32WindowsSnapshotSource> {
     pub const fn new(window_id: u32) -> Self {
         Self {
-            window_id,
-            geometry: Win32ClientGeometrySource,
+            identity: CanonicalWindowIdentity::from_xcap_window_id(window_id),
+            snapshots: Win32WindowsSnapshotSource,
         }
     }
 }
 
-impl<G> WindowsXcapWindowSnapshotSource<G> {
-    fn with_geometry(window_id: u32, geometry: G) -> Self {
+impl<S> WindowsXcapWindowSnapshotSource<S> {
+    #[cfg(test)]
+    fn with_snapshot_source_for_test(identity: CanonicalWindowIdentity, snapshots: S) -> Self {
         Self {
-            window_id,
-            geometry,
+            identity,
+            snapshots,
         }
     }
-
-    fn target_window(&self) -> Result<Window> {
-        Window::all()?
-            .into_iter()
-            .find(|window| window.id().is_ok_and(|id| id == self.window_id))
-            .with_context(|| format!("xcap window {} is no longer available", self.window_id))
-    }
 }
 
-impl<G: WindowClientGeometrySource> WindowsXcapWindowSnapshotSource<G> {
-    fn client_rect(&self) -> Result<Rect> {
-        self.geometry.client_rect(self.window_id)
-    }
-}
-
-impl<G: WindowClientGeometrySource> AtomicFrameSnapshotSource
-    for WindowsXcapWindowSnapshotSource<G>
-{
+impl<S: WindowsSnapshotSource> AtomicFrameSnapshotSource for WindowsXcapWindowSnapshotSource<S> {
     fn snapshot(&self, requested_region: Rect) -> Result<AtomicCaptureSnapshot> {
-        let window = self.target_window()?;
-        let window_id = window.id()?;
-        let process_id = window.pid()?;
-        let process_started_at_100ns = process_started_at_100ns(process_id)?;
-        let client_rect = self.client_rect()?;
+        let snapshot = self.snapshots.snapshot(self.identity)?;
+        let client_rect = snapshot.client_rect;
         window_local_to_screen(client_rect, requested_region).with_context(|| {
-            format!("requested macro capture region is outside xcap window {window_id}")
+            format!(
+                "requested macro capture region is outside xcap window {}",
+                self.identity.window_id()
+            )
         })?;
-
-        let monitor = window.current_monitor()?;
-        let monitor_id = monitor.id()?;
-        let monitor_name = monitor.name()?;
-        let monitor_friendly_name = monitor.friendly_name()?;
-        let monitor_rect = Rect::new(
-            monitor.x()?,
-            monitor.y()?,
-            monitor.width()?,
-            monitor.height()?,
-        );
-        let scale_factor = monitor.scale_factor()?;
-        let rotation = monitor.rotation()?;
-        let dpi = (scale_factor * 96.0).round().clamp(1.0, u32::MAX as f32) as u32;
-        let display_id = format!("{monitor_id}:{monitor_name}:{monitor_friendly_name}");
-
-        Ok(AtomicCaptureSnapshot {
-            requested_region,
-            window_id: u64::from(window_id),
-            window_revision: window_revision(window_id, process_id, process_started_at_100ns),
-            process_id,
-            process_started_at_100ns,
-            client_rect,
-            geometry_revision: stable_revision(&(
-                client_rect.x,
-                client_rect.y,
-                client_rect.width,
-                client_rect.height,
-            )),
-            display_id,
-            display_profile_revision: stable_revision(&(
-                monitor_id,
-                monitor_name,
-                monitor_friendly_name,
-                monitor_rect.x,
-                monitor_rect.y,
-                monitor_rect.width,
-                monitor_rect.height,
-                scale_factor.to_bits(),
-                rotation.to_bits(),
-            )),
-            dpi,
-        })
+        Ok(snapshot.atomic_capture_snapshot(requested_region))
     }
 }
 
@@ -296,34 +203,6 @@ pub fn xcap_atomic_window_capture(window_id: u32) -> XcapAtomicWindowCapture {
         XcapWindowRegionCapture::new(window_id),
         SystemClock::default(),
     )
-}
-
-fn stable_revision(value: &impl Hash) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn window_revision(window_id: u32, process_id: u32, process_started_at_100ns: u64) -> u64 {
-    stable_revision(&(window_id, process_id, process_started_at_100ns))
-}
-
-fn process_started_at_100ns(process_id: u32) -> Result<u64> {
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
-        .with_context(|| format!("failed to open process {process_id} for identity query"))?;
-    let mut created = FILETIME::default();
-    let mut exited = FILETIME::default();
-    let mut kernel = FILETIME::default();
-    let mut user = FILETIME::default();
-    let query_result =
-        unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
-    let close_result = unsafe { CloseHandle(process) };
-    query_result
-        .with_context(|| format!("failed to query creation time for process {process_id}"))?;
-    close_result
-        .with_context(|| format!("failed to close process {process_id} identity handle"))?;
-
-    Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
 fn rect_contains(container: Rect, nested: Rect) -> bool {
@@ -1371,6 +1250,17 @@ fn cursor_pos() -> Result<Point> {
 
 #[cfg(test)]
 mod tests {
+    use image::RgbaImage;
+
+    use crate::engine::{
+        automation::{AtomicFrameCapture, Clock, TargetGuard},
+        types::ScreenImage,
+    };
+
+    use super::super::windows_snapshot::{
+        CanonicalWindowIdentity, CanonicalWindowsSnapshot, DisplayProfileInputs,
+        WindowsSnapshotSource,
+    };
     use super::*;
 
     #[derive(Debug, Clone, Copy)]
@@ -1382,6 +1272,84 @@ mod tests {
         fn client_rect(&self, _window_id: u32) -> Result<Rect> {
             Ok(self.client_rect)
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeWindowsSnapshot(CanonicalWindowsSnapshot);
+
+    impl WindowsSnapshotSource for FakeWindowsSnapshot {
+        fn snapshot(&self, identity: CanonicalWindowIdentity) -> Result<CanonicalWindowsSnapshot> {
+            anyhow::ensure!(identity == self.0.identity, "wrong canonical window identity");
+            Ok(self.0.clone())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FakeRawCapture;
+
+    impl CaptureSource for FakeRawCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            Ok(ScreenImage::new(RgbaImage::new(rect.width, rect.height)))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FixedClock;
+
+    impl Clock for FixedClock {
+        fn now_ms(&self) -> u64 {
+            123
+        }
+    }
+
+    #[test]
+    fn guard_and_atomic_capture_share_the_canonical_high_bit_window_snapshot() {
+        let identity = CanonicalWindowIdentity::from_xcap_window_id(0x8000_0001);
+        let source = FakeWindowsSnapshot(CanonicalWindowsSnapshot {
+            identity,
+            process_id: 7,
+            process_started_at_100ns: 100,
+            process_path: r#"C:\games\Diablo IV.exe"#.to_string(),
+            client_rect: Rect::new(1_208, -269, 1_008, 729),
+            dpi: 144,
+            display: DisplayProfileInputs {
+                monitor_rect: Rect::new(0, -1_080, 1_920, 1_080),
+                work_rect: Rect::new(0, -1_080, 1_920, 1_040),
+                flags: 1,
+            },
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
+        });
+        let guard = WindowsTargetGuard::with_snapshot_source_for_test(
+            identity,
+            DurableTargetHints {
+                process_path: String::new(),
+                window_class: String::new(),
+                title_contains: String::new(),
+            },
+            source.clone(),
+        );
+        let snapshots =
+            WindowsXcapWindowSnapshotSource::with_snapshot_source_for_test(identity, source);
+        let capture = AtomicFrameCapture::new(snapshots, FakeRawCapture, FixedClock);
+
+        let target = guard.snapshot().unwrap();
+        let frame = capture
+            .capture_frame(Rect::new(25, 40, 100, 80))
+            .unwrap();
+
+        assert_eq!(identity.hwnd().0 as isize, i32::MIN as isize + 1);
+        assert_eq!(frame.metadata.window_id, target.window_id);
+        assert_eq!(frame.metadata.window_revision, target.window_revision);
+        assert_eq!(frame.metadata.client_width, target.client_rect.width);
+        assert_eq!(frame.metadata.client_height, target.client_rect.height);
+        assert_eq!(frame.metadata.geometry_revision, target.geometry_revision);
+        assert_eq!(
+            frame.metadata.display_profile_revision,
+            target.display_profile_revision
+        );
+        assert_eq!(frame.metadata.dpi, target.dpi);
     }
 
     #[test]
@@ -1417,12 +1385,10 @@ mod tests {
         };
         let local = Rect::new(25, 40, 100, 80);
         let capture = XcapWindowRegionCapture::with_geometry(42, client);
-        let snapshots = WindowsXcapWindowSnapshotSource::with_geometry(42, client);
 
         let translated = capture.screen_rect(local).unwrap();
 
         assert_eq!(translated, Rect::new(1_233, -229, 100, 80));
-        assert_eq!(snapshots.client_rect().unwrap(), client.client_rect);
         assert_ne!(
             translated,
             window_local_to_screen(xcap_outer_frame, local).unwrap()
@@ -1432,18 +1398,41 @@ mod tests {
 
     #[test]
     fn xcap_window_id_reconstruction_sign_extends_windows_user_handles() {
-        assert_eq!(hwnd_from_xcap_window_id(42).0 as isize, 42);
         assert_eq!(
-            hwnd_from_xcap_window_id(0x8000_0001).0 as isize,
+            CanonicalWindowIdentity::from_xcap_window_id(42).hwnd().0 as isize,
+            42
+        );
+        assert_eq!(
+            CanonicalWindowIdentity::from_xcap_window_id(0x8000_0001)
+                .hwnd()
+                .0 as isize,
             i32::MIN as isize + 1
         );
     }
 
     #[test]
     fn window_revision_changes_when_same_hwnd_and_pid_belong_to_restarted_process() {
-        let before = window_revision(42, 7, 100);
-        let after = window_revision(42, 7, 101);
+        let identity = CanonicalWindowIdentity::from_xcap_window_id(42);
+        let before = FakeWindowsSnapshot(CanonicalWindowsSnapshot {
+            identity,
+            process_id: 7,
+            process_started_at_100ns: 100,
+            process_path: String::new(),
+            client_rect: Rect::new(0, 0, 800, 600),
+            dpi: 96,
+            display: DisplayProfileInputs {
+                monitor_rect: Rect::new(0, 0, 1_920, 1_080),
+                work_rect: Rect::new(0, 0, 1_920, 1_040),
+                flags: 1,
+            },
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
+        })
+        .0;
+        let mut after = before.clone();
+        after.process_started_at_100ns = 101;
 
-        assert_ne!(before, after);
+        assert_ne!(before.window_revision(), after.window_revision());
     }
 }

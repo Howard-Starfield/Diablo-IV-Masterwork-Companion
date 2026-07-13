@@ -8,6 +8,9 @@ mod windows_input;
 mod windows_ocr;
 #[cfg(windows)]
 #[allow(dead_code)]
+mod windows_snapshot;
+#[cfg(windows)]
+#[allow(dead_code)]
 mod windows_target;
 
 #[cfg(windows)]

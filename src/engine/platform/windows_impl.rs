@@ -1780,6 +1780,16 @@ mod tests {
     }
 
     #[test]
+    fn concrete_window_capture_build_enables_windows_graphics_capture() {
+        let manifest = include_str!("../../../Cargo.toml");
+
+        assert!(
+            manifest.contains(r#"xcap = { version = "0.9.4", features = ["wgc"] }"#),
+            "xcap Window::capture_image must use WGC rather than the GDI fallback"
+        );
+    }
+
+    #[test]
     fn guard_and_atomic_capture_share_the_canonical_high_bit_window_snapshot() {
         let identity = CanonicalWindowIdentity::from_xcap_window_id(0x8000_0001);
         let source = FakeWindowsSnapshot(CanonicalWindowsSnapshot {

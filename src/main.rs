@@ -54,14 +54,118 @@ use eframe::{
 use image::{DynamicImage, ImageFormat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use windows::{
+    Win32::{
+        Foundation::{
+            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, SetLastError, WIN32_ERROR,
+        },
+        System::Threading::CreateMutexW,
+        UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW},
+    },
+    core::{HSTRING, w},
+};
 
 const APP_WIDTH: f32 = 600.0;
 const APP_HEIGHT: f32 = 760.0;
 const CALIBRATION_BUTTON_WIDTH: f32 = 138.0;
 const ACTION_BUTTON_HEIGHT: f32 = 38.0;
+const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\BoBoCompanion.SingleInstance.v1";
+
+struct NamedMutexCreation<H> {
+    handle: H,
+    already_exists: bool,
+}
+
+trait NamedMutexBackend: Clone {
+    type Handle;
+
+    fn create(&self, name: &str) -> anyhow::Result<NamedMutexCreation<Self::Handle>>;
+    fn close(&self, handle: Self::Handle);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Win32NamedMutexBackend;
+
+impl NamedMutexBackend for Win32NamedMutexBackend {
+    type Handle = HANDLE;
+
+    fn create(&self, name: &str) -> anyhow::Result<NamedMutexCreation<Self::Handle>> {
+        let name = HSTRING::from(name);
+        unsafe { SetLastError(WIN32_ERROR(0)) };
+        let handle = unsafe { CreateMutexW(None, false, &name) }
+            .map_err(|error| anyhow::anyhow!("failed to create single-instance mutex: {error}"))?;
+        let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        Ok(NamedMutexCreation {
+            handle,
+            already_exists,
+        })
+    }
+
+    fn close(&self, handle: Self::Handle) {
+        let _ = unsafe { CloseHandle(handle) };
+    }
+}
+
+struct SingleInstanceGuard<B: NamedMutexBackend> {
+    backend: B,
+    handle: Option<B::Handle>,
+}
+
+impl<B: NamedMutexBackend> SingleInstanceGuard<B> {
+    fn acquire_with(backend: B, name: &str) -> anyhow::Result<Option<Self>> {
+        let created = backend.create(name)?;
+        if created.already_exists {
+            backend.close(created.handle);
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            backend,
+            handle: Some(created.handle),
+        }))
+    }
+}
+
+impl<B: NamedMutexBackend> Drop for SingleInstanceGuard<B> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.backend.close(handle);
+        }
+    }
+}
+
+fn show_startup_notice(message: &str) {
+    let message = HSTRING::from(message);
+    unsafe {
+        MessageBoxW(
+            None,
+            &message,
+            w!("BoBo Companion"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
 
 fn main() -> eframe::Result<()> {
     enable_per_monitor_dpi_awareness();
+
+    // Keep this guard alive for the entire UI process so staged macro revisions cannot be
+    // concurrently recovered or replaced by another application instance.
+    let _single_instance = match SingleInstanceGuard::acquire_with(
+        Win32NamedMutexBackend,
+        SINGLE_INSTANCE_MUTEX_NAME,
+    ) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            show_startup_notice("BoBo Companion is already running.");
+            return Ok(());
+        }
+        Err(error) => {
+            show_startup_notice(&format!(
+                "BoBo Companion could not establish its single-instance safety boundary:\n\n{error}"
+            ));
+            return Ok(());
+        }
+    };
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("BoBo Companion")
@@ -2394,6 +2498,8 @@ fn save_native_config(path: &PathBuf, config: &NativeConfig) -> anyhow::Result<(
 
 #[cfg(test)]
 mod routing_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::engine::macro_engine::{Limit, MatchSelectionPolicy};
 
@@ -2428,6 +2534,86 @@ mod routing_tests {
         );
         assert_eq!(bottom_surface(AppPage::Macro), BottomSurface::MacroMonitor);
         assert!(MacroPage::MONITOR_HEIGHT < APP_HEIGHT / 3.0);
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeNamedMutexBackend {
+        already_exists: bool,
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl NamedMutexBackend for FakeNamedMutexBackend {
+        type Handle = usize;
+
+        fn create(&self, _name: &str) -> anyhow::Result<NamedMutexCreation<Self::Handle>> {
+            Ok(NamedMutexCreation {
+                handle: 7,
+                already_exists: self.already_exists,
+            })
+        }
+
+        fn close(&self, _handle: Self::Handle) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn single_instance_mutex_closes_second_launch_handle_and_holds_primary_until_drop() {
+        let primary_closes = Arc::new(AtomicUsize::new(0));
+        let primary = SingleInstanceGuard::acquire_with(
+            FakeNamedMutexBackend {
+                already_exists: false,
+                closes: Arc::clone(&primary_closes),
+            },
+            "test-primary",
+        )
+        .unwrap()
+        .expect("first launch owns the named object");
+        assert_eq!(primary_closes.load(Ordering::SeqCst), 0);
+        drop(primary);
+        assert_eq!(primary_closes.load(Ordering::SeqCst), 1);
+
+        let duplicate_closes = Arc::new(AtomicUsize::new(0));
+        assert!(
+            SingleInstanceGuard::acquire_with(
+                FakeNamedMutexBackend {
+                    already_exists: true,
+                    closes: Arc::clone(&duplicate_closes),
+                },
+                "test-duplicate",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(duplicate_closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn win32_named_mutex_blocks_duplicate_until_primary_guard_drops() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!(
+            "Local\\BoBoCompanion.SingleInstance.Test.{}.{}",
+            std::process::id(),
+            nonce
+        );
+
+        let primary = SingleInstanceGuard::acquire_with(Win32NamedMutexBackend, &name)
+            .unwrap()
+            .expect("unique mutex name must be available");
+        assert!(
+            SingleInstanceGuard::acquire_with(Win32NamedMutexBackend, &name)
+                .unwrap()
+                .is_none()
+        );
+        drop(primary);
+        assert!(
+            SingleInstanceGuard::acquire_with(Win32NamedMutexBackend, &name)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

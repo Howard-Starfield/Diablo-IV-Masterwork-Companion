@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use eframe::egui::{self, Color32, Frame, Grid, RichText, Stroke, Ui};
 
@@ -159,6 +159,11 @@ pub fn project_monitor(
     projection.running_revision = Some(run.revision);
     projection.mode = Some(run.mode);
     projection.status = RunStatus::Running;
+    let run_definition = run_snapshot.and_then(|snapshot| snapshot.definition_for(&run));
+    let mut loop_container_ids = HashSet::new();
+    if let Some(definition) = run_definition {
+        collect_loop_container_ids(&definition.blocks, &mut loop_container_ids);
+    }
 
     let mut scoped_events = events[run.start_index..]
         .iter()
@@ -172,6 +177,9 @@ pub fn project_monitor(
             RunEvent::RunStarted { .. } => {}
             RunEvent::StatusChanged { status, .. } => projection.status = *status,
             RunEvent::BlockEntered { block_id, .. } => {
+                if loop_container_ids.contains(block_id.as_str()) {
+                    projection.loop_iterations_by_id.remove(block_id);
+                }
                 projection.active_block = Some(block_id.clone());
             }
             RunEvent::ActionPlanned {
@@ -218,10 +226,9 @@ pub fn project_monitor(
         }
     }
 
-    if let (Some(definition), Some(active_block)) = (
-        run_snapshot.and_then(|snapshot| snapshot.definition_for(&run)),
-        projection.active_block.as_deref(),
-    ) {
+    if let (Some(definition), Some(active_block)) =
+        (run_definition, projection.active_block.as_deref())
+    {
         if let Some(context) =
             find_block_context(&definition.blocks, active_block, &ContextPath::default())
         {
@@ -299,6 +306,43 @@ fn event_run_id(event: &RunEvent) -> &str {
         | RunEvent::PollingDelayed { run_id, .. }
         | RunEvent::Error { run_id, .. }
         | RunEvent::RunStopped { run_id, .. } => run_id,
+    }
+}
+
+fn collect_loop_container_ids<'a>(blocks: &'a [Block], ids: &mut HashSet<&'a str>) {
+    for block in blocks {
+        match &block.kind {
+            BlockKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_loop_container_ids(then_body, ids);
+                collect_loop_container_ids(else_body, ids);
+            }
+            BlockKind::RepeatN { body, .. }
+            | BlockKind::RepeatUntil { body, .. }
+            | BlockKind::Continuous { body } => {
+                ids.insert(block.id.as_str());
+                collect_loop_container_ids(body, ids);
+            }
+            BlockKind::WatchGroup { group } => {
+                for lane in &group.lanes {
+                    collect_loop_container_ids(&lane.then_body, ids);
+                }
+                if let crate::engine::macro_engine::TimeoutOutcome::RunBody { body } =
+                    &group.timeout_outcome
+                {
+                    collect_loop_container_ids(body, ids);
+                }
+            }
+            BlockKind::Observe { .. }
+            | BlockKind::Action { .. }
+            | BlockKind::Wait { .. }
+            | BlockKind::StopSuccess
+            | BlockKind::StopError { .. }
+            | BlockKind::Comment { .. } => {}
+        }
     }
 }
 
@@ -623,6 +667,14 @@ mod tests {
             id: id.to_string(),
             enabled: true,
             kind: BlockKind::Continuous { body },
+        }
+    }
+
+    fn repeat_n(id: &str, count: u32, body: Vec<Block>) -> Block {
+        Block {
+            id: id.to_string(),
+            enabled: true,
+            kind: BlockKind::RepeatN { count, body },
         }
     }
 
@@ -1037,5 +1089,47 @@ mod tests {
             assert_eq!(monitor.active_loop, None);
             assert_eq!(monitor.active_branch, None);
         }
+    }
+
+    #[test]
+    fn nested_loop_reentry_clears_only_that_invocations_prior_count() {
+        let saved = definition(
+            "alpha",
+            7,
+            vec![
+                repeat_n("sibling", 9, vec![comment("sibling-body")]),
+                continuous(
+                    "outer",
+                    vec![repeat_n("inner", 2, vec![comment("inner-body")])],
+                ),
+            ],
+        );
+        let snapshot = snapshot("run", "hash", saved);
+        let before_first_new_yield = vec![
+            started(1, "run", "alpha", 7, "hash"),
+            yielded(2, "run", "sibling", 7),
+            yielded(3, "run", "outer", 1),
+            yielded(4, "run", "inner", 2),
+            entered(5, "run", "outer"),
+            entered(6, "run", "inner"),
+            entered(7, "run", "inner-body"),
+        ];
+
+        let before = project_monitor(Some("alpha"), Some(&snapshot), &before_first_new_yield);
+
+        assert_eq!(before.active_loop.as_deref(), Some("inner"));
+        assert_eq!(before.loop_iterations, None);
+        assert_eq!(before.loop_iterations_by_id.get("inner"), None);
+        assert_eq!(before.loop_iterations_by_id.get("outer"), None);
+        assert_eq!(before.loop_iterations_by_id.get("sibling"), Some(&7));
+
+        let mut after_first_new_yield = before_first_new_yield;
+        after_first_new_yield.push(yielded(8, "run", "inner", 1));
+        let after = project_monitor(Some("alpha"), Some(&snapshot), &after_first_new_yield);
+
+        assert_eq!(after.active_loop.as_deref(), Some("inner"));
+        assert_eq!(after.loop_iterations, Some(1));
+        assert_eq!(after.loop_iterations_by_id.get("inner"), Some(&1));
+        assert_eq!(after.loop_iterations_by_id.get("sibling"), Some(&7));
     }
 }

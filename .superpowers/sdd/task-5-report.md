@@ -90,3 +90,33 @@ The unrelaxed repository-wide `cargo clippy --all-targets -- -D warnings` remain
 - No UI, background service wiring, screenshot storage, OCR implementation, or image detector implementation is added. Task 5 defines and consumes the shared capture/detector contracts only.
 - Critical event backpressure can block a producer until a consumer drains the bounded event channel. This is intentional: only polling progress may be discarded.
 - Reaching the synchronous event collector bound stops the observation-only run with an explicit safety outcome rather than silently losing critical history.
+
+## Post-Review Runtime Hardening
+
+Review remediation was implemented in `a68bd13` (`fix: harden observation runtime invariants`) without expanding Task 5 beyond observation-only execution.
+
+- Observation state is keyed by the condition's declared source ID, so a later false observation clears the source token instead of leaving stale evidence under a different owner block. Before planning a matched action, the runtime now verifies the token's source, detector family, rule ID/revision, and region ID/revision against the compiled source identity.
+- Runtime-owned bounded channels share a sticky emergency signal with the active runtime. Emergency Stop remains out of band when the command queue is full, wakes cooperative waits and pauses, and stops with `EmergencyStopped`; no input dispatch path was added.
+- Finite condition deadlines are checked before retry accounting and before every subsequent detector call. Poll sleeps are capped by the remaining deadline, so 100 ms timeouts resolve through Continue, Run Body, or Stop Error without a post-deadline observation or retry-limit substitution.
+- Detector results, including errors, are interpreted only after control and generation checks. An error returned across pause/resume is discarded as stale and the condition is re-observed.
+- Maximum runtime is checked within the paused control loop, so a paused run cannot evade the wall-clock safety limit.
+- Compilation rejects conflicting hashes for the same immutable `(asset id, revision)` identity in both referenced and pinned assets, including public deserialized `SavedRevision` input.
+
+### Remediation TDD Evidence
+
+- Stale source regression: RED planned an action from the earlier true token after a later false check; GREEN clears the declared source and blocks the action.
+- Token identity regression: RED failed to compile because identity validation did not exist; GREEN rejects mutations to every source/detector/rule/region identity field.
+- Emergency bypass regression: RED failed to compile because runtime-owned channels did not exist; GREEN proves a full command queue still wakes and stops its owning runtime.
+- Deadline regressions: RED produced safety-limit outcomes after the 10-second poll interval for all three explicit 100 ms timeout modes; GREEN resolves all three in about 100 ms with exactly one detector call.
+- Stale detector-error regression: RED stopped after one call with `TechnicalFailure`; GREEN discards the generation-crossing error, re-observes, and plans from current evidence.
+- Paused runtime regression: RED required the test fallback stop and ended `UserStopped`; GREEN ends with the maximum-runtime `SafetyLimit` while still paused.
+- Asset identity regression: RED compiled a deserialized revision containing one `(id, revision)` with two hashes; GREEN rejects it with an immutable-identity conflict.
+
+### Remediation Verification
+
+- `cargo test engine::macro_engine::runtime::tests` - 36 passed, 0 failed.
+- `cargo test engine::macro_engine::semantics::tests` - 10 passed, 0 failed.
+- `cargo test` - 125 passed, 0 failed.
+- `rustfmt --edition 2024 --check src/engine/macro_engine/observation.rs src/engine/macro_engine/runtime.rs src/engine/macro_engine/semantics.rs src/engine/macro_engine/mod.rs` - exit 0, no output.
+- `cargo clippy --all-targets -- -D warnings -A dead_code -A clippy::collapsible-if -A clippy::too-many-arguments -A clippy::default-constructed-unit-structs -A clippy::ptr-arg` - exit 0.
+- `git diff --check` - exit 0, no output.

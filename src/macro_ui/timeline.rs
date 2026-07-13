@@ -201,7 +201,12 @@ fn format_duration(duration_ms: u64) -> String {
     }
 }
 
-pub fn show(ui: &mut Ui, rows: &[TimelineRow], active_block: Option<&str>) {
+pub fn show(
+    ui: &mut Ui,
+    rows: &[TimelineRow],
+    active_block: Option<&str>,
+    selected_block: Option<&str>,
+) -> Option<String> {
     if rows.is_empty() {
         Frame::none()
             .fill(Color32::from_rgb(14, 16, 18))
@@ -220,11 +225,13 @@ pub fn show(ui: &mut Ui, rows: &[TimelineRow], active_block: Option<&str>) {
                         .color(Color32::from_gray(132)),
                 );
             });
-        return;
+        return None;
     }
 
+    let mut selected = None;
     for row in rows {
-        let active = active_block == Some(row.id.as_str());
+        let active =
+            active_block == Some(row.id.as_str()) || selected_block == Some(row.id.as_str());
         let fill = if active {
             Color32::from_rgb(58, 37, 24)
         } else if row.is_loop_marker {
@@ -237,37 +244,43 @@ pub fn show(ui: &mut Ui, rows: &[TimelineRow], active_block: Option<&str>) {
         } else {
             Stroke::new(1.0, Color32::from_rgb(47, 51, 55))
         };
-        ui.horizontal(|ui| {
-            ui.add_space(row.depth as f32 * 14.0);
-            Frame::none()
-                .fill(fill)
-                .stroke(stroke)
-                .rounding(5.0)
-                .inner_margin(egui::Margin::symmetric(9.0, 7.0))
-                .show(ui, |ui| {
-                    ui.set_min_width((ui.available_width() - 8.0).max(120.0));
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(&row.label)
-                                .monospace()
-                                .size(10.0)
-                                .strong()
-                                .color(if active {
-                                    Color32::from_rgb(255, 172, 102)
-                                } else {
-                                    Color32::from_rgb(176, 142, 104)
-                                }),
-                        );
-                        ui.label(RichText::new(&row.summary).color(if row.enabled {
-                            Color32::from_gray(211)
-                        } else {
-                            Color32::from_gray(100)
-                        }));
+        let response = ui
+            .horizontal(|ui| {
+                ui.add_space(row.depth as f32 * 14.0);
+                Frame::none()
+                    .fill(fill)
+                    .stroke(stroke)
+                    .rounding(5.0)
+                    .inner_margin(egui::Margin::symmetric(9.0, 7.0))
+                    .show(ui, |ui| {
+                        ui.set_min_width((ui.available_width() - 8.0).max(120.0));
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&row.label)
+                                    .monospace()
+                                    .size(10.0)
+                                    .strong()
+                                    .color(if active {
+                                        Color32::from_rgb(255, 172, 102)
+                                    } else {
+                                        Color32::from_rgb(176, 142, 104)
+                                    }),
+                            );
+                            ui.label(RichText::new(&row.summary).color(if row.enabled {
+                                Color32::from_gray(211)
+                            } else {
+                                Color32::from_gray(100)
+                            }));
+                        });
                     });
-                });
-        });
+            })
+            .response;
+        if row.is_selectable && response.interact(egui::Sense::click()).clicked() {
+            selected = Some(row.id.clone());
+        }
         ui.add_space(4.0);
     }
+    selected
 }
 
 #[cfg(test)]

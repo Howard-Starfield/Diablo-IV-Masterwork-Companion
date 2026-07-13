@@ -762,7 +762,7 @@ impl App for NativeApp {
                         ui.set_width((ui.available_width() - 14.0).max(0.0));
                         match self.page {
                             AppPage::Enchant => self.content(ui, ctx),
-                            AppPage::Macro => MacroPage::show(ui, &self.macro_state),
+                            AppPage::Macro => MacroPage::show(ui, &mut self.macro_state),
                         }
                     });
             });

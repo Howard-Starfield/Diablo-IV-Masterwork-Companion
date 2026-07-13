@@ -1,36 +1,57 @@
+mod editor;
+mod inspector;
 mod library;
 mod monitor;
 mod timeline;
 
+pub use editor::*;
+
 use eframe::egui::{self, Align, Button, Color32, Frame, Layout, RichText, Stroke, Ui};
 
-use crate::engine::macro_engine::{MacroDefinition, RunEvent, ValidationProblem, validate_macro};
+use crate::engine::macro_engine::{RunEvent, ValidationProblem};
 
 use library::{MacroLibraryRow, project_definition};
 use monitor::{MonitorProjection, RunDefinitionSnapshot, project_last_completion, project_monitor};
 use timeline::{TimelineRow, project_timeline};
 
-/// Read-only data accepted by the Macro page. It intentionally owns no runtime command sender,
-/// capture service, mouse controller, or platform input handle.
+/// Canonical editor state. It intentionally owns no runtime command sender, capture service,
+/// mouse controller, or platform input handle.
 #[derive(Debug)]
 pub struct MacroPageState {
-    pub definition: Option<MacroDefinition>,
+    pub draft: Option<EditorDraft>,
     pub saved_revision: Option<u64>,
     pub enabled: bool,
     pub running_snapshot: Option<RunDefinitionSnapshot>,
     pub runtime_events: Vec<RunEvent>,
+    pub selected_block_id: Option<String>,
+    pub pending_inspector_intent: Option<inspector::InspectorIntent>,
+    pub editor_feedback: Option<String>,
+    pending_conversion: Option<PendingConversion>,
 }
 
 impl Default for MacroPageState {
     fn default() -> Self {
         Self {
-            definition: None,
+            draft: None,
             saved_revision: None,
             enabled: true,
             running_snapshot: None,
             runtime_events: Vec::new(),
+            selected_block_id: None,
+            pending_inspector_intent: None,
+            editor_feedback: None,
+            pending_conversion: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PendingConversion {
+    block_id: String,
+    preview: ConversionPreview,
+    required_values: Vec<(String, String)>,
+    command: EditorCommand,
+    structural_children: bool,
 }
 
 #[derive(Debug, Default)]
@@ -39,9 +60,18 @@ pub struct MacroPage;
 impl MacroPage {
     pub const MONITOR_HEIGHT: f32 = 176.0;
 
-    pub fn show(ui: &mut Ui, state: &MacroPageState) {
+    pub fn show(ui: &mut Ui, state: &mut MacroPageState) {
+        if let Some(draft) = &mut state.draft {
+            draft.editability = if state.running_snapshot.is_some() {
+                DraftEditability::Running {
+                    revision: draft.definition.revision,
+                }
+            } else {
+                DraftEditability::Editable
+            };
+        }
         let selected_macro_id = state
-            .definition
+            .draft
             .as_ref()
             .map(|definition| definition.id.as_str());
         let monitor = project_monitor(
@@ -52,12 +82,12 @@ impl MacroPage {
         let last_completion = selected_macro_id
             .and_then(|macro_id| project_last_completion(&state.runtime_events, macro_id));
         let problems = state
-            .definition
+            .draft
             .as_ref()
-            .map(validate_macro)
+            .map(editor_validation_problems)
             .unwrap_or_default();
         let library_rows = state
-            .definition
+            .draft
             .as_ref()
             .map(|definition| {
                 vec![project_definition(
@@ -71,7 +101,7 @@ impl MacroPage {
             })
             .unwrap_or_default();
         let timeline_rows = state
-            .definition
+            .draft
             .as_ref()
             .map(|definition| project_timeline(&definition.blocks))
             .unwrap_or_default();
@@ -80,15 +110,26 @@ impl MacroPage {
         ui.vertical(|ui| {
             title(ui);
             ui.add_space(8.0);
-            status_strip(ui, state, &monitor, &problems);
+            if let Some(target) = status_strip(ui, state, &monitor, &problems) {
+                state.selected_block_id = Some(target);
+            }
             ui.add_space(8.0);
-            workspace(ui, state, &library_rows, &timeline_rows, &monitor);
+            if let Some(target) = workspace(
+                ui,
+                state,
+                &library_rows,
+                &timeline_rows,
+                &monitor,
+                &problems,
+            ) {
+                state.selected_block_id = Some(target);
+            }
         });
     }
 
     pub fn show_monitor(ui: &mut Ui, state: &MacroPageState) {
         let selected_macro_id = state
-            .definition
+            .draft
             .as_ref()
             .map(|definition| definition.id.as_str());
         let monitor = project_monitor(
@@ -118,7 +159,7 @@ fn title(ui: &mut Ui) {
                     );
                     ui.label(
                         RichText::new(
-                            "Observe, arbitrate, then act — one immutable revision at a time",
+                            "Observe, arbitrate, then act - one immutable revision at a time",
                         )
                         .size(12.0)
                         .color(Color32::from_gray(138)),
@@ -126,7 +167,7 @@ fn title(ui: &mut Ui) {
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new("READ-ONLY SHELL")
+                        RichText::new("STRUCTURED EDITOR")
                             .monospace()
                             .size(10.0)
                             .strong()
@@ -139,10 +180,11 @@ fn title(ui: &mut Ui) {
 
 fn status_strip(
     ui: &mut Ui,
-    state: &MacroPageState,
+    state: &mut MacroPageState,
     monitor: &MonitorProjection,
     problems: &[ValidationProblem],
-) {
+) -> Option<String> {
+    let mut navigate = None;
     Frame::none()
         .fill(Color32::from_rgb(17, 20, 22))
         .stroke(Stroke::new(1.0, Color32::from_rgb(48, 52, 55)))
@@ -154,7 +196,7 @@ fn status_strip(
                     ui,
                     "TARGET",
                     state
-                        .definition
+                        .draft
                         .as_ref()
                         .map(|definition| definition.target.title_contains.as_str())
                         .filter(|title| !title.is_empty())
@@ -166,11 +208,11 @@ fn status_strip(
                     ui,
                     "DISPLAY",
                     state
-                        .definition
+                        .draft
                         .as_ref()
                         .map(|definition| {
                             format!(
-                                "{}×{} · {} DPI",
+                                "{}x{} | {} DPI",
                                 definition.target.captured_client_width,
                                 definition.target.captured_client_height,
                                 definition.target.captured_dpi
@@ -184,7 +226,7 @@ fn status_strip(
                 status_fact(
                     ui,
                     "VALIDATION",
-                    if state.definition.is_none() {
+                    if state.draft.is_none() {
                         "No definition"
                     } else if problems.is_empty() {
                         "Valid"
@@ -195,7 +237,20 @@ fn status_strip(
             });
             ui.add_space(9.0);
             ui.horizontal_wrapped(|ui| {
-                for label in ["Validate", "Dry Run", "Run Once", "Run", "Pause", "Stop"] {
+                if state.draft.is_none() && ui.button("Create starter draft").clicked() {
+                    state.draft = Some(EditorDraft::new(starter_macro_definition()));
+                    state.selected_block_id = Some("observe-1".into());
+                    state.editor_feedback =
+                        Some("Created an unsaved starter draft for editor authoring.".into());
+                }
+                let can_edit = state
+                    .draft
+                    .as_ref()
+                    .is_some_and(|draft| matches!(draft.editability, DraftEditability::Editable));
+                if ui.add_enabled(can_edit, Button::new("Validate")).clicked() {
+                    let _ = dispatch_editor_command(state, EditorCommand::MarkValidated);
+                }
+                for label in ["Dry Run", "Run Once", "Run", "Pause", "Stop"] {
                     ui.add_enabled(false, Button::new(label));
                 }
                 ui.label(
@@ -203,8 +258,80 @@ fn status_strip(
                         .size(10.0)
                         .color(Color32::from_gray(107)),
                 );
+                if let Some(target) = inspector::problem_navigation_target(problems, 0) {
+                    if ui.small_button("Open first problem").clicked() {
+                        navigate = Some(target);
+                    }
+                }
             });
         });
+    navigate
+}
+
+fn starter_macro_definition() -> crate::engine::macro_engine::MacroDefinition {
+    use crate::engine::macro_engine::*;
+    use crate::engine::types::RectRatio;
+    MacroDefinition {
+        schema_version: MACRO_SCHEMA_VERSION,
+        id: "starter-macro".into(),
+        name: "Starter Macro".into(),
+        revision: 1,
+        target: TargetProfile {
+            process_path: String::new(),
+            window_class: String::new(),
+            title_contains: "Diablo IV".into(),
+            captured_client_width: 1280,
+            captured_client_height: 720,
+            captured_dpi: 96,
+        },
+        regions: vec![RegionDefinition {
+            id: "starter-region".into(),
+            revision: 1,
+            rect: RectRatio {
+                x: 0.25,
+                y: 0.25,
+                width: 0.5,
+                height: 0.2,
+            },
+        }],
+        points: vec![],
+        text_rules: vec![TextRule {
+            id: "starter-text".into(),
+            revision: 1,
+            region_id: "starter-region".into(),
+            language: "en-US".into(),
+            preprocess: PreprocessProfile::Grayscale,
+            expected: "Edit expected text".into(),
+            match_mode: TextMatchMode::Contains,
+            threshold: 0.9,
+            case_sensitive: false,
+            allow_cross_line: false,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 250,
+            timeout_ms: Limit::Unlimited,
+            stable_frames: 2,
+        }],
+        image_rules: vec![],
+        blocks: vec![Block {
+            id: "observe-1".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "observe-1".into(),
+                    rule_id: "starter-text".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        }],
+        safety: SafetyPolicy {
+            max_runtime_ms: Limit::Unlimited,
+            max_clicks: Limit::Unlimited,
+            max_observation_retries: Limit::Unlimited,
+            max_observations_per_second: 20,
+            minimum_click_interval_ms: 100,
+            focus_loss: FocusLossPolicy::Stop,
+        },
+    }
 }
 
 fn status_fact(ui: &mut Ui, label: &str, value: &str) {
@@ -227,7 +354,7 @@ fn status_fact(ui: &mut Ui, label: &str, value: &str) {
 
 fn revision_summary(state: &MacroPageState, monitor: &MonitorProjection) -> String {
     let draft = state
-        .definition
+        .draft
         .as_ref()
         .map(|definition| definition.revision.to_string())
         .unwrap_or_else(|| "--".to_string());
@@ -239,16 +366,28 @@ fn revision_summary(state: &MacroPageState, monitor: &MonitorProjection) -> Stri
         .running_revision
         .map(|revision| revision.to_string())
         .unwrap_or_else(|| "--".to_string());
-    format!("draft {draft} · saved {saved} · running {running}")
+    format!("draft {draft} | saved {saved} | running {running}")
 }
 
 fn workspace(
     ui: &mut Ui,
-    state: &MacroPageState,
+    state: &mut MacroPageState,
     library_rows: &[MacroLibraryRow],
     timeline_rows: &[TimelineRow],
     monitor: &MonitorProjection,
-) {
+    problems: &[ValidationProblem],
+) -> Option<String> {
+    let mut selection = None;
+    let selected_owned = state.selected_block_id.clone();
+    let selected = selected_owned.as_deref();
+    let projection = state
+        .draft
+        .as_ref()
+        .and_then(|definition| {
+            selected.map(|id| inspector::project_inspector(definition, id, problems))
+        })
+        .unwrap_or(inspector::InspectorProjection::Empty);
+    let editable = state.running_snapshot.is_none();
     if ui.available_width() >= 900.0 {
         ui.columns(3, |columns| {
             section(&mut columns[0], "LIBRARY", |ui| {
@@ -256,15 +395,21 @@ fn workspace(
                     ui,
                     library_rows,
                     state
-                        .definition
+                        .draft
                         .as_ref()
                         .map(|definition| definition.id.as_str()),
                 );
             });
             section(&mut columns[1], "EVENT TIMELINE", |ui| {
-                timeline::show(ui, timeline_rows, monitor.active_block.as_deref());
+                editor_toolbar(ui, state);
+                selection =
+                    timeline::show(ui, timeline_rows, monitor.active_block.as_deref(), selected);
             });
-            section(&mut columns[2], "INSPECTOR", inspector_empty);
+            section(&mut columns[2], "INSPECTOR", |ui| {
+                if let Some(intent) = inspector::show(ui, &projection, editable) {
+                    handle_inspector_intent(state, intent);
+                }
+            });
         });
     } else {
         section(ui, "LIBRARY", |ui| {
@@ -272,17 +417,1181 @@ fn workspace(
                 ui,
                 library_rows,
                 state
-                    .definition
+                    .draft
                     .as_ref()
                     .map(|definition| definition.id.as_str()),
             );
         });
         ui.add_space(8.0);
         section(ui, "EVENT TIMELINE", |ui| {
-            timeline::show(ui, timeline_rows, monitor.active_block.as_deref());
+            editor_toolbar(ui, state);
+            selection =
+                timeline::show(ui, timeline_rows, monitor.active_block.as_deref(), selected);
         });
         ui.add_space(8.0);
-        section(ui, "INSPECTOR", inspector_empty);
+        section(ui, "INSPECTOR", |ui| {
+            if let Some(intent) = inspector::show(ui, &projection, editable) {
+                handle_inspector_intent(state, intent);
+            }
+        });
+    }
+    selection
+}
+
+fn dispatch_editor_command(
+    state: &mut MacroPageState,
+    command: EditorCommand,
+) -> Result<EditOutcome, EditorError> {
+    let result = state
+        .draft
+        .as_mut()
+        .ok_or_else(|| EditorError::MissingBlock("no draft".into()))
+        .and_then(|draft| apply_editor_command(draft, command));
+    state.editor_feedback = Some(match &result {
+        Ok(EditOutcome::Changed) => "Draft updated; validation required.".into(),
+        Ok(EditOutcome::Validated) => "Draft validated.".into(),
+        Ok(EditOutcome::NoChange) => "No change.".into(),
+        Err(error) => format!("Edit rejected: {error:?}"),
+    });
+    result
+}
+
+fn handle_inspector_intent(state: &mut MacroPageState, intent: inspector::InspectorIntent) {
+    match inspector_editor_command(state.draft.as_ref(), &intent) {
+        Ok(Some(command)) => {
+            let _ = dispatch_editor_command(state, command);
+        }
+        Ok(None) => state.pending_inspector_intent = Some(intent),
+        Err(message) => state.editor_feedback = Some(message),
+    }
+}
+
+fn inspector_editor_command(
+    draft: Option<&EditorDraft>,
+    intent: &inspector::InspectorIntent,
+) -> Result<Option<EditorCommand>, String> {
+    use inspector::InspectorIntent;
+    let path = |block_id: &str| {
+        draft
+            .and_then(|draft| locate_block_path(draft, block_id))
+            .ok_or_else(|| format!("Selected block '{block_id}' is no longer available."))
+    };
+    let command = match intent {
+        InspectorIntent::TestOcr { .. }
+        | InspectorIntent::TestImage { .. }
+        | InspectorIntent::RecaptureRegion { .. } => return Ok(None),
+        InspectorIntent::InvalidEdit { message } => return Err(message.clone()),
+        InspectorIntent::ReplaceTextRule { rule } => {
+            EditorCommand::ReplaceTextRule { rule: rule.clone() }
+        }
+        InspectorIntent::ReplaceImageRule { rule } => {
+            EditorCommand::ReplaceImageRule { rule: rule.clone() }
+        }
+        InspectorIntent::SetConditionMode { block_id, mode } => EditorCommand::SetConditionMode {
+            path: path(block_id)?,
+            mode: mode.clone(),
+        },
+        InspectorIntent::SetRepeatUntilMax { block_id, max } => EditorCommand::SetRepeatUntilMax {
+            path: path(block_id)?,
+            max_iterations: max.clone(),
+        },
+        InspectorIntent::SetWaitDuration {
+            block_id,
+            duration_ms,
+        } => EditorCommand::SetWaitDuration {
+            path: path(block_id)?,
+            duration_ms: *duration_ms,
+        },
+        InspectorIntent::SetRepeatCount { block_id, count } => EditorCommand::SetRepeatCount {
+            path: path(block_id)?,
+            count: *count,
+        },
+        InspectorIntent::SetWatchSettings {
+            block_id,
+            timeout_ms,
+            cooldown_ms,
+        } => EditorCommand::SetWatchSettings {
+            path: path(block_id)?,
+            timeout_ms: timeout_ms.clone(),
+            cooldown_ms: *cooldown_ms,
+        },
+    };
+    Ok(Some(command))
+}
+
+fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
+    let editable = state
+        .draft
+        .as_ref()
+        .is_some_and(|draft| matches!(draft.editability, DraftEditability::Editable));
+    let selected = state.selected_block_id.clone();
+    if let Some(feedback) = &state.editor_feedback {
+        ui.label(
+            RichText::new(feedback)
+                .size(10.0)
+                .color(Color32::from_rgb(196, 154, 106)),
+        );
+    }
+    if let Some(intent) = state.pending_inspector_intent.clone() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!("Pending observation intent: {intent:?}"))
+                    .size(10.0)
+                    .color(Color32::from_gray(150)),
+            );
+            if ui.small_button("Clear").clicked() {
+                state.pending_inspector_intent = None;
+            }
+        });
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui.add_enabled(editable, Button::new("Undo")).clicked() {
+            let _ = dispatch_editor_command(state, EditorCommand::Undo);
+        }
+        if ui.add_enabled(editable, Button::new("+ Note")).clicked() {
+            if let Some(draft) = &state.draft {
+                let block = crate::engine::macro_engine::Block {
+                    id: next_unique_id(draft, "note"),
+                    enabled: true,
+                    kind: crate::engine::macro_engine::BlockKind::Comment {
+                        text: "New step".into(),
+                    },
+                };
+                let target = InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: draft.blocks.len(),
+                };
+                let _ =
+                    dispatch_editor_command(state, EditorCommand::InsertBlock { target, block });
+            }
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        for (label, kind) in [
+            ("+ Observe", PaletteKind::Observe),
+            ("+ Action", PaletteKind::Action),
+            ("+ IF", PaletteKind::If),
+            ("+ Repeat", PaletteKind::Repeat),
+            ("+ Watch", PaletteKind::Watch),
+            ("+ Wait", PaletteKind::Wait),
+            ("+ Stop", PaletteKind::Stop),
+        ] {
+            if ui.add_enabled(editable, Button::new(label)).clicked() {
+                let command = state
+                    .draft
+                    .as_ref()
+                    .ok_or_else(|| "No draft is open.".to_string())
+                    .and_then(|draft| palette_command(draft, selected.as_deref(), kind));
+                match command {
+                    Ok(command) => {
+                        let _ = dispatch_editor_command(state, command);
+                    }
+                    Err(message) => state.editor_feedback = Some(message),
+                }
+            }
+        }
+    });
+    let Some(selected) = selected else { return };
+    if let Some((group_id, index, len)) = state
+        .draft
+        .as_ref()
+        .and_then(|draft| locate_watch_lane(draft, &selected))
+    {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(editable && index > 0, Button::new("Lane up"))
+                .clicked()
+            {
+                let _ = dispatch_editor_command(
+                    state,
+                    EditorCommand::MoveLane {
+                        group_id: group_id.clone(),
+                        lane_id: selected.clone(),
+                        to_index: index - 1,
+                    },
+                );
+            }
+            if ui
+                .add_enabled(editable && index + 1 < len, Button::new("Lane down"))
+                .clicked()
+            {
+                let _ = dispatch_editor_command(
+                    state,
+                    EditorCommand::MoveLane {
+                        group_id,
+                        lane_id: selected.clone(),
+                        to_index: index + 1,
+                    },
+                );
+            }
+        });
+        return;
+    }
+    let Some(path) = state
+        .draft
+        .as_ref()
+        .and_then(|draft| locate_block_path(draft, &selected))
+    else {
+        return;
+    };
+    let Some((index, len)) = state
+        .draft
+        .as_ref()
+        .and_then(|draft| sibling_position(draft, &path))
+    else {
+        return;
+    };
+    let block = state
+        .draft
+        .as_ref()
+        .and_then(|draft| block_at_path(draft, &path))
+        .cloned();
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(editable && index > 0, Button::new("Up"))
+            .clicked()
+        {
+            let _ = dispatch_editor_command(
+                state,
+                EditorCommand::ReorderSibling {
+                    path: path.clone(),
+                    to_index: index - 1,
+                },
+            );
+        }
+        if ui
+            .add_enabled(editable && index + 1 < len, Button::new("Down"))
+            .clicked()
+        {
+            let _ = dispatch_editor_command(
+                state,
+                EditorCommand::ReorderSibling {
+                    path: path.clone(),
+                    to_index: index + 1,
+                },
+            );
+        }
+        if let Some(block) = &block {
+            if ui
+                .add_enabled(
+                    editable,
+                    Button::new(if block.enabled { "Disable" } else { "Enable" }),
+                )
+                .clicked()
+            {
+                let _ = dispatch_editor_command(
+                    state,
+                    EditorCommand::SetBlockEnabled {
+                        path: path.clone(),
+                        enabled: !block.enabled,
+                    },
+                );
+            }
+        }
+        if ui.add_enabled(editable, Button::new("Duplicate")).clicked() {
+            let _ = dispatch_editor_command(
+                state,
+                EditorCommand::DuplicateBlock {
+                    source: path.clone(),
+                    target: InsertionTarget {
+                        container: path.container.clone(),
+                        index: index + 1,
+                    },
+                },
+            );
+        }
+        if !matches!(path.container, ContainerPath::Root)
+            && ui
+                .add_enabled(editable, Button::new("Move to root"))
+                .clicked()
+        {
+            let root = state
+                .draft
+                .as_ref()
+                .map(|draft| draft.blocks.len())
+                .unwrap_or(0);
+            let _ = dispatch_editor_command(
+                state,
+                EditorCommand::MoveBlock {
+                    source: path.clone(),
+                    target: InsertionTarget {
+                        container: ContainerPath::Root,
+                        index: root,
+                    },
+                },
+            );
+        }
+    });
+    if let Some(block) = block {
+        ui.horizontal_wrapped(|ui| match block.kind {
+            crate::engine::macro_engine::BlockKind::RepeatN { .. }
+            | crate::engine::macro_engine::BlockKind::RepeatUntil { .. }
+            | crate::engine::macro_engine::BlockKind::Continuous { .. } => {
+                if ui
+                    .add_enabled(editable, Button::new("Delete loop + contents"))
+                    .clicked()
+                {
+                    let _ = dispatch_editor_command(
+                        state,
+                        EditorCommand::RemoveBlock {
+                            path: path.clone(),
+                            loop_choice: Some(LoopDeletionChoice::DeleteWithContents),
+                        },
+                    );
+                }
+                if ui
+                    .add_enabled(editable, Button::new("Keep contents"))
+                    .clicked()
+                {
+                    let _ = dispatch_editor_command(
+                        state,
+                        EditorCommand::RemoveBlock {
+                            path: path.clone(),
+                            loop_choice: Some(LoopDeletionChoice::KeepContents),
+                        },
+                    );
+                }
+            }
+            _ => {
+                if ui.add_enabled(editable, Button::new("Delete")).clicked() {
+                    let _ = dispatch_editor_command(
+                        state,
+                        EditorCommand::RemoveBlock {
+                            path: path.clone(),
+                            loop_choice: None,
+                        },
+                    );
+                }
+            }
+        });
+        if let ContainerPath::IfThen { ref if_id } | ContainerPath::IfElse { ref if_id } =
+            path.container
+        {
+            let branch = if matches!(path.container, ContainerPath::IfThen { .. }) {
+                IfBranch::Then
+            } else {
+                IfBranch::Else
+            };
+            if ui
+                .add_enabled(editable, Button::new("Transfer THEN / ELSE"))
+                .clicked()
+            {
+                let _ = dispatch_editor_command(
+                    state,
+                    EditorCommand::TransferIfBranch {
+                        if_id: if_id.clone(),
+                        branch,
+                        block_id: path.block_id.clone(),
+                        to_index: 0,
+                    },
+                );
+            }
+        }
+        if state
+            .pending_conversion
+            .as_ref()
+            .is_some_and(|pending| pending.block_id == block.id)
+        {
+            let mut pending = state.pending_conversion.take().expect("checked pending");
+            conversion_preview_ui(ui, &mut pending);
+            let valid = state
+                .draft
+                .as_ref()
+                .is_some_and(|draft| pending_conversion_valid(draft, &pending));
+            let mut apply = false;
+            let mut cancel = false;
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(editable && valid, Button::new("Apply conversion"))
+                    .clicked()
+                {
+                    apply = true;
+                }
+                if ui.small_button("Cancel conversion").clicked() {
+                    cancel = true;
+                }
+            });
+            if !valid {
+                ui.label(
+                    RichText::new("Complete valid required values before applying.")
+                        .color(Color32::from_rgb(224, 112, 75)),
+                );
+            }
+            state.pending_conversion = Some(pending);
+            if apply {
+                let _ = confirm_pending_conversion(state);
+            } else if cancel {
+                cancel_pending_conversion(state);
+            }
+        } else {
+            let choices = state
+                .draft
+                .as_ref()
+                .map(|draft| conversion_choices(draft, &block, &path))
+                .unwrap_or_default();
+            ui.horizontal_wrapped(|ui| {
+                for (label, preview) in choices {
+                    if ui.add_enabled(editable, Button::new(label)).clicked() {
+                        state.pending_conversion = Some(preview);
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                for (label, kind) in [
+                    ("Replace as Wait", ReplacementKind::Wait),
+                    ("Replace as Note", ReplacementKind::Note),
+                    ("Replace as Stop", ReplacementKind::Stop),
+                ] {
+                    if ui.add_enabled(editable, Button::new(label)).clicked() {
+                        state.pending_conversion =
+                            Some(replace_block_preview(&block, path.clone(), kind));
+                    }
+                }
+            });
+        }
+    }
+}
+
+fn conversion_preview_ui(ui: &mut Ui, pending: &mut PendingConversion) {
+    let (preserved, required, removed, reason) = match &pending.preview {
+        ConversionPreview::Compatible {
+            preserved_fields,
+            required_fields,
+            removed_fields,
+        } => (
+            preserved_fields.join(", "),
+            required_fields.join(", "),
+            removed_fields.join(", "),
+            None,
+        ),
+        ConversionPreview::ReplaceRequired { reason, .. } => {
+            (String::new(), String::new(), String::new(), Some(*reason))
+        }
+    };
+    if let Some(reason) = reason {
+        ui.label(RichText::new(reason).color(Color32::from_rgb(224, 112, 75)));
+    }
+    if !preserved.is_empty() {
+        ui.label(format!("Preserved: {preserved}"));
+    }
+    if !required.is_empty() {
+        ui.label(format!("Required: {required}"));
+    }
+    if !removed.is_empty() {
+        ui.label(format!("Removed (undo only): {removed}"));
+    }
+    for (field, value) in &pending.required_values {
+        ui.label(format!("{field}: {value}"));
+    }
+    match &mut pending.command {
+        EditorCommand::ConvertBlock {
+            target: ConversionTarget::RepeatN { count },
+            ..
+        } => {
+            ui.horizontal(|ui| {
+                ui.label("Count");
+                ui.add(egui::DragValue::new(count).clamp_range(0..=u32::MAX));
+            });
+            pending.required_values = vec![("count".into(), count.to_string())];
+        }
+        EditorCommand::ConvertBlock {
+            target:
+                ConversionTarget::RepeatUntil {
+                    max_iterations: crate::engine::macro_engine::Limit::Finite(maximum),
+                    ..
+                },
+            ..
+        } => {
+            ui.horizontal(|ui| {
+                ui.label("Max iterations");
+                ui.add(egui::DragValue::new(maximum).clamp_range(0..=u64::MAX));
+            });
+            pending.required_values = vec![("max_iterations".into(), maximum.to_string())];
+        }
+        EditorCommand::ReplaceBlock { replacement, .. } => match &mut replacement.kind {
+            crate::engine::macro_engine::BlockKind::Wait { duration_ms } => {
+                ui.horizontal(|ui| {
+                    ui.label("Duration ms");
+                    ui.add(egui::DragValue::new(duration_ms).clamp_range(0..=u64::MAX));
+                });
+                pending.required_values = vec![("duration_ms".into(), duration_ms.to_string())];
+            }
+            crate::engine::macro_engine::BlockKind::Comment { text } => {
+                ui.horizontal(|ui| {
+                    ui.label("Text");
+                    ui.text_edit_singleline(text);
+                });
+                pending.required_values = vec![("text".into(), text.clone())];
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    if pending.structural_children {
+        let disposition = match &pending.command {
+            EditorCommand::ReplaceBlock {
+                children: ChildDisposition::KeepOwnedContents,
+                ..
+            } => "Keep",
+            EditorCommand::ReplaceBlock {
+                children: ChildDisposition::DeleteOwnedContents,
+                ..
+            } => "Delete",
+            _ => "Not applicable",
+        };
+        ui.label(format!("Selected child disposition: {disposition}"));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Owned children");
+            if ui.button("Keep").clicked() {
+                if let EditorCommand::ReplaceBlock { children, .. } = &mut pending.command {
+                    *children = ChildDisposition::KeepOwnedContents;
+                }
+            }
+            if ui.button("Delete").clicked() {
+                if let EditorCommand::ReplaceBlock { children, .. } = &mut pending.command {
+                    *children = ChildDisposition::DeleteOwnedContents;
+                }
+            }
+        });
+    }
+}
+
+fn pending_conversion_valid(draft: &EditorDraft, pending: &PendingConversion) -> bool {
+    use crate::engine::macro_engine::{BlockKind, Limit};
+    match &pending.command {
+        EditorCommand::ConvertBlock { target, .. } => match target {
+            ConversionTarget::ClickPoint { point_id, .. } => {
+                draft.points.iter().any(|point| point.id == *point_id)
+            }
+            ConversionTarget::ClickRegion { region_id, .. } => {
+                draft.regions.iter().any(|region| region.id == *region_id)
+            }
+            ConversionTarget::RepeatN { count } => *count > 0,
+            ConversionTarget::RepeatUntil {
+                condition,
+                max_iterations,
+            } => {
+                let max_valid = !matches!(max_iterations, Limit::Finite(0));
+                let source_id = match condition {
+                    crate::engine::macro_engine::Condition::Text {
+                        source_block_id, ..
+                    }
+                    | crate::engine::macro_engine::Condition::Image {
+                        source_block_id, ..
+                    } => source_block_id,
+                };
+                max_valid
+                    && locate_block_path(draft, source_id)
+                        .and_then(|path| block_at_path(draft, &path))
+                        .is_some_and(|block| matches!(block.kind, BlockKind::Observe { .. }))
+            }
+            _ => true,
+        },
+        EditorCommand::ReplaceBlock { replacement, .. } => match &replacement.kind {
+            BlockKind::Wait { duration_ms } => *duration_ms > 0,
+            BlockKind::Comment { text } => !text.trim().is_empty(),
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
+fn confirm_pending_conversion(state: &mut MacroPageState) -> Result<EditOutcome, EditorError> {
+    let pending = state
+        .pending_conversion
+        .take()
+        .ok_or_else(|| EditorError::MissingBlock("no conversion preview".into()))?;
+    if !state
+        .draft
+        .as_ref()
+        .is_some_and(|draft| pending_conversion_valid(draft, &pending))
+    {
+        state.editor_feedback = Some("Conversion has invalid required values.".into());
+        state.pending_conversion = Some(pending);
+        return Err(EditorError::IncompatibleConversion);
+    }
+    dispatch_editor_command(state, pending.command)
+}
+
+fn cancel_pending_conversion(state: &mut MacroPageState) {
+    state.pending_conversion = None;
+    state.editor_feedback = Some("Conversion canceled; draft unchanged.".into());
+}
+
+fn compatible_conversion_preview(
+    block: &crate::engine::macro_engine::Block,
+    path: BlockPath,
+    target: ConversionTarget,
+) -> PendingConversion {
+    let family = conversion_target_family(&target);
+    PendingConversion {
+        block_id: block.id.clone(),
+        preview: preview_conversion(block, family),
+        required_values: conversion_required_values(&target),
+        command: EditorCommand::ConvertBlock { path, target },
+        structural_children: false,
+    }
+}
+
+fn conversion_choices(
+    draft: &EditorDraft,
+    block: &crate::engine::macro_engine::Block,
+    path: &BlockPath,
+) -> Vec<(String, PendingConversion)> {
+    use crate::engine::macro_engine::{
+        Action, BlockKind, Condition, Limit, MouseButton, ObserveMode, TimeoutOutcome,
+    };
+    let wait_true = || ObserveMode::WaitForTrue {
+        timeout_ms: Limit::Unlimited,
+        timeout_outcome: TimeoutOutcome::Continue,
+    };
+    let wait_false = || ObserveMode::WaitForFalse {
+        timeout_ms: Limit::Unlimited,
+        timeout_outcome: TimeoutOutcome::Continue,
+    };
+    let mut targets = Vec::new();
+    match &block.kind {
+        BlockKind::Observe {
+            condition: Condition::Text { .. },
+        } => targets.extend([
+            (
+                "Text: Check now".into(),
+                ConversionTarget::TextObservation {
+                    mode: ObserveMode::CheckNow,
+                },
+            ),
+            (
+                "Text: Wait true".into(),
+                ConversionTarget::TextObservation { mode: wait_true() },
+            ),
+            (
+                "Text: Wait false".into(),
+                ConversionTarget::TextObservation { mode: wait_false() },
+            ),
+        ]),
+        BlockKind::Observe {
+            condition: Condition::Image { .. },
+        } => targets.extend([
+            (
+                "Image: Check now".into(),
+                ConversionTarget::ImageObservation {
+                    mode: ObserveMode::CheckNow,
+                },
+            ),
+            (
+                "Image: Wait true".into(),
+                ConversionTarget::ImageObservation { mode: wait_true() },
+            ),
+            (
+                "Image: Wait false".into(),
+                ConversionTarget::ImageObservation { mode: wait_false() },
+            ),
+        ]),
+        BlockKind::Action {
+            action: Action::ClickTextMatch { .. },
+        } => targets.extend([
+            (
+                "Text click: Left".into(),
+                ConversionTarget::ClickTextMatch {
+                    button: MouseButton::Left,
+                },
+            ),
+            (
+                "Text click: Right".into(),
+                ConversionTarget::ClickTextMatch {
+                    button: MouseButton::Right,
+                },
+            ),
+        ]),
+        BlockKind::Action {
+            action: Action::ClickImageMatch { .. },
+        } => targets.extend([
+            (
+                "Image click: Left".into(),
+                ConversionTarget::ClickImageMatch {
+                    button: MouseButton::Left,
+                },
+            ),
+            (
+                "Image click: Right".into(),
+                ConversionTarget::ClickImageMatch {
+                    button: MouseButton::Right,
+                },
+            ),
+        ]),
+        BlockKind::Action {
+            action: Action::ClickPoint { button, .. } | Action::ClickRegion { button, .. },
+        } => {
+            targets.extend(draft.points.iter().map(|point| {
+                (
+                    format!("Point: {}", point.id),
+                    ConversionTarget::ClickPoint {
+                        point_id: point.id.clone(),
+                        button: *button,
+                    },
+                )
+            }));
+            targets.extend(draft.regions.iter().map(|region| {
+                (
+                    format!("Region: {}", region.id),
+                    ConversionTarget::ClickRegion {
+                        region_id: region.id.clone(),
+                        button: *button,
+                    },
+                )
+            }));
+        }
+        BlockKind::RepeatN { .. } => {
+            if let Some((source_id, condition)) = observation_source(draft, None) {
+                targets.push((
+                    "Repeat Until".into(),
+                    ConversionTarget::RepeatUntil {
+                        condition: condition_with_source(condition, source_id),
+                        max_iterations: Limit::Finite(100),
+                    },
+                ));
+            }
+        }
+        BlockKind::RepeatUntil { .. } => {
+            targets.push(("Repeat N".into(), ConversionTarget::RepeatN { count: 2 }))
+        }
+        _ => {}
+    }
+    targets
+        .into_iter()
+        .filter(|(_, target)| conversion_target_changes(block, target))
+        .map(|(label, target)| {
+            (
+                label,
+                compatible_conversion_preview(block, path.clone(), target),
+            )
+        })
+        .collect()
+}
+
+fn conversion_target_changes(
+    block: &crate::engine::macro_engine::Block,
+    target: &ConversionTarget,
+) -> bool {
+    use crate::engine::macro_engine::{Action, BlockKind, Condition};
+    match (&block.kind, target) {
+        (
+            BlockKind::Observe {
+                condition: Condition::Text { mode, .. },
+            },
+            ConversionTarget::TextObservation { mode: target },
+        )
+        | (
+            BlockKind::Observe {
+                condition: Condition::Image { mode, .. },
+            },
+            ConversionTarget::ImageObservation { mode: target },
+        ) => mode != target,
+        (
+            BlockKind::Action {
+                action: Action::ClickTextMatch { button, .. },
+            },
+            ConversionTarget::ClickTextMatch { button: target },
+        )
+        | (
+            BlockKind::Action {
+                action: Action::ClickImageMatch { button, .. },
+            },
+            ConversionTarget::ClickImageMatch { button: target },
+        ) => button != target,
+        (
+            BlockKind::Action {
+                action: Action::ClickPoint { point_id, button },
+            },
+            ConversionTarget::ClickPoint {
+                point_id: target_id,
+                button: target_button,
+            },
+        ) => point_id != target_id || button != target_button,
+        (
+            BlockKind::Action {
+                action: Action::ClickRegion { region_id, button },
+            },
+            ConversionTarget::ClickRegion {
+                region_id: target_id,
+                button: target_button,
+            },
+        ) => region_id != target_id || button != target_button,
+        _ => true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplacementKind {
+    Wait,
+    Note,
+    Stop,
+}
+
+fn replace_block_preview(
+    block: &crate::engine::macro_engine::Block,
+    path: BlockPath,
+    replacement_kind: ReplacementKind,
+) -> PendingConversion {
+    use crate::engine::macro_engine::{Block, BlockKind};
+    let (kind, required_values) = match replacement_kind {
+        ReplacementKind::Wait => (
+            BlockKind::Wait { duration_ms: 250 },
+            vec![("duration_ms".into(), "250".into())],
+        ),
+        ReplacementKind::Note => (
+            BlockKind::Comment {
+                text: "Replaced step".into(),
+            },
+            vec![("text".into(), "Replaced step".into())],
+        ),
+        ReplacementKind::Stop => (BlockKind::StopSuccess, vec![]),
+    };
+    PendingConversion {
+        block_id: block.id.clone(),
+        preview: ConversionPreview::ReplaceRequired {
+            from: block_family_for_ui(block),
+            to: BlockFamily::Other,
+            reason: "Replacing an unrelated type requires confirmation; removed settings remain available only through undo.",
+        },
+        required_values,
+        command: EditorCommand::ReplaceBlock {
+            path,
+            replacement: Block {
+                id: block.id.clone(),
+                enabled: block.enabled,
+                kind,
+            },
+            children: ChildDisposition::KeepOwnedContents,
+        },
+        structural_children: matches!(
+            block.kind,
+            BlockKind::If { .. }
+                | BlockKind::RepeatN { .. }
+                | BlockKind::RepeatUntil { .. }
+                | BlockKind::Continuous { .. }
+                | BlockKind::WatchGroup { .. }
+        ),
+    }
+}
+
+fn conversion_target_family(target: &ConversionTarget) -> BlockFamily {
+    match target {
+        ConversionTarget::TextObservation { .. } => BlockFamily::TextObservation,
+        ConversionTarget::ImageObservation { .. } => BlockFamily::ImageObservation,
+        ConversionTarget::ClickTextMatch { .. } => BlockFamily::TextMatchedClick,
+        ConversionTarget::ClickImageMatch { .. } => BlockFamily::ImageMatchedClick,
+        ConversionTarget::ClickPoint { .. } | ConversionTarget::ClickRegion { .. } => {
+            BlockFamily::SavedLocationClick
+        }
+        ConversionTarget::RepeatN { .. } | ConversionTarget::RepeatUntil { .. } => {
+            BlockFamily::Loop
+        }
+    }
+}
+
+fn conversion_required_values(target: &ConversionTarget) -> Vec<(String, String)> {
+    match target {
+        ConversionTarget::ClickPoint { point_id, .. } => {
+            vec![("point_id".into(), point_id.clone())]
+        }
+        ConversionTarget::ClickRegion { region_id, .. } => {
+            vec![("region_id".into(), region_id.clone())]
+        }
+        ConversionTarget::RepeatN { count } => vec![("count".into(), count.to_string())],
+        ConversionTarget::RepeatUntil { max_iterations, .. } => {
+            vec![("max_iterations".into(), format!("{max_iterations:?}"))]
+        }
+        _ => vec![],
+    }
+}
+
+fn block_family_for_ui(block: &crate::engine::macro_engine::Block) -> BlockFamily {
+    use crate::engine::macro_engine::{Action, BlockKind, Condition};
+    match &block.kind {
+        BlockKind::Observe {
+            condition: Condition::Text { .. },
+        } => BlockFamily::TextObservation,
+        BlockKind::Observe {
+            condition: Condition::Image { .. },
+        } => BlockFamily::ImageObservation,
+        BlockKind::Action {
+            action: Action::ClickTextMatch { .. },
+        } => BlockFamily::TextMatchedClick,
+        BlockKind::Action {
+            action: Action::ClickImageMatch { .. },
+        } => BlockFamily::ImageMatchedClick,
+        BlockKind::Action {
+            action: Action::ClickPoint { .. } | Action::ClickRegion { .. },
+        } => BlockFamily::SavedLocationClick,
+        BlockKind::RepeatN { .. } | BlockKind::RepeatUntil { .. } => BlockFamily::Loop,
+        _ => BlockFamily::Other,
+    }
+}
+
+fn next_unique_id(draft: &EditorDraft, prefix: &str) -> String {
+    for ordinal in 1_u64.. {
+        let id = format!("{prefix}-{ordinal}");
+        if locate_block_path(draft, &id).is_none() && locate_watch_lane(draft, &id).is_none() {
+            return id;
+        }
+    }
+    unreachable!()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteKind {
+    Observe,
+    Action,
+    If,
+    Repeat,
+    Watch,
+    Wait,
+    Stop,
+}
+
+fn palette_command(
+    draft: &EditorDraft,
+    selected_id: Option<&str>,
+    kind: PaletteKind,
+) -> Result<EditorCommand, String> {
+    use crate::engine::macro_engine::{
+        Action, Block, BlockKind, Condition, Limit, MouseButton, ObserveMode, PassiveCondition,
+        TimeoutOutcome, WatchGroup, WatchLane,
+    };
+
+    let target = insertion_target(draft, selected_id);
+    let id = next_unique_id(
+        draft,
+        match kind {
+            PaletteKind::Observe => "observe",
+            PaletteKind::Action => "action",
+            PaletteKind::If => "if",
+            PaletteKind::Repeat => "repeat",
+            PaletteKind::Watch => "watch",
+            PaletteKind::Wait => "wait",
+            PaletteKind::Stop => "stop",
+        },
+    );
+    let source = observation_source(draft, selected_id);
+    let kind = match kind {
+        PaletteKind::Observe => {
+            if let Some(rule) = draft.text_rules.first() {
+                BlockKind::Observe {
+                    condition: Condition::Text {
+                        source_block_id: id.clone(),
+                        rule_id: rule.id.clone(),
+                        mode: ObserveMode::CheckNow,
+                    },
+                }
+            } else if let Some(rule) = draft.image_rules.first() {
+                BlockKind::Observe {
+                    condition: Condition::Image {
+                        source_block_id: id.clone(),
+                        rule_id: rule.id.clone(),
+                        mode: ObserveMode::CheckNow,
+                    },
+                }
+            } else {
+                return Err("Add a text or image rule before inserting an observation.".into());
+            }
+        }
+        PaletteKind::Action => match source {
+            Some((source_id, Condition::Text { .. })) => BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: source_id,
+                    button: MouseButton::Left,
+                },
+            },
+            Some((source_id, Condition::Image { .. })) => BlockKind::Action {
+                action: Action::ClickImageMatch {
+                    source_block_id: source_id,
+                    button: MouseButton::Left,
+                },
+            },
+            None => return Err("Add or select an observation before inserting an action.".into()),
+        },
+        PaletteKind::If => {
+            let Some((source_id, condition)) = source else {
+                return Err("Add or select an observation before inserting an IF.".into());
+            };
+            BlockKind::If {
+                condition: condition_with_source(condition, source_id),
+                then_body: vec![],
+                else_body: vec![],
+            }
+        }
+        PaletteKind::Repeat => BlockKind::RepeatN {
+            count: 2,
+            body: vec![],
+        },
+        PaletteKind::Watch => {
+            let Some((source_id, condition)) = source else {
+                return Err("Add or select an observation before inserting a Watch Group.".into());
+            };
+            let lane_id = next_unique_id(draft, "lane");
+            let passive = match condition {
+                Condition::Text { rule_id, .. } => PassiveCondition::Text {
+                    source_block_id: source_id,
+                    rule_id,
+                },
+                Condition::Image { rule_id, .. } => PassiveCondition::Image {
+                    source_block_id: source_id,
+                    rule_id,
+                },
+            };
+            BlockKind::WatchGroup {
+                group: WatchGroup {
+                    lanes: vec![WatchLane {
+                        id: lane_id,
+                        enabled: true,
+                        condition: passive,
+                        then_body: vec![],
+                    }],
+                    timeout_ms: Limit::Unlimited,
+                    timeout_outcome: TimeoutOutcome::Continue,
+                    cooldown_ms: 250,
+                },
+            }
+        }
+        PaletteKind::Wait => BlockKind::Wait { duration_ms: 250 },
+        PaletteKind::Stop => BlockKind::StopSuccess,
+    };
+    Ok(EditorCommand::InsertBlock {
+        target,
+        block: Block {
+            id,
+            enabled: true,
+            kind,
+        },
+    })
+}
+
+fn insertion_target(draft: &EditorDraft, selected_id: Option<&str>) -> InsertionTarget {
+    let Some(selected_id) = selected_id else {
+        return InsertionTarget {
+            container: ContainerPath::Root,
+            index: draft.blocks.len(),
+        };
+    };
+    if let Some((watch_id, _, _)) = locate_watch_lane(draft, selected_id) {
+        let container = ContainerPath::WatchLaneBody {
+            watch_id,
+            lane_id: selected_id.into(),
+        };
+        let index = container_len(draft, &container).unwrap_or(0);
+        return InsertionTarget { container, index };
+    }
+    let Some(path) = locate_block_path(draft, selected_id) else {
+        return InsertionTarget {
+            container: ContainerPath::Root,
+            index: draft.blocks.len(),
+        };
+    };
+    let child_container =
+        block_at_path(draft, &path).and_then(|block| match &block.kind {
+            crate::engine::macro_engine::BlockKind::If { .. } => Some(ContainerPath::IfThen {
+                if_id: block.id.clone(),
+            }),
+            crate::engine::macro_engine::BlockKind::RepeatN { .. }
+            | crate::engine::macro_engine::BlockKind::RepeatUntil { .. }
+            | crate::engine::macro_engine::BlockKind::Continuous { .. } => {
+                Some(ContainerPath::LoopBody {
+                    loop_id: block.id.clone(),
+                })
+            }
+            crate::engine::macro_engine::BlockKind::WatchGroup { group } => group
+                .lanes
+                .first()
+                .map(|lane| ContainerPath::WatchLaneBody {
+                    watch_id: block.id.clone(),
+                    lane_id: lane.id.clone(),
+                }),
+            _ => None,
+        });
+    if let Some(container) = child_container {
+        let index = container_len(draft, &container).unwrap_or(0);
+        InsertionTarget { container, index }
+    } else {
+        let index = sibling_position(draft, &path)
+            .map(|(index, _)| index + 1)
+            .unwrap_or(0);
+        InsertionTarget {
+            container: path.container,
+            index,
+        }
+    }
+}
+
+fn observation_source(
+    draft: &EditorDraft,
+    selected_id: Option<&str>,
+) -> Option<(String, crate::engine::macro_engine::Condition)> {
+    use crate::engine::macro_engine::BlockKind;
+    let selected = selected_id
+        .and_then(|id| locate_block_path(draft, id))
+        .and_then(|path| block_at_path(draft, &path));
+    if let Some(block) = selected {
+        if let BlockKind::Observe { condition } = &block.kind {
+            return Some((block.id.clone(), condition.clone()));
+        }
+    }
+    fn find(
+        blocks: &[crate::engine::macro_engine::Block],
+    ) -> Option<(String, crate::engine::macro_engine::Condition)> {
+        for block in blocks {
+            if let BlockKind::Observe { condition } = &block.kind {
+                return Some((block.id.clone(), condition.clone()));
+            }
+            for child in palette_child_slices(block) {
+                if let Some(found) = find(child) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    find(&draft.blocks)
+}
+
+fn palette_child_slices(
+    block: &crate::engine::macro_engine::Block,
+) -> Vec<&[crate::engine::macro_engine::Block]> {
+    use crate::engine::macro_engine::BlockKind;
+    match &block.kind {
+        BlockKind::If {
+            then_body,
+            else_body,
+            ..
+        } => vec![then_body, else_body],
+        BlockKind::RepeatN { body, .. }
+        | BlockKind::RepeatUntil { body, .. }
+        | BlockKind::Continuous { body } => vec![body],
+        BlockKind::WatchGroup { group } => group
+            .lanes
+            .iter()
+            .map(|lane| lane.then_body.as_slice())
+            .collect(),
+        _ => vec![],
+    }
+}
+
+fn condition_with_source(
+    condition: crate::engine::macro_engine::Condition,
+    source_block_id: String,
+) -> crate::engine::macro_engine::Condition {
+    use crate::engine::macro_engine::{Condition, ObserveMode};
+    match condition {
+        Condition::Text { rule_id, .. } => Condition::Text {
+            source_block_id,
+            rule_id,
+            mode: ObserveMode::CheckNow,
+        },
+        Condition::Image { rule_id, .. } => Condition::Image {
+            source_block_id,
+            rule_id,
+            mode: ObserveMode::CheckNow,
+        },
     }
 }
 
@@ -306,27 +1615,70 @@ fn section(ui: &mut Ui, label: &str, contents: impl FnOnce(&mut Ui)) {
         });
 }
 
-fn inspector_empty(ui: &mut Ui) {
-    ui.label(
-        RichText::new("No block selected")
-            .strong()
-            .color(Color32::from_gray(204)),
-    );
-    ui.label(
-        RichText::new("Select a timeline block to inspect settings and validation results.")
-            .size(11.0)
-            .color(Color32::from_gray(119)),
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::macro_engine::*;
+
+    fn fixture() -> EditorDraft {
+        EditorDraft::new(MacroDefinition {
+            schema_version: MACRO_SCHEMA_VERSION,
+            id: "macro".into(),
+            name: "Macro".into(),
+            revision: 1,
+            target: TargetProfile {
+                process_path: "game.exe".into(),
+                window_class: "d4".into(),
+                title_contains: "Diablo".into(),
+                captured_client_width: 1280,
+                captured_client_height: 720,
+                captured_dpi: 96,
+            },
+            regions: vec![],
+            points: vec![],
+            text_rules: vec![TextRule {
+                id: "rule".into(),
+                revision: 1,
+                region_id: "scan".into(),
+                language: "en-US".into(),
+                preprocess: PreprocessProfile::Grayscale,
+                expected: "Salvage".into(),
+                match_mode: TextMatchMode::Contains,
+                threshold: 0.9,
+                case_sensitive: false,
+                allow_cross_line: false,
+                match_policy: MatchSelectionPolicy::ExactlyOne,
+                poll_interval_ms: 250,
+                timeout_ms: Limit::Unlimited,
+                stable_frames: 2,
+            }],
+            image_rules: vec![],
+            blocks: vec![Block {
+                id: "observe-1".into(),
+                enabled: true,
+                kind: BlockKind::Observe {
+                    condition: Condition::Text {
+                        source_block_id: "observe-1".into(),
+                        rule_id: "rule".into(),
+                        mode: ObserveMode::CheckNow,
+                    },
+                },
+            }],
+            safety: SafetyPolicy {
+                max_runtime_ms: Limit::Unlimited,
+                max_clicks: Limit::Unlimited,
+                max_observation_retries: Limit::Unlimited,
+                max_observations_per_second: 20,
+                minimum_click_interval_ms: 100,
+                focus_loss: FocusLossPolicy::Stop,
+            },
+        })
+    }
 
     #[test]
     fn empty_macro_page_has_no_runtime_or_input_authority() {
         let state = MacroPageState::default();
-        assert!(state.definition.is_none());
+        assert!(state.draft.is_none());
         assert!(state.runtime_events.is_empty());
         assert!(state.enabled);
     }
@@ -342,7 +1694,180 @@ mod tests {
 
         assert_eq!(
             revision_summary(&state, &monitor),
-            "draft -- · saved 2 · running 3"
+            "draft -- | saved 2 | running 3"
         );
+    }
+
+    #[test]
+    fn palette_covers_core_types_and_inserts_nested_containers() {
+        let mut draft = fixture();
+        assert_eq!(next_unique_id(&draft, "observe"), "observe-2");
+        for kind in [
+            PaletteKind::Observe,
+            PaletteKind::Action,
+            PaletteKind::If,
+            PaletteKind::Repeat,
+            PaletteKind::Watch,
+            PaletteKind::Wait,
+            PaletteKind::Stop,
+        ] {
+            assert!(palette_command(&draft, Some("observe-1"), kind).is_ok());
+        }
+
+        let command = palette_command(&draft, Some("observe-1"), PaletteKind::If).unwrap();
+        let EditorCommand::InsertBlock { block, .. } = &command else {
+            panic!()
+        };
+        let if_id = block.id.clone();
+        apply_editor_command(&mut draft, command).unwrap();
+        let command = palette_command(&draft, Some(&if_id), PaletteKind::Repeat).unwrap();
+        let EditorCommand::InsertBlock { target, block } = &command else {
+            panic!()
+        };
+        assert_eq!(
+            target.container,
+            ContainerPath::IfThen {
+                if_id: if_id.clone()
+            }
+        );
+        let repeat_id = block.id.clone();
+        apply_editor_command(&mut draft, command).unwrap();
+        let EditorCommand::InsertBlock { target, .. } =
+            palette_command(&draft, Some(&repeat_id), PaletteKind::Wait).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            target.container,
+            ContainerPath::LoopBody { loop_id: repeat_id }
+        );
+    }
+
+    #[test]
+    fn inspector_intents_share_transactional_dispatch_and_surface_run_lock() {
+        let mut state = MacroPageState {
+            draft: Some(fixture()),
+            ..MacroPageState::default()
+        };
+        let mut rule = state.draft.as_ref().unwrap().text_rules[0].clone();
+        rule.expected = "Retry".into();
+        let command = inspector_editor_command(
+            state.draft.as_ref(),
+            &inspector::InspectorIntent::ReplaceTextRule { rule },
+        )
+        .unwrap()
+        .unwrap();
+        dispatch_editor_command(&mut state, command).unwrap();
+        assert_eq!(
+            state.draft.as_ref().unwrap().text_rules[0].expected,
+            "Retry"
+        );
+
+        state.draft.as_mut().unwrap().editability = DraftEditability::Running { revision: 2 };
+        let path = locate_block_path(state.draft.as_ref().unwrap(), "observe-1").unwrap();
+        let result = dispatch_editor_command(
+            &mut state,
+            EditorCommand::SetConditionMode {
+                path,
+                mode: ObserveMode::CheckNow,
+            },
+        );
+        assert_eq!(result, Err(EditorError::RunInProgress));
+        assert!(
+            state
+                .editor_feedback
+                .as_deref()
+                .unwrap()
+                .contains("RunInProgress")
+        );
+    }
+
+    #[test]
+    fn conversion_previews_expose_replace_confirmation_and_required_values() {
+        let draft = fixture();
+        let block = &draft.blocks[0];
+        let path = locate_block_path(&draft, &block.id).unwrap();
+        let compatible = conversion_choices(&draft, block, &path)
+            .into_iter()
+            .next()
+            .unwrap()
+            .1;
+        assert!(matches!(
+            compatible.preview,
+            ConversionPreview::Compatible { .. }
+        ));
+
+        let replacement = replace_block_preview(block, path, ReplacementKind::Wait);
+        assert!(matches!(
+            replacement.preview,
+            ConversionPreview::ReplaceRequired { .. }
+        ));
+        assert_eq!(
+            replacement.required_values,
+            vec![("duration_ms".into(), "250".into())]
+        );
+    }
+
+    #[test]
+    fn conversion_confirm_cancel_and_invalid_requirements_are_transactional() {
+        let mut state = MacroPageState {
+            draft: Some(fixture()),
+            ..MacroPageState::default()
+        };
+        let before = state.draft.as_ref().unwrap().definition.clone();
+        let block = state.draft.as_ref().unwrap().blocks[0].clone();
+        let path = locate_block_path(state.draft.as_ref().unwrap(), &block.id).unwrap();
+        state.pending_conversion = Some(replace_block_preview(
+            &block,
+            path.clone(),
+            ReplacementKind::Wait,
+        ));
+        cancel_pending_conversion(&mut state);
+        assert_eq!(state.draft.as_ref().unwrap().definition, before);
+        assert!(state.pending_conversion.is_none());
+
+        state.pending_conversion = Some(replace_block_preview(
+            &block,
+            path.clone(),
+            ReplacementKind::Wait,
+        ));
+        confirm_pending_conversion(&mut state).unwrap();
+        assert!(matches!(
+            state.draft.as_ref().unwrap().blocks[0].kind,
+            BlockKind::Wait { duration_ms: 250 }
+        ));
+
+        let mut state = MacroPageState {
+            draft: Some(fixture()),
+            ..MacroPageState::default()
+        };
+        state.pending_conversion = Some(PendingConversion {
+            block_id: "observe-1".into(),
+            preview: ConversionPreview::Compatible {
+                preserved_fields: vec![],
+                required_fields: vec!["count"],
+                removed_fields: vec![],
+            },
+            required_values: vec![("count".into(), "0".into())],
+            command: EditorCommand::ConvertBlock {
+                path,
+                target: ConversionTarget::RepeatN { count: 0 },
+            },
+            structural_children: false,
+        });
+        assert_eq!(
+            confirm_pending_conversion(&mut state),
+            Err(EditorError::IncompatibleConversion)
+        );
+        assert!(state.pending_conversion.is_some());
+        assert_eq!(state.draft.as_ref().unwrap().definition, before);
+    }
+
+    #[test]
+    fn starter_draft_opens_a_native_editor_surface() {
+        let draft = EditorDraft::new(starter_macro_definition());
+        assert_eq!(draft.blocks.len(), 1);
+        assert!(locate_block_path(&draft, "observe-1").is_some());
+        assert!(!draft.text_rules.is_empty());
     }
 }

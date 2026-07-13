@@ -151,6 +151,7 @@ pub fn validate_macro(definition: &MacroDefinition) -> Vec<ValidationProblem> {
     let mut block_ids = HashSet::new();
     let mut lane_ids = HashSet::new();
     let mut sources = HashMap::new();
+    collect_structural_identity_duplicates(&definition.blocks, &mut HashSet::new(), &mut problems);
     index_blocks(
         &definition.blocks,
         true,
@@ -187,6 +188,66 @@ pub fn validate_macro(definition: &MacroDefinition) -> Vec<ValidationProblem> {
     );
 
     problems
+}
+
+fn collect_structural_identity_duplicates(
+    blocks: &[Block],
+    identities: &mut HashSet<String>,
+    problems: &mut Vec<ValidationProblem>,
+) {
+    for block in blocks {
+        insert_structural_identity(&block.id, identities, problems);
+        match &block.kind {
+            BlockKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_structural_identity_duplicates(then_body, identities, problems);
+                collect_structural_identity_duplicates(else_body, identities, problems);
+            }
+            BlockKind::RepeatN { body, .. }
+            | BlockKind::RepeatUntil { body, .. }
+            | BlockKind::Continuous { body } => {
+                collect_structural_identity_duplicates(body, identities, problems);
+            }
+            BlockKind::WatchGroup { group } => {
+                for lane in &group.lanes {
+                    insert_structural_identity(&lane.id, identities, problems);
+                    collect_structural_identity_duplicates(&lane.then_body, identities, problems);
+                }
+                if let TimeoutOutcome::RunBody { body } = &group.timeout_outcome {
+                    collect_structural_identity_duplicates(body, identities, problems);
+                }
+            }
+            _ => {}
+        }
+        if let BlockKind::Observe { condition }
+        | BlockKind::If { condition, .. }
+        | BlockKind::RepeatUntil { condition, .. } = &block.kind
+        {
+            if let Some(TimeoutOutcome::RunBody { body }) = condition_timeout_outcome(condition) {
+                collect_structural_identity_duplicates(body, identities, problems);
+            }
+        }
+    }
+}
+
+fn insert_structural_identity(
+    id: &str,
+    identities: &mut HashSet<String>,
+    problems: &mut Vec<ValidationProblem>,
+) {
+    if !identities.insert(id.to_string()) {
+        push_problem(
+            problems,
+            "timeline.duplicate_identity",
+            format!(
+                "timeline block and lane identities must be globally unique; '{id}' is duplicated"
+            ),
+            Some(id),
+        );
+    }
 }
 
 fn collect_unique_ids<'a>(
@@ -1205,6 +1266,39 @@ mod tests {
 
     fn has_code(problems: &[ValidationProblem], code: &str) -> bool {
         problems.iter().any(|problem| problem.code == code)
+    }
+
+    #[test]
+    fn rejects_lane_identity_that_collides_with_non_observation_block() {
+        let definition = fixture_macro(vec![
+            block(
+                "shared",
+                BlockKind::Comment {
+                    text: "owner".into(),
+                },
+            ),
+            block(
+                "watch",
+                BlockKind::WatchGroup {
+                    group: WatchGroup {
+                        lanes: vec![WatchLane {
+                            id: "shared".into(),
+                            enabled: true,
+                            condition: passive_text_condition("shared", "text-present"),
+                            then_body: vec![],
+                        }],
+                        timeout_ms: Limit::Finite(100),
+                        timeout_outcome: TimeoutOutcome::Continue,
+                        cooldown_ms: 0,
+                    },
+                },
+            ),
+        ]);
+
+        assert!(has_code(
+            &validate_macro(&definition),
+            "timeline.duplicate_identity"
+        ));
     }
 
     #[test]

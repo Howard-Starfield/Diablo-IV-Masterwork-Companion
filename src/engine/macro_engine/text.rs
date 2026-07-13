@@ -386,6 +386,10 @@ struct TextPreprocessWorker {
     frame_growths: usize,
     #[cfg(test)]
     scratch_growths: usize,
+    #[cfg(test)]
+    frame_resize_growths: usize,
+    #[cfg(test)]
+    scratch_resize_growths: usize,
 }
 
 impl Default for TextPreprocessWorker {
@@ -402,6 +406,10 @@ impl Default for TextPreprocessWorker {
             frame_growths: 0,
             #[cfg(test)]
             scratch_growths: 0,
+            #[cfg(test)]
+            frame_resize_growths: 0,
+            #[cfg(test)]
+            scratch_resize_growths: 0,
         }
     }
 }
@@ -477,27 +485,43 @@ impl TextPreprocessWorker {
 
     fn ensure_frame_len(&mut self, len: usize) {
         if self.frame.pixels.capacity() < len {
+            #[cfg(test)]
+            let capacity_before = self.frame.pixels.capacity();
             self.frame
                 .pixels
-                .reserve_exact(len - self.frame.pixels.capacity());
+                .reserve_exact(len - self.frame.pixels.len());
             #[cfg(test)]
-            {
+            if self.frame.pixels.capacity() > capacity_before {
                 self.frame_growths += 1;
             }
         }
+        #[cfg(test)]
+        let capacity_before_resize = self.frame.pixels.capacity();
         self.frame.pixels.resize(len, 0);
+        #[cfg(test)]
+        if self.frame.pixels.capacity() > capacity_before_resize {
+            self.frame_resize_growths += 1;
+        }
     }
 
     fn ensure_scratch_len(&mut self, len: usize) {
         if self.gray_scratch.capacity() < len {
-            self.gray_scratch
-                .reserve_exact(len - self.gray_scratch.capacity());
             #[cfg(test)]
-            {
+            let capacity_before = self.gray_scratch.capacity();
+            self.gray_scratch
+                .reserve_exact(len - self.gray_scratch.len());
+            #[cfg(test)]
+            if self.gray_scratch.capacity() > capacity_before {
                 self.scratch_growths += 1;
             }
         }
+        #[cfg(test)]
+        let capacity_before_resize = self.gray_scratch.capacity();
         self.gray_scratch.resize(len, 0);
+        #[cfg(test)]
+        if self.gray_scratch.capacity() > capacity_before_resize {
+            self.scratch_resize_growths += 1;
+        }
     }
 
     #[cfg(test)]
@@ -508,7 +532,10 @@ impl TextPreprocessWorker {
             frame_capacity: self.frame.pixels.capacity(),
             frame_growths: self.frame_growths,
             scratch_ptr: self.gray_scratch.as_ptr() as usize,
+            scratch_capacity: self.gray_scratch.capacity(),
             scratch_growths: self.scratch_growths,
+            frame_resize_growths: self.frame_resize_growths,
+            scratch_resize_growths: self.scratch_resize_growths,
         }
     }
 }
@@ -521,7 +548,10 @@ struct PreprocessBufferStats {
     frame_capacity: usize,
     frame_growths: usize,
     scratch_ptr: usize,
+    scratch_capacity: usize,
     scratch_growths: usize,
+    frame_resize_growths: usize,
+    scratch_resize_growths: usize,
 }
 
 fn checked_buffer_len(width: u32, height: u32, bytes_per_pixel: usize) -> Result<usize> {
@@ -1311,6 +1341,74 @@ mod tests {
         assert_eq!((original.frame.width, original.frame.height), (4, 3));
         assert_eq!(original.frame.pixel_format, OcrPixelFormat::Bgra8);
         assert_eq!(original.frame.pixels.len(), 4 * 3 * 4);
+    }
+
+    #[test]
+    fn frame_reserve_accounts_for_shrink_then_growth_without_resize_allocation() {
+        let image =
+            |width| ScreenImage::new(RgbaImage::from_pixel(width, 1, Rgba([40, 50, 60, 255])));
+        let mut worker = TextPreprocessWorker::default();
+        worker
+            .prepare(&image(100), PreprocessProfile::Grayscale)
+            .unwrap();
+        worker
+            .prepare(&image(80), PreprocessProfile::Grayscale)
+            .unwrap();
+        let before_growth = worker.buffer_stats();
+        let target_width = u32::try_from(before_growth.frame_capacity + 50).unwrap();
+
+        worker
+            .prepare(&image(target_width), PreprocessProfile::Grayscale)
+            .unwrap();
+        let grown = worker.buffer_stats();
+        worker
+            .prepare(&image(target_width), PreprocessProfile::Grayscale)
+            .unwrap();
+        let repeated = worker.buffer_stats();
+
+        assert_eq!(grown.frame_growths, before_growth.frame_growths + 1);
+        assert_eq!(
+            grown.frame_resize_growths,
+            before_growth.frame_resize_growths
+        );
+        assert!(grown.frame_capacity >= target_width as usize);
+        assert_eq!(repeated.frame_ptr, grown.frame_ptr);
+        assert_eq!(repeated.frame_capacity, grown.frame_capacity);
+        assert_eq!(repeated.frame_growths, grown.frame_growths);
+    }
+
+    #[test]
+    fn small_text_scratch_reserve_accounts_for_shrink_then_growth() {
+        let image =
+            |width| ScreenImage::new(RgbaImage::from_pixel(width, 1, Rgba([40, 50, 60, 255])));
+        let mut worker = TextPreprocessWorker::default();
+        worker
+            .prepare(&image(100), PreprocessProfile::SmallText)
+            .unwrap();
+        worker
+            .prepare(&image(80), PreprocessProfile::SmallText)
+            .unwrap();
+        let before_growth = worker.buffer_stats();
+        let target_width = u32::try_from(before_growth.scratch_capacity + 50).unwrap();
+
+        worker
+            .prepare(&image(target_width), PreprocessProfile::SmallText)
+            .unwrap();
+        let grown = worker.buffer_stats();
+        worker
+            .prepare(&image(target_width), PreprocessProfile::SmallText)
+            .unwrap();
+        let repeated = worker.buffer_stats();
+
+        assert_eq!(grown.scratch_growths, before_growth.scratch_growths + 1);
+        assert_eq!(
+            grown.scratch_resize_growths,
+            before_growth.scratch_resize_growths
+        );
+        assert!(grown.scratch_capacity >= target_width as usize);
+        assert_eq!(repeated.scratch_ptr, grown.scratch_ptr);
+        assert_eq!(repeated.scratch_capacity, grown.scratch_capacity);
+        assert_eq!(repeated.scratch_growths, grown.scratch_growths);
     }
 
     #[derive(Default)]

@@ -68,8 +68,9 @@ pub struct StaleCapturedFrameError;
 
 /// Brackets a reusable raw capture source with before/after target snapshots.
 ///
-/// `capture` deliberately remains a direct raw path for OCR and the existing Enchant flow.
-/// Image detection uses `capture_frame`, which fails closed if any target fact drifts.
+/// `capture` deliberately remains a direct raw path for OCR utilities and the existing Enchant
+/// flow. Executable text and image detection use `capture_frame`, which fails closed if any
+/// target fact drifts.
 #[derive(Debug)]
 pub struct AtomicFrameCapture<S, R, C> {
     snapshots: S,
@@ -365,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn bracketed_capture_preserves_raw_capture_for_text_and_enchant() {
+    fn bracketed_capture_preserves_raw_capture_for_ocr_utilities_and_enchant() {
         let capture = AtomicFrameCapture::new(
             FakeSnapshots(Mutex::new(VecDeque::new())),
             FakeRawCapture,

@@ -65,6 +65,27 @@ impl DetectorEvidence {
         stable_frames: u8,
         details: serde_json::Value,
     ) -> Self {
+        Self::captured_match(
+            matched,
+            frame,
+            match_rect,
+            score,
+            match_count,
+            stable_frames,
+            details,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn captured_match(
+        matched: bool,
+        frame: ImageFrameMetadata,
+        match_rect: Option<Rect>,
+        score: Option<f64>,
+        match_count: u32,
+        stable_frames: u8,
+        details: serde_json::Value,
+    ) -> Self {
         Self {
             matched,
             frame_id: frame.frame_id,

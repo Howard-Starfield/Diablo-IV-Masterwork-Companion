@@ -1448,10 +1448,11 @@ impl CompiledMacro {
         block_id: &str,
         action: &Action,
         token: Option<&ObservationToken>,
-        observation_target: TargetSnapshot,
+        resume: &ResumeAuthorization,
         destination: Point,
         maximum_observation_age_ms: u64,
     ) -> Result<ActionAuthorization> {
+        let guard_target = &resume.target;
         let compiled_block = find_block_by_id(&self.definition.blocks, block_id)
             .ok_or_else(|| anyhow::anyhow!("action block '{block_id}' is not compiled"))?;
         let BlockKind::Action {
@@ -1480,11 +1481,20 @@ impl CompiledMacro {
                     "observation token is stale"
                 );
                 validate_action_token(self, action, token)?;
-                validate_token_frame_consistency(token, &observation_target)?;
+                let frame = token
+                    .frame_metadata
+                    .context("matched click token has no canonical frame metadata")?;
+                validate_token_frame_consistency(token, guard_target)?;
                 let local = token
                     .match_rect
                     .context("matched click token has no geometry")?;
-                Some(local_rect_to_screen(observation_target.client_rect, local)?)
+                let captured_client = crate::engine::types::Rect::new(
+                    frame.client_x,
+                    frame.client_y,
+                    frame.client_width,
+                    frame.client_height,
+                );
+                Some(local_rect_to_screen(captured_client, local)?)
             }
             Action::ClickPoint { point_id, .. } => {
                 anyhow::ensure!(
@@ -1498,7 +1508,7 @@ impl CompiledMacro {
                     .find(|point| point.id == *point_id)
                     .ok_or_else(|| anyhow::anyhow!("compiled point '{point_id}' is missing"))?;
                 anyhow::ensure!(
-                    observation_target.client_rect.point_from_ratio(point.point) == destination,
+                    guard_target.client_rect.point_from_ratio(point.point) == destination,
                     "destination does not match compiled point"
                 );
                 None
@@ -1514,7 +1524,7 @@ impl CompiledMacro {
                     .iter()
                     .find(|region| region.id == *region_id)
                     .ok_or_else(|| anyhow::anyhow!("compiled region '{region_id}' is missing"))?;
-                Some(observation_target.client_rect.rect_from_ratio(region.rect))
+                Some(guard_target.client_rect.rect_from_ratio(region.rect))
             }
             Action::MoveOnly { .. } => unreachable!(),
         };
@@ -1525,7 +1535,7 @@ impl CompiledMacro {
             );
         }
         anyhow::ensure!(
-            point_inside_rect(observation_target.client_rect, destination),
+            point_inside_rect(guard_target.client_rect, destination),
             "destination is outside observation-time client bounds"
         );
 
@@ -1536,7 +1546,7 @@ impl CompiledMacro {
             },
             block_id: block_id.to_string(),
             action: action.clone(),
-            expected_target: observation_target,
+            expected_target: guard_target.clone(),
             destination,
             button,
             observation: token.cloned(),
@@ -3948,6 +3958,7 @@ mod tests {
             }),
             evidence: serde_json::Value::Null,
         };
+        let resume = ResumeAuthorization::for_test(target.clone());
 
         let authorization = compiled
             .authorize_action(
@@ -3957,7 +3968,7 @@ mod tests {
                 "click-match",
                 &action,
                 Some(&token),
-                target.clone(),
+                &resume,
                 Point::new(115, 225),
                 1_000,
             )
@@ -3981,7 +3992,7 @@ mod tests {
                     "click-match",
                     &action,
                     Some(&wrong_source),
-                    target.clone(),
+                    &resume,
                     Point::new(115, 225),
                     1_000,
                 )
@@ -3999,7 +4010,7 @@ mod tests {
                     "click-match",
                     &action,
                     Some(&wrong_frame),
-                    target.clone(),
+                    &resume,
                     Point::new(115, 225),
                     1_000,
                 )
@@ -4019,11 +4030,102 @@ mod tests {
                     "click-match",
                     &wrong_action,
                     Some(&token),
-                    target,
+                    &resume,
                     Point::new(115, 225),
                     1_000,
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn window_a_observation_cannot_authorize_against_window_b_resume_guard() {
+        let action = Action::ClickTextMatch {
+            source_block_id: "observe".to_string(),
+            button: super::super::MouseButton::Left,
+        };
+        let revision = saved(fixture_definition(vec![
+            block(
+                "observe",
+                BlockKind::Observe {
+                    condition: text_condition("observe", ObserveMode::CheckNow),
+                },
+            ),
+            block(
+                "click-match",
+                BlockKind::Action {
+                    action: action.clone(),
+                },
+            ),
+        ]));
+        let compiled = CompiledMacro::compile(revision).unwrap();
+        let window_b = TargetSnapshot {
+            window_id: 92,
+            process_id: 8,
+            process_started_at_100ns: 200,
+            process_path: "game.exe".to_string(),
+            client_rect: Rect::new(500, 300, 800, 600),
+            window_revision: 1,
+            geometry_revision: 2,
+            dpi: 144,
+            display_profile: "display-a".to_string(),
+            display_profile_revision: 3,
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
+        };
+        let resume = ResumeAuthorization::for_test(window_b);
+        let window_a_token = ObservationToken {
+            run_id: "run-1".to_string(),
+            generation: 4,
+            source_block_id: "observe".to_string(),
+            detector: DetectorKind::Text,
+            region_id: "region".to_string(),
+            region_revision: 1,
+            rule_id: "text".to_string(),
+            rule_revision: 1,
+            frame_id: 8,
+            captured_at_ms: 10,
+            match_rect: Some(Rect::new(10, 20, 30, 40)),
+            score: Some(0.99),
+            match_count: 1,
+            stable_frames: 2,
+            frame_metadata: Some(super::super::ImageFrameMetadata {
+                frame_id: 8,
+                captured_at_ms: 10,
+                window_id: 91,
+                window_revision: 1,
+                client_x: 100,
+                client_y: 200,
+                client_width: 800,
+                client_height: 600,
+                geometry_revision: 2,
+                display_profile_revision: 3,
+                dpi: 144,
+                region_revision: 1,
+                rule_revision: 1,
+            }),
+            evidence: serde_json::Value::Null,
+        };
+
+        let error = compiled
+            .authorize_action(
+                "run-1",
+                4,
+                20,
+                "click-match",
+                &action,
+                Some(&window_a_token),
+                &resume,
+                Point::new(115, 225),
+                1_000,
+            )
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("frame HWND does not match target")
         );
     }
 

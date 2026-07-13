@@ -682,7 +682,6 @@ struct StabilityState {
 pub struct TextDetector {
     recognizer: Arc<dyn PositionedTextRecognizer>,
     preprocess: Mutex<TextPreprocessWorker>,
-    next_frame_id: AtomicU64,
     stability: Mutex<HashMap<StabilityKey, StabilityState>>,
 }
 
@@ -697,7 +696,6 @@ impl TextDetector {
         Self {
             recognizer,
             preprocess: Mutex::new(TextPreprocessWorker::default()),
-            next_frame_id: AtomicU64::new(1),
             stability: Mutex::new(HashMap::new()),
         }
     }
@@ -727,12 +725,48 @@ impl TextDetector {
             definition.target.captured_client_height,
         );
         let capture_rect = client.rect_from_ratio(region.rect);
-        let image = capture.capture(capture_rect)?;
+        let captured = capture.capture_frame(capture_rect)?;
+        let frame = super::ImageFrameMetadata {
+            frame_id: captured.metadata.frame_id,
+            captured_at_ms: captured.metadata.captured_at_ms,
+            window_id: captured.metadata.window_id,
+            window_revision: captured.metadata.window_revision,
+            client_x: captured.metadata.client_x,
+            client_y: captured.metadata.client_y,
+            client_width: captured.metadata.client_width,
+            client_height: captured.metadata.client_height,
+            geometry_revision: captured.metadata.geometry_revision,
+            display_profile_revision: captured.metadata.display_profile_revision,
+            dpi: captured.metadata.dpi,
+            region_revision: region.revision,
+            rule_revision: rule.revision,
+        };
+        if (frame.client_width, frame.client_height)
+            != (
+                definition.target.captured_client_width,
+                definition.target.captured_client_height,
+            )
+        {
+            bail!(
+                "text rule client geometry {}x{} is stale for current client geometry {}x{}",
+                definition.target.captured_client_width,
+                definition.target.captured_client_height,
+                frame.client_width,
+                frame.client_height
+            );
+        }
+        if frame.dpi != definition.target.captured_dpi {
+            bail!(
+                "text rule DPI {} is stale for current DPI {}",
+                definition.target.captured_dpi,
+                frame.dpi
+            );
+        }
         let mut preprocess = self
             .preprocess
             .lock()
             .map_err(|_| anyhow::anyhow!("text detector preprocessing lock is poisoned"))?;
-        let prepared = preprocess.prepare(&image, rule.preprocess)?;
+        let prepared = preprocess.prepare(&captured.image, rule.preprocess)?;
         let relative_words = self
             .recognizer
             .recognize_words(prepared.frame, &rule.language)?;
@@ -772,10 +806,9 @@ impl TextDetector {
             "raw_match": text_match,
             "words": words,
         });
-        Ok(DetectorEvidence::new(
+        Ok(DetectorEvidence::captured_match(
             qualified,
-            self.next_frame_id.fetch_add(1, Ordering::Relaxed),
-            request.observed_at_ms,
+            frame,
             qualified.then_some(text_match.rect).flatten(),
             text_match.score,
             text_match.match_count,
@@ -1008,7 +1041,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::engine::automation::CaptureSource;
+    use crate::engine::automation::{CaptureFrameMetadata, CaptureSource, CapturedScreenFrame};
     use crate::engine::macro_engine::{
         Block, BlockKind, CompiledMacro, Condition, FocusLossPolicy, MACRO_SCHEMA_VERSION,
         MacroDefinition, ObservationRequest, ObserveMode, RegionDefinition, SafetyPolicy,
@@ -1430,19 +1463,72 @@ mod tests {
     #[derive(Default)]
     struct FakeCapture {
         rects: Mutex<Vec<Rect>>,
+        next_frame_id: AtomicU64,
     }
 
     impl CaptureSource for FakeCapture {
-        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+        fn capture(&self, _rect: Rect) -> Result<ScreenImage> {
+            anyhow::bail!("executable text detection must not use raw capture")
+        }
+
+        fn capture_frame(&self, rect: Rect) -> Result<CapturedScreenFrame> {
             self.rects.lock().unwrap().push(rect);
-            Ok(ScreenImage::new(RgbaImage::from_fn(
-                rect.width,
-                rect.height,
-                |x, _| {
+            Ok(CapturedScreenFrame {
+                image: ScreenImage::new(RgbaImage::from_fn(rect.width, rect.height, |x, _| {
                     let value = if x < rect.width / 2 { 10 } else { 240 };
                     Rgba([value, value, value, 255])
+                })),
+                metadata: CaptureFrameMetadata {
+                    frame_id: self.next_frame_id.fetch_add(1, Ordering::Relaxed) + 1,
+                    captured_at_ms: 42,
+                    window_id: 1,
+                    window_revision: 1,
+                    client_x: 0,
+                    client_y: 0,
+                    client_width: 100,
+                    client_height: 50,
+                    geometry_revision: 1,
+                    display_profile_revision: 1,
+                    dpi: 96,
                 },
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RawOnlyCapture;
+
+    impl CaptureSource for RawOnlyCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            Ok(ScreenImage::new(RgbaImage::from_pixel(
+                rect.width,
+                rect.height,
+                Rgba([255, 255, 255, 255]),
             )))
+        }
+    }
+
+    struct PairedFrameCapture {
+        raw_calls: Mutex<Vec<Rect>>,
+        frame_calls: Mutex<Vec<Rect>>,
+        metadata: CaptureFrameMetadata,
+    }
+
+    impl CaptureSource for PairedFrameCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            self.raw_calls.lock().unwrap().push(rect);
+            anyhow::bail!("executable text detection must not use raw capture")
+        }
+
+        fn capture_frame(&self, rect: Rect) -> Result<CapturedScreenFrame> {
+            self.frame_calls.lock().unwrap().push(rect);
+            Ok(CapturedScreenFrame {
+                image: ScreenImage::new(RgbaImage::from_fn(rect.width, rect.height, |x, _| {
+                    let value = if x < rect.width / 2 { 10 } else { 240 };
+                    Rgba([value, value, value, 255])
+                })),
+                metadata: self.metadata,
+            })
         }
     }
 
@@ -1566,6 +1652,90 @@ mod tests {
         assert_eq!(evidence.details["region_id"], "region");
         assert_eq!(evidence.details["region_revision"], 7);
         assert_eq!(evidence.details["source_block_id"], "observe");
+    }
+
+    #[test]
+    fn executable_text_detector_uses_one_paired_frame_and_preserves_canonical_metadata() {
+        let recognizer = Arc::new(FakeRecognizer {
+            calls: Mutex::default(),
+            words: vec![OcrWord::new("Ready", Rect::new(2, 3, 20, 5), 0, 0)],
+        });
+        let detector = TextDetector::with_recognizer(recognizer.clone());
+        let capture = PairedFrameCapture {
+            raw_calls: Mutex::default(),
+            frame_calls: Mutex::default(),
+            metadata: CaptureFrameMetadata {
+                frame_id: 44,
+                captured_at_ms: 900,
+                window_id: 77,
+                window_revision: 5,
+                client_x: -320,
+                client_y: 180,
+                client_width: 100,
+                client_height: 50,
+                geometry_revision: 6,
+                display_profile_revision: 7,
+                dpi: 96,
+            },
+        };
+        let compiled = compiled_text_macro(PreprocessProfile::HighContrast, 1);
+        let condition = text_condition();
+        let request = ObservationRequest {
+            run_id: "run-1",
+            generation: 3,
+            condition: &condition,
+            compiled: &compiled,
+            observed_at_ms: 42,
+        };
+
+        let evidence = detector.observe(&request, &capture).unwrap();
+
+        assert!(evidence.matched);
+        assert!(capture.raw_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            capture.frame_calls.lock().unwrap().as_slice(),
+            &[Rect::new(10, 10, 50, 20)]
+        );
+        assert_eq!(
+            recognizer.calls.lock().unwrap().as_slice(),
+            &[(OcrPixelFormat::Gray8, 50, 20)]
+        );
+        assert_eq!(evidence.frame_id, 44);
+        assert_eq!(evidence.captured_at_ms, 900);
+        let frame = evidence.frame_metadata.expect("canonical frame metadata");
+        assert_eq!((frame.window_id, frame.window_revision), (77, 5));
+        assert_eq!((frame.client_x, frame.client_y), (-320, 180));
+        assert_eq!((frame.client_width, frame.client_height), (100, 50));
+        assert_eq!((frame.region_revision, frame.rule_revision), (7, 9));
+        assert_eq!(evidence.match_rect, Some(Rect::new(12, 13, 20, 5)));
+    }
+
+    #[test]
+    fn executable_text_detector_fails_closed_when_capture_has_no_paired_metadata() {
+        let recognizer = Arc::new(FakeRecognizer {
+            calls: Mutex::default(),
+            words: vec![OcrWord::new("Ready", Rect::new(2, 3, 20, 5), 0, 0)],
+        });
+        let detector = TextDetector::with_recognizer(recognizer.clone());
+        let capture = RawOnlyCapture;
+        let compiled = compiled_text_macro(PreprocessProfile::Original, 1);
+        let condition = text_condition();
+        let request = ObservationRequest {
+            run_id: "run-1",
+            generation: 3,
+            condition: &condition,
+            compiled: &compiled,
+            observed_at_ms: 42,
+        };
+
+        let error = detector.observe(&request, &capture).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("atomic pixels and frame metadata")
+        );
+        assert!(recognizer.calls.lock().unwrap().is_empty());
     }
 
     #[test]

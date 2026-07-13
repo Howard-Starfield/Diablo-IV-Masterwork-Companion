@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::engine::macro_engine::{
     Action, AssetRef, Block, BlockKind, Condition, ImageRule, Limit, MacroDefinition, MouseButton,
@@ -34,7 +34,14 @@ pub struct EditorDraft {
     pub status: DraftStatus,
     pub editability: DraftEditability,
     invalidated_source_ids: BTreeSet<String>,
+    detector_test_failures: BTreeMap<String, DetectorTestFailure>,
     undo: VecDeque<UndoEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectorTestFailure {
+    definition_revision: u64,
+    message: String,
 }
 
 impl EditorDraft {
@@ -44,6 +51,7 @@ impl EditorDraft {
             status: DraftStatus::Ready,
             editability: DraftEditability::Editable,
             invalidated_source_ids: BTreeSet::new(),
+            detector_test_failures: BTreeMap::new(),
             undo: VecDeque::new(),
         }
     }
@@ -65,6 +73,31 @@ impl EditorDraft {
 
     pub fn undo_len(&self) -> usize {
         self.undo.len()
+    }
+
+    pub fn record_detector_test_failure(
+        &mut self,
+        block_id: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.detector_test_failures.insert(
+            block_id.into(),
+            DetectorTestFailure {
+                definition_revision: self.definition.revision,
+                message: message.into(),
+            },
+        );
+        self.status = DraftStatus::NeedsValidation;
+    }
+
+    pub fn clear_detector_test_failure(&mut self, block_id: &str) {
+        self.detector_test_failures.remove(block_id);
+    }
+
+    fn has_current_detector_test_failure(&self) -> bool {
+        self.detector_test_failures
+            .values()
+            .any(|failure| failure.definition_revision == self.definition.revision)
     }
 }
 
@@ -287,6 +320,9 @@ pub enum EditorCommand {
         rule_id: String,
         verification: crate::engine::macro_engine::ImageRuleVerificationArtifact,
     },
+    ClearImageVerification {
+        rule_id: String,
+    },
     MarkValidated,
     Undo,
 }
@@ -388,7 +424,9 @@ pub fn apply_editor_command(
     ensure_unique_structural_ids(&draft.definition)?;
 
     if command == EditorCommand::MarkValidated {
-        if !crate::engine::macro_engine::validate_macro(&draft.definition).is_empty() {
+        if !crate::engine::macro_engine::validate_macro(&draft.definition).is_empty()
+            || draft.has_current_detector_test_failure()
+        {
             return Err(EditorError::ValidationFailed);
         }
         if draft.status == DraftStatus::Ready && draft.invalidated_source_ids.is_empty() {
@@ -467,6 +505,20 @@ pub fn editor_validation_problems(draft: &EditorDraft) -> Vec<ValidationProblem>
         true,
         &draft.invalidated_source_ids,
         &mut problems,
+    );
+    problems.extend(
+        draft
+            .detector_test_failures
+            .iter()
+            .filter_map(|(block_id, failure)| {
+                (failure.definition_revision == draft.definition.revision).then(|| {
+                    ValidationProblem {
+                        code: "editor.detector_test_failed".to_string(),
+                        message: format!("latest detector test failed: {}", failure.message),
+                        block_id: Some(block_id.clone()),
+                    }
+                })
+            }),
     );
     problems
 }
@@ -885,6 +937,15 @@ fn apply_to_definition(
                 return Err(EditorError::ValidationFailed);
             }
             definition.image_rules[rule_index].verification = Some(verification);
+        }
+        EditorCommand::ClearImageVerification { rule_id } => {
+            let rule = definition
+                .image_rules
+                .iter_mut()
+                .find(|rule| rule.id == rule_id)
+                .ok_or_else(|| EditorError::MissingRule(rule_id.clone()))?;
+            rule.verification = None;
+            invalidated.extend(source_ids_for_rule(&definition.blocks, &rule_id));
         }
         EditorCommand::MarkValidated | EditorCommand::Undo => unreachable!(),
     }

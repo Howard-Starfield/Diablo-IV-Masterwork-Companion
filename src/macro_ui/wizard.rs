@@ -66,6 +66,9 @@ pub enum WizardUiAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WizardRequestId(pub u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthoringSessionId(pub u64);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WizardAuthoringKind {
     CaptureTarget,
@@ -80,6 +83,7 @@ pub enum WizardAuthoringKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WizardAuthoringRequest {
+    pub session: AuthoringSessionId,
     pub id: WizardRequestId,
     pub fingerprint: String,
     pub kind: WizardAuthoringKind,
@@ -113,6 +117,7 @@ pub enum WizardAuthoringOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WizardAuthoringResult {
+    pub session: AuthoringSessionId,
     pub id: WizardRequestId,
     pub fingerprint: String,
     pub outcome: WizardAuthoringOutcome,
@@ -172,13 +177,16 @@ pub struct WizardState {
     pub name: String,
     pub target: TargetProfile,
     pub target_bound: bool,
+    pub target_generation: u64,
     pub region: RectRatio,
+    pub region_capture_generation: Option<u64>,
     pub detector: WizardDetector,
     pub text_expected: String,
     pub text_match_mode: TextMatchMode,
     pub observe_mode: ObserveMode,
     pub mouse_button: MouseButton,
     pub action_target: WizardActionTarget,
+    pub action_capture_generation: Option<u64>,
     pub repetition: WizardRepetition,
     pub failure: WizardFailure,
     pub detector_test: Option<DetectorTestResult>,
@@ -202,12 +210,14 @@ impl Default for WizardState {
                 captured_dpi: 96,
             },
             target_bound: false,
+            target_generation: 0,
             region: RectRatio {
                 x: 0.25,
                 y: 0.25,
                 width: 0.5,
                 height: 0.2,
             },
+            region_capture_generation: None,
             detector: WizardDetector::Text,
             text_expected: String::new(),
             text_match_mode: TextMatchMode::Contains,
@@ -219,6 +229,7 @@ impl Default for WizardState {
             },
             mouse_button: MouseButton::Left,
             action_target: WizardActionTarget::MatchedResult,
+            action_capture_generation: None,
             repetition: WizardRepetition::RunOnce,
             failure: WizardFailure::Stop {
                 message: "Detector did not match".into(),
@@ -266,6 +277,16 @@ impl WizardState {
         if !self.target_bound {
             return Err("Capture and bind a concrete target before Finish".into());
         }
+        if self.region_capture_generation != Some(self.target_generation) {
+            return Err("Capture the detection region for the current target before Finish".into());
+        }
+        if !matches!(self.action_target, WizardActionTarget::MatchedResult)
+            && self.action_capture_generation != Some(self.target_generation)
+        {
+            return Err(
+                "Capture the saved click target for the current target before Finish".into(),
+            );
+        }
         if matches!(self.detector, WizardDetector::Text) && self.text_expected.trim().is_empty() {
             return Err("Expected OCR text is required".into());
         }
@@ -292,8 +313,8 @@ impl WizardState {
 
         let region_id = "detect-region".to_string();
         let source_id = match self.detector {
-            WizardDetector::Text => "wait-text",
-            WizardDetector::Image { .. } => "wait-image",
+            WizardDetector::Text => "check-text",
+            WizardDetector::Image { .. } => "check-image",
         };
         let click_id = match self.detector {
             WizardDetector::Text => "click-text",
@@ -333,20 +354,25 @@ impl WizardState {
                 button: self.mouse_button,
             },
         };
-        let sequence = vec![
-            Block {
-                id: source_id.into(),
-                enabled: true,
-                kind: BlockKind::Observe { condition },
+        // The action belongs to the true branch of the same condition that produced its
+        // evidence. A standalone Observe followed by Action would incorrectly click after a
+        // false CheckNow or a finite wait whose timeout policy is Continue.
+        let gated_action = Block {
+            id: source_id.into(),
+            enabled: true,
+            kind: BlockKind::If {
+                condition,
+                then_body: vec![Block {
+                    id: click_id.into(),
+                    enabled: true,
+                    kind: BlockKind::Action {
+                        action: action.clone(),
+                    },
+                }],
+                else_body: vec![],
             },
-            Block {
-                id: click_id.into(),
-                enabled: true,
-                kind: BlockKind::Action {
-                    action: action.clone(),
-                },
-            },
-        ];
+        };
+        let sequence = vec![gated_action.clone()];
         let blocks = match &self.repetition {
             WizardRepetition::RunOnce => sequence,
             WizardRepetition::Repeat(count) => vec![Block {
@@ -359,6 +385,7 @@ impl WizardState {
             }],
             WizardRepetition::Until { max_iterations } => {
                 let repeat_source = "repeat-until";
+                let action_gate_source = "repeat-until-action-gate";
                 let repeat_condition = match self.detector {
                     WizardDetector::Text => Condition::Text {
                         source_block_id: repeat_source.into(),
@@ -372,7 +399,7 @@ impl WizardState {
                     },
                 };
                 let final_action = match &self.action_target {
-                    WizardActionTarget::MatchedResult => matched_action(repeat_source),
+                    WizardActionTarget::MatchedResult => matched_action(action_gate_source),
                     _ => action,
                 };
                 vec![
@@ -389,11 +416,34 @@ impl WizardState {
                             }],
                         },
                     },
+                    // RepeatUntil exits both when the detector matches and when a finite maximum
+                    // is exhausted. Re-check in an If so exhaustion can never fall through to an
+                    // action, and matched-result actions consume evidence produced by this fresh
+                    // gate rather than a stale loop token.
                     Block {
-                        id: click_id.into(),
+                        id: action_gate_source.into(),
                         enabled: true,
-                        kind: BlockKind::Action {
-                            action: final_action,
+                        kind: BlockKind::If {
+                            condition: match self.detector {
+                                WizardDetector::Text => Condition::Text {
+                                    source_block_id: action_gate_source.into(),
+                                    rule_id: "text-rule".into(),
+                                    mode: ObserveMode::CheckNow,
+                                },
+                                WizardDetector::Image { .. } => Condition::Image {
+                                    source_block_id: action_gate_source.into(),
+                                    rule_id: "image-rule".into(),
+                                    mode: ObserveMode::CheckNow,
+                                },
+                            },
+                            then_body: vec![Block {
+                                id: click_id.into(),
+                                enabled: true,
+                                kind: BlockKind::Action {
+                                    action: final_action,
+                                },
+                            }],
+                            else_body: vec![],
                         },
                     },
                 ]
@@ -405,25 +455,7 @@ impl WizardState {
             }],
         };
         let text_rules = self.text_rule_for_authoring().into_iter().collect();
-        let image_rules = match &self.detector {
-            WizardDetector::Text => vec![],
-            WizardDetector::Image { template } => vec![ImageRule {
-                id: "image-rule".into(),
-                revision: 1,
-                region_id: region_id.clone(),
-                template: template.clone(),
-                transparent_mask: None,
-                threshold: WIZARD_IMAGE_THRESHOLD,
-                scales_percent: vec![95, 100, 105],
-                stable_frames: 2,
-                maximum_center_drift_px: 5,
-                minimum_runner_up_margin: 0.05,
-                verification: self.image_verification.clone(),
-                match_policy: MatchSelectionPolicy::ExactlyOne,
-                poll_interval_ms: 100,
-                timeout_ms: Limit::Unlimited,
-            }],
-        };
+        let image_rules = self.image_rule_for_authoring().into_iter().collect();
         let definition = MacroDefinition {
             schema_version: MACRO_SCHEMA_VERSION,
             id: "wizard-macro".into(),
@@ -486,9 +518,11 @@ impl WizardState {
 
     pub fn detector_fingerprint(&self) -> String {
         format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            "{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
             self.target,
+            self.target_generation,
             self.region,
+            self.region_capture_generation,
             self.detector,
             self.text_expected,
             self.text_match_mode,
@@ -512,6 +546,28 @@ impl WizardState {
             poll_interval_ms: 250,
             timeout_ms: Limit::Unlimited,
             stable_frames: 2,
+        })
+    }
+
+    pub fn image_rule_for_authoring(&self) -> Option<ImageRule> {
+        let WizardDetector::Image { template } = &self.detector else {
+            return None;
+        };
+        Some(ImageRule {
+            id: "image-rule".into(),
+            revision: 1,
+            region_id: "detect-region".into(),
+            template: template.clone(),
+            transparent_mask: None,
+            threshold: WIZARD_IMAGE_THRESHOLD,
+            scales_percent: vec![95, 100, 105],
+            stable_frames: 2,
+            maximum_center_drift_px: 3,
+            minimum_runner_up_margin: 0.05,
+            verification: self.image_verification.clone(),
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 100,
+            timeout_ms: Limit::Unlimited,
         })
     }
 
@@ -573,6 +629,26 @@ impl WizardState {
         self.dry_run_fingerprint = None;
     }
 
+    pub fn record_target_capture(&mut self, target: TargetProfile) {
+        self.target = target;
+        self.target_bound = true;
+        self.target_generation = self.target_generation.saturating_add(1);
+        self.region_capture_generation = None;
+        self.action_capture_generation = None;
+        self.invalidate_detector_proof();
+    }
+
+    pub fn record_region_capture(&mut self, rect: RectRatio) {
+        self.region = rect;
+        self.region_capture_generation = Some(self.target_generation);
+        self.invalidate_detector_proof();
+    }
+
+    pub fn record_action_capture(&mut self) {
+        self.action_capture_generation = Some(self.target_generation);
+        self.invalidate_dry_run_review();
+    }
+
     fn reconcile_form_edits(&mut self, detector_before: &str, review_before: &str) {
         if self.detector_fingerprint() != detector_before {
             self.invalidate_detector_proof();
@@ -616,6 +692,8 @@ impl WizardState {
             }),
             dry_run_reviewed: true,
             target_bound: true,
+            target_generation: 1,
+            region_capture_generation: Some(1),
             ..Self::default()
         }
         .with_current_proofs()
@@ -629,7 +707,11 @@ impl WizardState {
     }
 }
 
-pub fn show(ui: &mut Ui, state: &mut WizardState) -> Option<WizardUiAction> {
+pub fn show(
+    ui: &mut Ui,
+    state: &mut WizardState,
+    authoring_pending: bool,
+) -> Option<WizardUiAction> {
     let detector_before = state.detector_fingerprint();
     let review_before = state.review_fingerprint();
     let mut action = None;
@@ -643,7 +725,7 @@ pub fn show(ui: &mut Ui, state: &mut WizardState) -> Option<WizardUiAction> {
             ));
         });
         ui.separator();
-        match state.step {
+        ui.add_enabled_ui(!authoring_pending, |ui| match state.step {
             WizardStep::Target => {
                 ui.label("Choose the window profile this macro is allowed to observe.");
                 ui.add(TextEdit::singleline(&mut state.name).hint_text("Macro name"));
@@ -789,6 +871,7 @@ pub fn show(ui: &mut Ui, state: &mut WizardState) -> Option<WizardUiAction> {
                                 id: "click-point".into(),
                                 point: crate::engine::types::PointRatio { x: 0.5, y: 0.5 },
                             };
+                            state.action_capture_generation = None;
                         }
                         if ui.button("Capture click point").clicked() {
                             action = Some(WizardUiAction::CaptureClickPoint);
@@ -805,6 +888,7 @@ pub fn show(ui: &mut Ui, state: &mut WizardState) -> Option<WizardUiAction> {
                                     height: 0.1,
                                 },
                             };
+                            state.action_capture_generation = None;
                         }
                         if ui.button("Capture click region").clicked() {
                             action = Some(WizardUiAction::CaptureClickRegion);
@@ -911,17 +995,26 @@ pub fn show(ui: &mut Ui, state: &mut WizardState) -> Option<WizardUiAction> {
                     ui.label(RichText::new(error).color(egui::Color32::LIGHT_RED));
                 }
             },
+        });
+        if authoring_pending {
+            ui.label("Capture or detector test in progress…");
         }
         ui.separator();
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(state.step != WizardStep::Target, egui::Button::new("Back"))
+                .add_enabled(
+                    !authoring_pending && state.step != WizardStep::Target,
+                    egui::Button::new("Back"),
+                )
                 .clicked()
             {
                 state.back();
             }
             if ui
-                .add_enabled(state.step != WizardStep::Finish, egui::Button::new("Next"))
+                .add_enabled(
+                    !authoring_pending && state.step != WizardStep::Finish,
+                    egui::Button::new("Next"),
+                )
                 .clicked()
             {
                 state.next();
@@ -965,7 +1058,7 @@ mod tests {
             threshold: WIZARD_IMAGE_THRESHOLD,
             scales_percent: vec![95, 100, 105],
             stable_frames: 2,
-            maximum_center_drift_px: 5,
+            maximum_center_drift_px: 3,
             minimum_runner_up_margin: 0.05,
             verification: None,
             match_policy: MatchSelectionPolicy::ExactlyOne,
@@ -1009,6 +1102,11 @@ mod tests {
                 return Some(block);
             }
             let children: &[Block] = match &block.kind {
+                BlockKind::If {
+                    then_body,
+                    else_body: _,
+                    ..
+                } => then_body,
                 BlockKind::RepeatN { body, .. }
                 | BlockKind::RepeatUntil { body, .. }
                 | BlockKind::Continuous { body } => body,
@@ -1031,7 +1129,7 @@ mod tests {
             output.definition.blocks[0].kind,
             BlockKind::Continuous { .. }
         ));
-        assert!(find_block(&output.definition.blocks, "wait-text").is_some());
+        assert!(find_block(&output.definition.blocks, "check-text").is_some());
         assert!(find_block(&output.definition.blocks, "click-text").is_some());
         assert_eq!(output.definition.text_rules, vec![authoring_rule]);
         assert!(output.validation_problems.is_empty());
@@ -1052,7 +1150,7 @@ mod tests {
         let context = egui::Context::default();
         context.begin_frame(egui::RawInput::default());
         egui::CentralPanel::default().show(&context, |ui| {
-            assert_eq!(show(ui, &mut wizard), None);
+            assert_eq!(show(ui, &mut wizard, false), None);
         });
         let _ = context.end_frame();
 
@@ -1076,7 +1174,7 @@ mod tests {
             threshold: WIZARD_IMAGE_THRESHOLD,
             scales_percent: vec![100],
             stable_frames: 2,
-            maximum_center_drift_px: 5,
+            maximum_center_drift_px: 3,
             minimum_runner_up_margin: 0.05,
             verification: None,
             match_policy: MatchSelectionPolicy::ExactlyOne,
@@ -1125,14 +1223,15 @@ mod tests {
         wizard.step = WizardStep::Finish;
         wizard.mark_dry_run_reviewed();
         let output = wizard.finish().expect("editable canonical output");
-        let observe = find_block(&output.definition.blocks, "wait-text").unwrap();
+        let observe = find_block(&output.definition.blocks, "check-text").unwrap();
         assert!(matches!(
             observe.kind,
-            BlockKind::Observe {
+            BlockKind::If {
                 condition: crate::engine::macro_engine::Condition::Text {
                     mode: ObserveMode::CheckNow,
                     ..
-                }
+                },
+                ..
             }
         ));
     }
@@ -1161,6 +1260,8 @@ mod tests {
         let mut wizard = WizardState::default();
         wizard.step = WizardStep::Finish;
         wizard.target_bound = true;
+        wizard.target_generation = 1;
+        wizard.region_capture_generation = Some(1);
         wizard.text_expected = "Ancestral".into();
         assert!(wizard.finish().unwrap_err().contains("Detector test"));
 
@@ -1189,7 +1290,7 @@ mod tests {
 
         assert!(output.definition.text_rules.is_empty());
         assert_eq!(output.definition.image_rules[0].template.revision, 3);
-        assert!(find_block(&output.definition.blocks, "wait-image").is_some());
+        assert!(find_block(&output.definition.blocks, "check-image").is_some());
         assert!(find_block(&output.definition.blocks, "click-image").is_some());
     }
 
@@ -1200,6 +1301,7 @@ mod tests {
             id: "click-point".into(),
             point: crate::engine::types::PointRatio { x: 0.4, y: 0.6 },
         };
+        point.action_capture_generation = Some(point.target_generation);
         point.mark_dry_run_reviewed();
         let output = point.finish().unwrap();
         assert_eq!(output.definition.points[0].id, "click-point");
@@ -1222,6 +1324,7 @@ mod tests {
                 height: 0.1,
             },
         };
+        region.action_capture_generation = Some(region.target_generation);
         region.mark_dry_run_reviewed();
         let output = region.finish().unwrap();
         assert!(
@@ -1297,7 +1400,7 @@ mod tests {
             threshold: WIZARD_IMAGE_THRESHOLD,
             scales_percent: vec![95, 100, 105],
             stable_frames: 2,
-            maximum_center_drift_px: 5,
+            maximum_center_drift_px: 3,
             minimum_runner_up_margin: 0.05,
             verification: None,
             match_policy: MatchSelectionPolicy::ExactlyOne,
@@ -1316,5 +1419,163 @@ mod tests {
         assert!(wizard.image_negative_samples.is_empty());
         assert!(wizard.detector_test.is_none());
         assert!(wizard.image_verification.is_none());
+    }
+
+    #[test]
+    fn finish_requires_explicit_current_target_region_and_fixed_action_captures() {
+        let mut wizard = WizardState::completed_text_fixture();
+        wizard.region_capture_generation = None;
+        assert!(wizard.finish().unwrap_err().contains("detection region"));
+
+        wizard.region_capture_generation = Some(wizard.target_generation);
+        wizard.action_target = WizardActionTarget::SavedPoint {
+            id: "point".into(),
+            point: crate::engine::types::PointRatio { x: 0.5, y: 0.5 },
+        };
+        wizard.action_capture_generation = None;
+        wizard.mark_dry_run_reviewed();
+        assert!(wizard.finish().unwrap_err().contains("saved click target"));
+
+        wizard.record_action_capture();
+        wizard.mark_dry_run_reviewed();
+        assert!(wizard.finish().is_ok());
+
+        let target = wizard.target.clone();
+        wizard.record_target_capture(target);
+        assert!(wizard.region_capture_generation.is_none());
+        assert!(wizard.action_capture_generation.is_none());
+        assert!(wizard.finish().unwrap_err().contains("detection region"));
+    }
+
+    fn true_branch_action_count(block: &Block, condition_met: bool) -> usize {
+        match &block.kind {
+            BlockKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                let selected = if condition_met { then_body } else { else_body };
+                selected
+                    .iter()
+                    .filter(|child| matches!(child.kind, BlockKind::Action { .. }))
+                    .count()
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn every_action_target_is_condition_gated_for_false_and_timeout_continue() {
+        let targets = [
+            WizardActionTarget::MatchedResult,
+            WizardActionTarget::SavedPoint {
+                id: "point".into(),
+                point: crate::engine::types::PointRatio { x: 0.4, y: 0.6 },
+            },
+            WizardActionTarget::SavedRegion {
+                id: "click-region".into(),
+                rect: RectRatio {
+                    x: 0.2,
+                    y: 0.2,
+                    width: 0.1,
+                    height: 0.1,
+                },
+            },
+        ];
+        for target in targets {
+            let mut wizard = WizardState::completed_text_fixture();
+            wizard.repetition = WizardRepetition::RunOnce;
+            wizard.observe_mode = ObserveMode::WaitForTrue {
+                timeout_ms: Limit::Finite(1),
+                timeout_outcome: TimeoutOutcome::Continue,
+            };
+            wizard.failure = WizardFailure::Continue;
+            wizard.action_target = target;
+            if !matches!(wizard.action_target, WizardActionTarget::MatchedResult) {
+                wizard.action_capture_generation = Some(wizard.target_generation);
+            }
+            wizard.mark_dry_run_reviewed();
+            let output = wizard.finish().unwrap();
+            let gate = &output.definition.blocks[0];
+            assert_eq!(true_branch_action_count(gate, false), 0);
+            assert_eq!(true_branch_action_count(gate, true), 1);
+            assert!(matches!(
+                gate.kind,
+                BlockKind::If {
+                    condition: Condition::Text {
+                        mode: ObserveMode::WaitForTrue {
+                            timeout_outcome: TimeoutOutcome::Continue,
+                            ..
+                        },
+                        ..
+                    },
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn finite_repeat_until_exhaustion_cannot_act_and_fresh_true_gate_acts_once() {
+        for target in [
+            WizardActionTarget::MatchedResult,
+            WizardActionTarget::SavedPoint {
+                id: "point".into(),
+                point: crate::engine::types::PointRatio { x: 0.4, y: 0.6 },
+            },
+            WizardActionTarget::SavedRegion {
+                id: "click-region".into(),
+                rect: RectRatio {
+                    x: 0.2,
+                    y: 0.2,
+                    width: 0.1,
+                    height: 0.1,
+                },
+            },
+        ] {
+            let mut wizard = WizardState::completed_text_fixture();
+            wizard.repetition = WizardRepetition::Until {
+                max_iterations: Limit::Finite(2),
+            };
+            wizard.action_target = target;
+            if !matches!(wizard.action_target, WizardActionTarget::MatchedResult) {
+                wizard.action_capture_generation = Some(wizard.target_generation);
+            }
+            wizard.mark_dry_run_reviewed();
+            let output = wizard.finish().unwrap();
+            let gate = &output.definition.blocks[1];
+            assert_eq!(gate.id, "repeat-until-action-gate");
+            assert_eq!(true_branch_action_count(gate, false), 0);
+            assert_eq!(true_branch_action_count(gate, true), 1);
+            if matches!(wizard.action_target, WizardActionTarget::MatchedResult) {
+                let click = find_block(&output.definition.blocks, "click-text").unwrap();
+                assert!(matches!(
+                    &click.kind,
+                    BlockKind::Action {
+                        action: Action::ClickTextMatch { source_block_id, .. }
+                    } if source_block_id == "repeat-until-action-gate"
+                ));
+            }
+            assert!(output.validation_problems.is_empty());
+        }
+    }
+
+    #[test]
+    fn image_wizard_uses_spec_center_drift_default() {
+        let mut wizard = WizardState::completed_text_fixture();
+        wizard.detector = WizardDetector::Image {
+            template: AssetRef {
+                id: "template".into(),
+                revision: 1,
+                content_hash: "abc".into(),
+            },
+        };
+        let verification = image_verification(&wizard);
+        wizard.record_image_detector_test(true, "matched", 2, Some(verification));
+        wizard.mark_dry_run_reviewed();
+        assert_eq!(
+            wizard.finish().unwrap().definition.image_rules[0].maximum_center_drift_px,
+            3
+        );
     }
 }

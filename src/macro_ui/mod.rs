@@ -30,6 +30,7 @@ pub enum EditorAuthoringKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EditorAuthoringRequest {
+    pub session: wizard::AuthoringSessionId,
     pub id: EditorAuthoringRequestId,
     pub fingerprint: String,
     pub kind: EditorAuthoringKind,
@@ -59,6 +60,7 @@ pub enum EditorAuthoringOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EditorAuthoringResult {
+    pub session: wizard::AuthoringSessionId,
     pub id: EditorAuthoringRequestId,
     pub fingerprint: String,
     pub outcome: EditorAuthoringOutcome,
@@ -91,6 +93,8 @@ pub struct MacroPageState {
     pub active_wizard_request: Option<wizard::WizardAuthoringRequest>,
     wizard_request_dispatched: bool,
     next_wizard_request_id: u64,
+    authoring_session: wizard::AuthoringSessionId,
+    next_authoring_session_id: u64,
     pub active_editor_authoring_request: Option<EditorAuthoringRequest>,
     editor_authoring_dispatched: bool,
     next_editor_authoring_request_id: u64,
@@ -116,6 +120,8 @@ impl Default for MacroPageState {
             active_wizard_request: None,
             wizard_request_dispatched: false,
             next_wizard_request_id: 1,
+            authoring_session: wizard::AuthoringSessionId(0),
+            next_authoring_session_id: 1,
             active_editor_authoring_request: None,
             editor_authoring_dispatched: false,
             next_editor_authoring_request_id: 1,
@@ -125,6 +131,20 @@ impl Default for MacroPageState {
 }
 
 impl MacroPageState {
+    fn begin_authoring_session(&mut self) {
+        self.authoring_session = wizard::AuthoringSessionId(self.next_authoring_session_id);
+        self.next_authoring_session_id = self.next_authoring_session_id.saturating_add(1);
+        self.cancel_wizard_authoring();
+        self.active_editor_authoring_request = None;
+        self.editor_authoring_dispatched = false;
+    }
+
+    fn cancel_wizard_authoring(&mut self) {
+        self.active_wizard_request = None;
+        self.wizard_request_dispatched = false;
+        self.pending_wizard_action = None;
+    }
+
     pub fn take_wizard_request(&mut self) -> Option<wizard::WizardAuthoringRequest> {
         if self.wizard_request_dispatched {
             return None;
@@ -142,7 +162,11 @@ impl MacroPageState {
         let Some(request) = self.active_wizard_request.as_ref() else {
             return Err(wizard::WizardResultError::UnexpectedResult);
         };
-        if request.id != result.id || request.fingerprint != result.fingerprint {
+        if request.session != self.authoring_session
+            || result.session != request.session
+            || request.id != result.id
+            || request.fingerprint != result.fingerprint
+        {
             return Err(wizard::WizardResultError::UnexpectedResult);
         }
         let Some(wizard_state) = self.wizard.as_mut() else {
@@ -167,22 +191,21 @@ impl MacroPageState {
                     dpi,
                 },
             ) => {
-                wizard_state.target.process_path = process_path;
-                wizard_state.target.window_class = window_class;
-                wizard_state.target.title_contains = title;
-                wizard_state.target.captured_client_width = width;
-                wizard_state.target.captured_client_height = height;
-                wizard_state.target.captured_dpi = dpi;
-                wizard_state.target_bound = true;
-                wizard_state.invalidate_detector_proof();
+                wizard_state.record_target_capture(crate::engine::macro_engine::TargetProfile {
+                    process_path,
+                    window_class,
+                    title_contains: title,
+                    captured_client_width: width,
+                    captured_client_height: height,
+                    captured_dpi: dpi,
+                });
                 true
             }
             (
                 WizardAuthoringKind::CaptureTextRegion | WizardAuthoringKind::CaptureImageRegion,
                 WizardAuthoringOutcome::Region(rect),
             ) => {
-                wizard_state.region = rect;
-                wizard_state.invalidate_detector_proof();
+                wizard_state.record_region_capture(rect);
                 true
             }
             (WizardAuthoringKind::CaptureClickPoint, WizardAuthoringOutcome::Point(point)) => {
@@ -190,7 +213,7 @@ impl MacroPageState {
                     id: "click-point".into(),
                     point,
                 };
-                wizard_state.invalidate_dry_run_review();
+                wizard_state.record_action_capture();
                 true
             }
             (WizardAuthoringKind::CaptureClickRegion, WizardAuthoringOutcome::Region(rect)) => {
@@ -198,7 +221,7 @@ impl MacroPageState {
                     id: "click-region".into(),
                     rect,
                 };
-                wizard_state.invalidate_dry_run_review();
+                wizard_state.record_action_capture();
                 true
             }
             (WizardAuthoringKind::CaptureTemplate, WizardAuthoringOutcome::Template { asset }) => {
@@ -274,7 +297,11 @@ impl MacroPageState {
         let Some(request) = self.active_editor_authoring_request.as_ref() else {
             return Err(EditorAuthoringError::UnexpectedResult);
         };
-        if request.id != result.id || request.fingerprint != result.fingerprint {
+        if request.session != self.authoring_session
+            || result.session != request.session
+            || request.id != result.id
+            || request.fingerprint != result.fingerprint
+        {
             return Err(EditorAuthoringError::UnexpectedResult);
         }
         let Some(draft) = self.draft.as_ref() else {
@@ -334,34 +361,75 @@ impl MacroPageState {
                 if image_verification.is_some() && !passed {
                     return Err(EditorAuthoringError::OutcomeMismatch);
                 }
-                if let (Some(rule_id), Some(verification)) = (rule_id, image_verification) {
-                    let EditorAuthoringKind::TestImage { block_id } = request_kind else {
-                        return Err(EditorAuthoringError::OutcomeMismatch);
-                    };
-                    let expected_rule = match condition_for_block(
-                        &self.draft.as_ref().unwrap().definition,
-                        &block_id,
-                    ) {
-                        Some(crate::engine::macro_engine::Condition::Image { rule_id, .. }) => {
-                            rule_id
+                let (block_id, effective_passed) = match request_kind {
+                    EditorAuthoringKind::TestOcr { block_id } => {
+                        if rule_id.is_some() || image_verification.is_some() {
+                            return Err(EditorAuthoringError::OutcomeMismatch);
                         }
-                        _ => return Err(EditorAuthoringError::OutcomeMismatch),
-                    };
-                    if expected_rule != &rule_id {
-                        return Err(EditorAuthoringError::OutcomeMismatch);
+                        (block_id, passed)
                     }
-                    dispatch_editor_command(
-                        self,
-                        EditorCommand::ApplyImageVerification {
-                            rule_id,
-                            verification,
-                        },
-                    )
-                    .map_err(|_| EditorAuthoringError::EditRejected)?;
+                    EditorAuthoringKind::TestImage { block_id } => {
+                        let expected_rule = match condition_for_block(
+                            &self.draft.as_ref().unwrap().definition,
+                            &block_id,
+                        ) {
+                            Some(crate::engine::macro_engine::Condition::Image {
+                                rule_id, ..
+                            }) => rule_id.clone(),
+                            _ => return Err(EditorAuthoringError::OutcomeMismatch),
+                        };
+                        if passed {
+                            match (rule_id, image_verification) {
+                                (Some(rule_id), Some(verification)) => {
+                                    if expected_rule != rule_id {
+                                        return Err(EditorAuthoringError::OutcomeMismatch);
+                                    }
+                                    dispatch_editor_command(
+                                        self,
+                                        EditorCommand::ApplyImageVerification {
+                                            rule_id,
+                                            verification,
+                                        },
+                                    )
+                                    .map_err(|_| EditorAuthoringError::EditRejected)?;
+                                    (block_id, true)
+                                }
+                                (None, None) => {
+                                    // A positive image test without a revision-bound verification
+                                    // artifact is ambiguous and cannot make the draft run-ready.
+                                    dispatch_editor_command(
+                                        self,
+                                        EditorCommand::ClearImageVerification {
+                                            rule_id: expected_rule,
+                                        },
+                                    )
+                                    .map_err(|_| EditorAuthoringError::EditRejected)?;
+                                    (block_id, false)
+                                }
+                                _ => return Err(EditorAuthoringError::OutcomeMismatch),
+                            }
+                        } else {
+                            dispatch_editor_command(
+                                self,
+                                EditorCommand::ClearImageVerification {
+                                    rule_id: expected_rule,
+                                },
+                            )
+                            .map_err(|_| EditorAuthoringError::EditRejected)?;
+                            (block_id, false)
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                let draft = self.draft.as_mut().unwrap();
+                if effective_passed {
+                    draft.clear_detector_test_failure(&block_id);
+                } else {
+                    draft.record_detector_test_failure(&block_id, evidence.clone());
                 }
                 self.editor_feedback = Some(format!(
                     "Detector test {} in {elapsed_ms} ms: {evidence}",
-                    if passed { "passed" } else { "failed" }
+                    if effective_passed { "passed" } else { "failed" }
                 ));
                 Ok(())
             }
@@ -379,7 +447,36 @@ impl MacroPageState {
                 self.editor_feedback = Some("Captured an image negative sample.".into());
                 Ok(())
             }
-            (_, EditorAuthoringOutcome::Failed(message)) => {
+            (kind, EditorAuthoringOutcome::Failed(message)) => {
+                match kind {
+                    EditorAuthoringKind::TestOcr { block_id } => self
+                        .draft
+                        .as_mut()
+                        .unwrap()
+                        .record_detector_test_failure(block_id, message.clone()),
+                    EditorAuthoringKind::TestImage { block_id } => {
+                        let rule_id = match condition_for_block(
+                            &self.draft.as_ref().unwrap().definition,
+                            &block_id,
+                        ) {
+                            Some(crate::engine::macro_engine::Condition::Image {
+                                rule_id, ..
+                            }) => Some(rule_id.clone()),
+                            _ => None,
+                        };
+                        if let Some(rule_id) = rule_id {
+                            let _ = dispatch_editor_command(
+                                self,
+                                EditorCommand::ClearImageVerification { rule_id },
+                            );
+                        }
+                        self.draft
+                            .as_mut()
+                            .unwrap()
+                            .record_detector_test_failure(block_id, message.clone());
+                    }
+                    _ => {}
+                }
                 self.editor_feedback = Some(format!("Authoring request failed: {message}"));
                 Ok(())
             }
@@ -420,6 +517,7 @@ fn begin_editor_authoring(state: &mut MacroPageState, kind: EditorAuthoringKind)
         _ => Vec::new(),
     };
     state.active_editor_authoring_request = Some(EditorAuthoringRequest {
+        session: state.authoring_session,
         id,
         fingerprint: editor_authoring_fingerprint(draft),
         kind,
@@ -493,10 +591,11 @@ impl MacroPage {
         ui.vertical(|ui| {
             title(ui);
             ui.add_space(8.0);
+            let wizard_pending = state.active_wizard_request.is_some();
             let wizard_action = state
                 .wizard
                 .as_mut()
-                .and_then(|wizard_state| wizard::show(ui, wizard_state));
+                .and_then(|wizard_state| wizard::show(ui, wizard_state, wizard_pending));
             if let Some(action) = wizard_action {
                 apply_wizard_ui_action(state, action);
             }
@@ -543,6 +642,11 @@ fn select_timeline(state: &mut MacroPageState, selection: TimelineSelection) {
 }
 
 fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAction) {
+    if state.active_wizard_request.is_some() && !matches!(action, wizard::WizardUiAction::Finish(_))
+    {
+        state.editor_feedback = Some("Wait for the current wizard request to finish.".into());
+        return;
+    }
     match action {
         wizard::WizardUiAction::Finish(output) => {
             let selected = output
@@ -555,7 +659,7 @@ fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAc
             state.selected_block_id = selected.clone();
             state.selected_timeline = selected.map(TimelineSelection::Identity);
             state.wizard = None;
-            state.pending_wizard_action = None;
+            state.cancel_wizard_authoring();
             state.editor_feedback = Some(
                 "Wizard created an unsaved canonical draft. Every step remains editable.".into(),
             );
@@ -590,6 +694,7 @@ fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAc
             let id = wizard::WizardRequestId(state.next_wizard_request_id);
             state.next_wizard_request_id = state.next_wizard_request_id.saturating_add(1);
             state.active_wizard_request = Some(wizard::WizardAuthoringRequest {
+                session: state.authoring_session,
                 id,
                 fingerprint: wizard_state.review_fingerprint(),
                 kind,
@@ -695,18 +800,28 @@ fn status_strip(
             ui.add_space(9.0);
             ui.horizontal_wrapped(|ui| {
                 if state.draft.is_none() && ui.button("Create starter draft").clicked() {
+                    state.begin_authoring_session();
                     state.draft = Some(EditorDraft::new(starter_macro_definition()));
                     state.selected_block_id = Some("observe-1".into());
                     state.selected_timeline = Some(TimelineSelection::Identity("observe-1".into()));
                     state.editor_feedback =
                         Some("Created an unsaved starter draft for editor authoring.".into());
                 }
-                if state.wizard.is_none() && ui.button("Guided wizard").clicked() {
+                let wizard_pending = state.active_wizard_request.is_some();
+                if state.wizard.is_none()
+                    && ui
+                        .add_enabled(!wizard_pending, Button::new("Guided wizard"))
+                        .clicked()
+                {
+                    state.begin_authoring_session();
                     state.wizard = Some(wizard::WizardState::default());
-                    state.pending_wizard_action = None;
-                } else if state.wizard.is_some() && ui.button("Close wizard").clicked() {
+                } else if state.wizard.is_some()
+                    && ui
+                        .add_enabled(!wizard_pending, Button::new("Close wizard"))
+                        .clicked()
+                {
                     state.wizard = None;
-                    state.pending_wizard_action = None;
+                    state.cancel_wizard_authoring();
                 }
                 let can_edit = state
                     .draft
@@ -3163,6 +3278,8 @@ mod tests {
         let mut wizard = wizard::WizardState::default();
         wizard.step = wizard::WizardStep::Finish;
         wizard.target_bound = true;
+        wizard.target_generation = 1;
+        wizard.region_capture_generation = Some(1);
         wizard.text_expected = "Ancestral".into();
         wizard.record_detector_test(true, "Ancestral", 9);
         wizard.mark_dry_run_reviewed();
@@ -3178,7 +3295,7 @@ mod tests {
         assert_eq!(state.saved_revision, None);
         let draft = state.draft.as_ref().unwrap();
         assert_eq!(draft.name, "New Macro");
-        assert!(locate_block_path(draft, "wait-text").is_some());
+        assert!(locate_block_path(draft, "check-text").is_some());
     }
 
     #[test]
@@ -3194,13 +3311,14 @@ mod tests {
             &mut state,
             wizard::WizardUiAction::CaptureRegion(wizard::WizardDetectorKind::Text),
         );
-        let old = state.take_wizard_request().unwrap();
-        apply_wizard_ui_action(&mut state, wizard::WizardUiAction::CaptureClickPoint);
         let current = state.take_wizard_request().unwrap();
+        apply_wizard_ui_action(&mut state, wizard::WizardUiAction::CaptureClickPoint);
+        assert!(state.take_wizard_request().is_none());
 
-        let old_result = wizard::WizardAuthoringResult {
-            id: old.id,
-            fingerprint: old.fingerprint,
+        let out_of_order = wizard::WizardAuthoringResult {
+            session: current.session,
+            id: wizard::WizardRequestId(current.id.0 + 1),
+            fingerprint: current.fingerprint.clone(),
             outcome: wizard::WizardAuthoringOutcome::Region(crate::engine::types::RectRatio {
                 x: 0.1,
                 y: 0.1,
@@ -3209,13 +3327,14 @@ mod tests {
             }),
         };
         assert_eq!(
-            state.apply_wizard_result(old_result),
+            state.apply_wizard_result(out_of_order),
             Err(wizard::WizardResultError::UnexpectedResult)
         );
         assert_eq!(state.active_wizard_request.as_ref().unwrap().id, current.id);
 
         state.wizard.as_mut().unwrap().text_expected = "Changed".into();
         let stale = wizard::WizardAuthoringResult {
+            session: current.session,
             id: current.id,
             fingerprint: current.fingerprint,
             outcome: wizard::WizardAuthoringOutcome::Point(crate::engine::types::PointRatio {
@@ -3227,6 +3346,46 @@ mod tests {
             state.apply_wizard_result(stale),
             Err(wizard::WizardResultError::StaleWizard)
         );
+    }
+
+    #[test]
+    fn wizard_session_rejects_results_after_close_reopen_and_finish_cancels_pending() {
+        let mut state = MacroPageState::default();
+        state.begin_authoring_session();
+        state.wizard = Some(wizard::WizardState::default());
+        apply_wizard_ui_action(&mut state, wizard::WizardUiAction::CaptureTarget);
+        let old = state.take_wizard_request().unwrap();
+
+        state.wizard = None;
+        state.cancel_wizard_authoring();
+        state.begin_authoring_session();
+        state.wizard = Some(wizard::WizardState::default());
+        assert_ne!(state.authoring_session, old.session);
+        assert_eq!(
+            state.apply_wizard_result(wizard::WizardAuthoringResult {
+                session: old.session,
+                id: old.id,
+                fingerprint: old.fingerprint,
+                outcome: wizard::WizardAuthoringOutcome::Cancelled,
+            }),
+            Err(wizard::WizardResultError::UnexpectedResult)
+        );
+
+        let mut completed = wizard::WizardState::default();
+        completed.step = wizard::WizardStep::Finish;
+        completed.target_bound = true;
+        completed.target_generation = 1;
+        completed.region_capture_generation = Some(1);
+        completed.text_expected = "Ancestral".into();
+        completed.record_detector_test(true, "matched", 1);
+        completed.mark_dry_run_reviewed();
+        let output = completed.finish().unwrap();
+        state.wizard = Some(completed);
+        apply_wizard_ui_action(&mut state, wizard::WizardUiAction::CaptureTarget);
+        assert!(state.active_wizard_request.is_some());
+        apply_wizard_ui_action(&mut state, wizard::WizardUiAction::Finish(output));
+        assert!(state.active_wizard_request.is_none());
+        assert!(state.wizard.is_none());
     }
 
     #[test]
@@ -3244,6 +3403,7 @@ mod tests {
         let request = state.take_wizard_request().unwrap();
         state
             .apply_wizard_result(wizard::WizardAuthoringResult {
+                session: request.session,
                 id: request.id,
                 fingerprint: request.fingerprint,
                 outcome: wizard::WizardAuthoringOutcome::TargetGeometry {
@@ -3264,6 +3424,9 @@ mod tests {
         assert_eq!(wizard.target.captured_dpi, 144);
         assert!(wizard.detector_test.is_none());
         assert!(!wizard.dry_run_reviewed);
+        assert_eq!(wizard.target_generation, 1);
+        assert!(wizard.region_capture_generation.is_none());
+        assert!(wizard.action_capture_generation.is_none());
     }
 
     #[test]
@@ -3295,6 +3458,7 @@ mod tests {
         );
         let request = state.take_editor_authoring_request().unwrap();
         let result = EditorAuthoringResult {
+            session: request.session,
             id: request.id,
             fingerprint: request.fingerprint.clone(),
             outcome: EditorAuthoringOutcome::Region(crate::engine::types::RectRatio {
@@ -3316,6 +3480,7 @@ mod tests {
         let request = state.take_editor_authoring_request().unwrap();
         state.draft.as_mut().unwrap().definition.revision += 1;
         let result = EditorAuthoringResult {
+            session: request.session,
             id: request.id,
             fingerprint: request.fingerprint,
             outcome: EditorAuthoringOutcome::DetectorTest {
@@ -3329,6 +3494,75 @@ mod tests {
         assert_eq!(
             state.apply_editor_authoring_result(result),
             Err(EditorAuthoringError::StaleDraft)
+        );
+    }
+
+    #[test]
+    fn failed_ocr_test_is_revision_bound_and_blocks_validation_until_success() {
+        let mut state = MacroPageState {
+            draft: Some(EditorDraft::new(starter_macro_definition())),
+            ..MacroPageState::default()
+        };
+        handle_inspector_intent(
+            &mut state,
+            inspector::InspectorIntent::TestOcr {
+                block_id: "observe-1".into(),
+            },
+        );
+        let failed = state.take_editor_authoring_request().unwrap();
+        state
+            .apply_editor_authoring_result(EditorAuthoringResult {
+                session: failed.session,
+                id: failed.id,
+                fingerprint: failed.fingerprint,
+                outcome: EditorAuthoringOutcome::DetectorTest {
+                    passed: false,
+                    evidence: "expected text not found".into(),
+                    elapsed_ms: 5,
+                    rule_id: None,
+                    image_verification: None,
+                },
+            })
+            .unwrap();
+        assert!(
+            editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
+        assert_eq!(
+            apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,),
+            Err(EditorError::ValidationFailed)
+        );
+
+        handle_inspector_intent(
+            &mut state,
+            inspector::InspectorIntent::TestOcr {
+                block_id: "observe-1".into(),
+            },
+        );
+        let passed = state.take_editor_authoring_request().unwrap();
+        state
+            .apply_editor_authoring_result(EditorAuthoringResult {
+                session: passed.session,
+                id: passed.id,
+                fingerprint: passed.fingerprint,
+                outcome: EditorAuthoringOutcome::DetectorTest {
+                    passed: true,
+                    evidence: "matched".into(),
+                    elapsed_ms: 4,
+                    rule_id: None,
+                    image_verification: None,
+                },
+            })
+            .unwrap();
+        assert!(
+            !editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
+        assert!(
+            apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,)
+                .is_ok()
         );
     }
 
@@ -3389,6 +3623,7 @@ mod tests {
         let recapture = state.take_editor_authoring_request().unwrap();
         state
             .apply_editor_authoring_result(EditorAuthoringResult {
+                session: recapture.session,
                 id: recapture.id,
                 fingerprint: recapture.fingerprint,
                 outcome: EditorAuthoringOutcome::Region(crate::engine::types::RectRatio {
@@ -3428,6 +3663,7 @@ mod tests {
         let negative = state.take_editor_authoring_request().unwrap();
         state
             .apply_editor_authoring_result(EditorAuthoringResult {
+                session: negative.session,
                 id: negative.id,
                 fingerprint: negative.fingerprint,
                 outcome: EditorAuthoringOutcome::ImageNegativeSample {
@@ -3472,6 +3708,7 @@ mod tests {
         .into_artifact();
         assert_eq!(
             state.apply_editor_authoring_result(EditorAuthoringResult {
+                session: test.session,
                 id: test.id,
                 fingerprint: test.fingerprint,
                 outcome: EditorAuthoringOutcome::DetectorTest {
@@ -3499,6 +3736,7 @@ mod tests {
         let test = state.take_editor_authoring_request().unwrap();
         state
             .apply_editor_authoring_result(EditorAuthoringResult {
+                session: test.session,
                 id: test.id,
                 fingerprint: test.fingerprint,
                 outcome: EditorAuthoringOutcome::DetectorTest {
@@ -3506,7 +3744,7 @@ mod tests {
                     evidence: "matched and verified".into(),
                     elapsed_ms: 4,
                     rule_id: Some("image-rule".into()),
-                    image_verification: Some(verification),
+                    image_verification: Some(verification.clone()),
                 },
             })
             .unwrap();
@@ -3517,6 +3755,70 @@ mod tests {
                 .is_some()
         );
         assert!(validate_macro(state.draft.as_ref().unwrap()).is_empty());
+
+        handle_inspector_intent(
+            &mut state,
+            inspector::InspectorIntent::TestImage {
+                block_id: "observe-1".into(),
+            },
+        );
+        let failed = state.take_editor_authoring_request().unwrap();
+        state
+            .apply_editor_authoring_result(EditorAuthoringResult {
+                session: failed.session,
+                id: failed.id,
+                fingerprint: failed.fingerprint,
+                outcome: EditorAuthoringOutcome::DetectorTest {
+                    passed: true,
+                    evidence: "ambiguous candidates".into(),
+                    elapsed_ms: 4,
+                    rule_id: None,
+                    image_verification: None,
+                },
+            })
+            .unwrap();
+        assert!(
+            state.draft.as_ref().unwrap().image_rules[0]
+                .verification
+                .is_none()
+        );
+        assert!(
+            editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
+
+        handle_inspector_intent(
+            &mut state,
+            inspector::InspectorIntent::TestImage {
+                block_id: "observe-1".into(),
+            },
+        );
+        let recovered = state.take_editor_authoring_request().unwrap();
+        state
+            .apply_editor_authoring_result(EditorAuthoringResult {
+                session: recovered.session,
+                id: recovered.id,
+                fingerprint: recovered.fingerprint,
+                outcome: EditorAuthoringOutcome::DetectorTest {
+                    passed: true,
+                    evidence: "matched and verified".into(),
+                    elapsed_ms: 4,
+                    rule_id: Some("image-rule".into()),
+                    image_verification: Some(verification),
+                },
+            })
+            .unwrap();
+        assert!(
+            state.draft.as_ref().unwrap().image_rules[0]
+                .verification
+                .is_some()
+        );
+        assert!(
+            !editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
 
         let mut edited = state.draft.as_ref().unwrap().image_rules[0].clone();
         edited.threshold = 0.92;

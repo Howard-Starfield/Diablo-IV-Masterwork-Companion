@@ -1279,7 +1279,10 @@ mod tests {
 
     impl WindowsSnapshotSource for FakeWindowsSnapshot {
         fn snapshot(&self, identity: CanonicalWindowIdentity) -> Result<CanonicalWindowsSnapshot> {
-            anyhow::ensure!(identity == self.0.identity, "wrong canonical window identity");
+            anyhow::ensure!(
+                identity == self.0.identity,
+                "wrong canonical window identity"
+            );
             Ok(self.0.clone())
         }
     }
@@ -1335,9 +1338,7 @@ mod tests {
         let capture = AtomicFrameCapture::new(snapshots, FakeRawCapture, FixedClock);
 
         let target = guard.snapshot().unwrap();
-        let frame = capture
-            .capture_frame(Rect::new(25, 40, 100, 80))
-            .unwrap();
+        let frame = capture.capture_frame(Rect::new(25, 40, 100, 80)).unwrap();
 
         assert_eq!(identity.hwnd().0 as isize, i32::MIN as isize + 1);
         assert_eq!(frame.metadata.window_id, target.window_id);

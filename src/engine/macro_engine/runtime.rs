@@ -1906,6 +1906,7 @@ impl MacroRuntime {
             emitter: &mut emitter,
             observations: HashMap::new(),
             last_observation_at_ms: None,
+            non_authoritative_planned_clicks: 0,
             paused_event_emitted: false,
             detector_generations: HashSet::new(),
         };
@@ -2018,6 +2019,9 @@ struct RunExecution<'a, 'clock> {
     emitter: &'a mut EventEmitter<'clock>,
     observations: HashMap<String, ObservationToken>,
     last_observation_at_ms: Option<u64>,
+    /// Simulation-only count of click actions emitted as planned during this run.
+    /// It is deliberately separate from, and cannot mutate, `ActionCommitter`'s live ledger.
+    non_authoritative_planned_clicks: u64,
     paused_event_emitted: bool,
     detector_generations: HashSet<u64>,
 }
@@ -2417,8 +2421,21 @@ impl RunExecution<'_, '_> {
             }
             None => None,
         };
-        // Planning is observation-only. The live `ActionCommitter` owns and consumes the
-        // authoritative click budget exactly at the pre-SendInput linearization boundary.
+        if is_click_action(action) {
+            if matches!(
+                self.compiled.definition().safety.max_clicks,
+                Limit::Finite(maximum)
+                    if self.non_authoritative_planned_clicks >= maximum
+            ) {
+                return Some(StopReason::SafetyLimit {
+                    message: "maximum click count exceeded".to_string(),
+                });
+            }
+            self.non_authoritative_planned_clicks =
+                self.non_authoritative_planned_clicks.saturating_add(1);
+        }
+        // This run-local simulation count gates planning only. The live `ActionCommitter`
+        // remains the sole owner of actual click consumption at the first SendInput boundary.
         self.emitter.action_planned(block_id, action.clone(), token);
         self.cooperative_wait(self.compiled.definition().safety.minimum_click_interval_ms)
     }
@@ -2586,6 +2603,16 @@ fn action_source(action: &Action) -> Option<&str> {
             target: super::ActionTarget::Point { .. } | super::ActionTarget::Region { .. },
         } => None,
     }
+}
+
+fn is_click_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::ClickTextMatch { .. }
+            | Action::ClickImageMatch { .. }
+            | Action::ClickPoint { .. }
+            | Action::ClickRegion { .. }
+    )
 }
 
 fn validate_action_token(
@@ -2998,6 +3025,73 @@ mod tests {
     impl CaptureSource for FakeCapture {
         fn capture(&self, _rect: Rect) -> Result<ScreenImage> {
             bail!("capture should not be called")
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct StableLiveTarget(TargetSnapshot);
+
+    impl TargetGuard for StableLiveTarget {
+        fn snapshot(&self) -> Result<TargetSnapshot> {
+            Ok(self.0.clone())
+        }
+
+        fn validate(&self, expected: &TargetSnapshot) -> Result<()> {
+            anyhow::ensure!(&self.0 == expected, "target changed");
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct SuccessfulLiveInput;
+
+    impl LiveActionInput for SuccessfulLiveInput {
+        fn reset_manual_baseline(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn manual_takeover_detected(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn dispatch_action(
+            &self,
+            _point: Point,
+            _button: MouseButton,
+            _movement: Option<&MouseMovementProfile>,
+            _stop: &dyn StopSource,
+            commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+            validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+        ) -> InputDispatchOutcome {
+            if let Err(reason) = commit() {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit {
+                    reason,
+                });
+            }
+            if let Err(reason) = validate_after_movement() {
+                return InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure: InputDispatchFailure::Validation { reason },
+                });
+            }
+            InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct NoopLiveControl;
+
+    impl LiveControlSink for NoopLiveControl {
+        fn pause_for_manual_takeover(&self) {}
+
+        fn stop_for_manual_takeover(&self) {}
+    }
+
+    #[derive(Debug, Default)]
+    struct NeverStop;
+
+    impl StopSource for NeverStop {
+        fn is_stopped(&self) -> bool {
+            false
         }
     }
 
@@ -3566,6 +3660,157 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, RunEvent::ActionPlanned { .. }))
         );
+    }
+
+    #[test]
+    fn dry_run_stops_before_planning_a_click_past_the_finite_limit() {
+        let mut definition = fixture_definition(vec![
+            point_action("allowed-click"),
+            point_action("blocked-click"),
+        ]);
+        definition.safety.max_clicks = Limit::Finite(1);
+
+        let events = fixture_runtime()
+            .run(saved(definition), RunMode::DryRun)
+            .unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RunEvent::ActionPlanned { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| {
+            matches!(event, RunEvent::ActionPlanned { block_id, .. } if block_id == "allowed-click")
+        }));
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::SafetyLimit { message },
+                ..
+            }) if message == "maximum click count exceeded"
+        ));
+    }
+
+    #[test]
+    fn observation_only_stops_before_planning_a_click_past_the_finite_limit() {
+        let mut definition = fixture_definition(vec![
+            point_action("allowed-click"),
+            point_action("blocked-click"),
+        ]);
+        definition.safety.max_clicks = Limit::Finite(1);
+
+        let events = fixture_runtime()
+            .run(saved(definition), RunMode::ObservationOnly)
+            .unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RunEvent::ActionPlanned { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::SafetyLimit { message },
+                ..
+            }) if message == "maximum click count exceeded"
+        ));
+    }
+
+    #[test]
+    fn simulated_planning_does_not_consume_the_live_committer_click_budget() {
+        let mut definition =
+            fixture_definition(vec![point_action("simulated"), point_action("over-limit")]);
+        definition.safety.max_clicks = Limit::Finite(1);
+        let compiled = CompiledMacro::compile(saved(definition.clone())).unwrap();
+
+        let simulated_events = fixture_runtime()
+            .run(saved(definition), RunMode::DryRun)
+            .unwrap();
+        assert_eq!(
+            simulated_events
+                .iter()
+                .filter(|event| matches!(event, RunEvent::ActionPlanned { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            simulated_events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::SafetyLimit { .. },
+                ..
+            })
+        ));
+
+        let target = TargetSnapshot {
+            window_id: 91,
+            process_id: 7,
+            process_started_at_100ns: 100,
+            process_path: "game.exe".to_string(),
+            client_rect: Rect::new(100, 100, 800, 600),
+            window_revision: 1,
+            geometry_revision: 2,
+            dpi: 144,
+            display_profile: "display-a".to_string(),
+            display_profile_revision: 3,
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
+        };
+        let session = LiveActionSession::new(
+            Arc::new(StableLiveTarget(target.clone())),
+            Arc::new(SuccessfulLiveInput),
+            Arc::new(NoopLiveControl),
+        );
+        let resume = session.resume().unwrap();
+        let action = Action::ClickPoint {
+            point_id: "point".to_string(),
+            button: MouseButton::Left,
+        };
+        let authorization = compiled
+            .authorize_action(
+                "live-run",
+                1,
+                1,
+                "simulated",
+                &action,
+                None,
+                &resume,
+                target
+                    .client_rect
+                    .point_from_ratio(PointRatio { x: 0.5, y: 0.5 }),
+                1_000,
+            )
+            .unwrap();
+        let committer = ActionCommitter::new(
+            session,
+            Arc::new(FrozenClock),
+            "live-run",
+            Limit::Finite(1),
+            1,
+        );
+        let prepared = committer
+            .prepare(ActionPrepareRequest::new(
+                authorization,
+                None,
+                0,
+                TakeoverPolicy::Stop,
+                resume,
+            ))
+            .unwrap();
+
+        let outcome = committer.commit(
+            prepared,
+            &NeverStop,
+            CommitContext::new("live-run", 1, None),
+        );
+
+        assert!(matches!(outcome, ActionOutcome::Dispatched { .. }));
+        assert_eq!(committer.committed_clicks(), 1);
     }
 
     #[test]

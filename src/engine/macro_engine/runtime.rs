@@ -413,7 +413,7 @@ pub struct LiveActionSession {
     input: Arc<dyn LiveActionInput>,
     control: Arc<dyn LiveControlSink>,
     resume: Mutex<ResumeState>,
-    registered_committer_runs: Mutex<HashSet<String>>,
+    registered_committer_run: Mutex<Option<String>>,
 }
 
 impl LiveActionSession {
@@ -428,7 +428,7 @@ impl LiveActionSession {
             input,
             control,
             resume: Mutex::new(ResumeState::default()),
-            registered_committer_runs: Mutex::new(HashSet::new()),
+            registered_committer_run: Mutex::new(None),
         })
     }
 
@@ -480,15 +480,26 @@ impl LiveActionSession {
         run_id: &str,
     ) -> std::result::Result<(), ActionCommitterCreateError> {
         let mut registered = self
-            .registered_committer_runs
+            .registered_committer_run
             .lock()
             .expect("live committer registry poisoned");
-        if !registered.insert(run_id.to_string()) {
+        if let Some(registered_run_id) = registered.as_ref() {
             return Err(ActionCommitterCreateError::RunAlreadyRegistered {
-                run_id: run_id.to_string(),
+                run_id: registered_run_id.clone(),
             });
         }
+        *registered = Some(run_id.to_string());
         Ok(())
+    }
+
+    fn release_committer_run(&self, run_id: &str) {
+        let mut registered = self
+            .registered_committer_run
+            .lock()
+            .expect("live committer registry poisoned");
+        if registered.as_deref() == Some(run_id) {
+            *registered = None;
+        }
     }
 }
 
@@ -918,12 +929,19 @@ impl ActionCommitter {
     }
 
     pub fn finish_run(&self) -> std::result::Result<(), BlockReason> {
-        let mut ledger = self.ledger.lock().expect("action attempt ledger poisoned");
-        if ledger.active.is_some() {
-            return Err(BlockReason::ActionLockBusy);
-        }
-        ledger.attempts.clear();
-        ledger.finished = true;
+        let run_id = {
+            let mut ledger = self.ledger.lock().expect("action attempt ledger poisoned");
+            if ledger.active.is_some() {
+                return Err(BlockReason::ActionLockBusy);
+            }
+            if ledger.finished {
+                return Ok(());
+            }
+            ledger.attempts.clear();
+            ledger.finished = true;
+            ledger.run_id.clone()
+        };
+        self.session.release_committer_run(&run_id);
         Ok(())
     }
 

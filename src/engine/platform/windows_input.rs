@@ -860,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn committer_registration_preserves_distinct_runs_and_sessions() {
+    fn committer_registration_rejects_concurrent_distinct_run_but_preserves_distinct_sessions() {
         let session = LiveActionSession::new(
             Arc::new(ScriptedTarget(Mutex::new(vec![target()]))),
             Arc::new(RecordingInput::default()),
@@ -894,8 +894,121 @@ mod tests {
         );
 
         assert!(run_one.is_ok());
-        assert!(run_two.is_ok());
+        assert!(matches!(
+            run_two,
+            Err(ActionCommitterCreateError::RunAlreadyRegistered { run_id }) if run_id == "run-1"
+        ));
         assert!(same_run_elsewhere.is_ok());
+    }
+
+    #[test]
+    fn successful_finish_releases_exactly_once_for_a_sequential_run() {
+        let session = LiveActionSession::new(
+            Arc::new(ScriptedTarget(Mutex::new(vec![target()]))),
+            Arc::new(RecordingInput::default()),
+            Arc::new(RecordingControl::default()),
+        );
+        session.activate_for_test(target());
+        let run_one = ActionCommitter::new(
+            session.clone(),
+            Arc::new(FixedClock(100)),
+            "run-1",
+            Limit::Finite(1),
+            8,
+        )
+        .unwrap();
+        assert!(matches!(
+            ActionCommitter::new(
+                session.clone(),
+                Arc::new(FixedClock(100)),
+                "run-2",
+                Limit::Finite(1),
+                8,
+            ),
+            Err(ActionCommitterCreateError::RunAlreadyRegistered { .. })
+        ));
+
+        run_one.finish_run().unwrap();
+        let run_two = ActionCommitter::new(
+            session.clone(),
+            Arc::new(FixedClock(100)),
+            "run-2",
+            Limit::Finite(1),
+            8,
+        )
+        .unwrap();
+        assert!(matches!(
+            run_one.prepare(request()),
+            Err(BlockReason::RunFinished)
+        ));
+
+        run_one.finish_run().unwrap();
+        assert!(matches!(
+            ActionCommitter::new(
+                session.clone(),
+                Arc::new(FixedClock(100)),
+                "run-3",
+                Limit::Finite(1),
+                8,
+            ),
+            Err(ActionCommitterCreateError::RunAlreadyRegistered { run_id }) if run_id == "run-2"
+        ));
+
+        run_two.finish_run().unwrap();
+        assert!(
+            ActionCommitter::new(
+                session,
+                Arc::new(FixedClock(100)),
+                "run-3",
+                Limit::Finite(1),
+                8,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn failed_finish_with_active_action_does_not_release_session_owner() {
+        let session = LiveActionSession::new(
+            Arc::new(ScriptedTarget(Mutex::new(vec![target()]))),
+            Arc::new(RecordingInput::default()),
+            Arc::new(RecordingControl::default()),
+        );
+        session.activate_for_test(target());
+        let run_one = ActionCommitter::new(
+            session.clone(),
+            Arc::new(FixedClock(100)),
+            "run-1",
+            Limit::Finite(1),
+            8,
+        )
+        .unwrap();
+        let prepared = run_one.prepare(request()).unwrap();
+
+        assert_eq!(run_one.finish_run(), Err(BlockReason::ActionLockBusy));
+        assert!(matches!(
+            ActionCommitter::new(
+                session.clone(),
+                Arc::new(FixedClock(100)),
+                "run-2",
+                Limit::Finite(1),
+                8,
+            ),
+            Err(ActionCommitterCreateError::RunAlreadyRegistered { run_id }) if run_id == "run-1"
+        ));
+
+        drop(prepared);
+        run_one.finish_run().unwrap();
+        assert!(
+            ActionCommitter::new(
+                session,
+                Arc::new(FixedClock(100)),
+                "run-2",
+                Limit::Finite(1),
+                8,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -920,11 +1033,11 @@ mod tests {
             ActionCommitter::new(
                 session.clone(),
                 Arc::new(FixedClock(100)),
-                "run-1",
+                "run-2",
                 Limit::Finite(1),
                 8,
             ),
-            Err(ActionCommitterCreateError::RunAlreadyRegistered { .. })
+            Err(ActionCommitterCreateError::RunAlreadyRegistered { run_id }) if run_id == "run-1"
         ));
         drop(session);
 

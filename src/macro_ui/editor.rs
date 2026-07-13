@@ -438,6 +438,7 @@ pub fn apply_editor_command(
         return Err(EditorError::RunInProgress);
     }
     ensure_unique_structural_ids(&draft.definition)?;
+    let target_rebind = matches!(&command, EditorCommand::ReplaceTarget { .. });
 
     if command == EditorCommand::MarkValidated {
         if !crate::engine::macro_engine::validate_macro(&draft.definition).is_empty()
@@ -482,7 +483,10 @@ pub fn apply_editor_command(
         return Err(EditorError::ValidationFailed);
     }
 
-    if candidate == before.definition && invalidated == before.invalidated_source_ids {
+    if !target_rebind
+        && candidate == before.definition
+        && invalidated == before.invalidated_source_ids
+    {
         return Ok(EditOutcome::NoChange);
     }
 
@@ -493,7 +497,11 @@ pub fn apply_editor_command(
     draft.undo.push_back(before);
     draft.definition = candidate;
     draft.invalidated_source_ids = invalidated;
-    draft.prune_superseded_detector_test_failures();
+    if target_rebind {
+        draft.detector_test_failures.clear();
+    } else {
+        draft.prune_superseded_detector_test_failures();
+    }
     draft.status = DraftStatus::NeedsValidation;
     Ok(EditOutcome::Changed)
 }
@@ -842,20 +850,18 @@ fn apply_to_definition(
             invalidated.insert(path.block_id);
         }
         EditorCommand::ReplaceTarget { target } => {
-            if definition.target != target {
-                definition.target = target;
-                for rule in &mut definition.image_rules {
-                    rule.verification = None;
-                }
-                let rule_ids = definition
-                    .text_rules
-                    .iter()
-                    .map(|rule| rule.id.as_str())
-                    .chain(definition.image_rules.iter().map(|rule| rule.id.as_str()))
-                    .collect::<Vec<_>>();
-                for rule_id in rule_ids {
-                    invalidated.extend(source_ids_for_rule(&definition.blocks, rule_id));
-                }
+            definition.target = target;
+            for rule in &mut definition.image_rules {
+                rule.verification = None;
+            }
+            let rule_ids = definition
+                .text_rules
+                .iter()
+                .map(|rule| rule.id.as_str())
+                .chain(definition.image_rules.iter().map(|rule| rule.id.as_str()))
+                .collect::<Vec<_>>();
+            for rule_id in rule_ids {
+                invalidated.extend(source_ids_for_rule(&definition.blocks, rule_id));
             }
         }
         EditorCommand::ReplaceTextRule { mut rule } => {
@@ -2465,18 +2471,6 @@ mod tests {
         let mut draft = EditorDraft::new(definition);
         let original = draft.definition.target.clone();
 
-        assert_eq!(
-            apply_editor_command(
-                &mut draft,
-                EditorCommand::ReplaceTarget {
-                    target: original.clone(),
-                },
-            ),
-            Ok(EditOutcome::NoChange)
-        );
-        assert_eq!(draft.definition.revision, 4);
-        assert_eq!(draft.undo_len(), 0);
-
         let mut replacement = original.clone();
         replacement.captured_dpi = 144;
         assert_eq!(
@@ -2499,6 +2493,49 @@ mod tests {
             Some(verification)
         );
         assert!(!draft.invalidated_source_ids().contains("image-source"));
+    }
+
+    #[test]
+    fn identical_profile_retarget_invalidates_proofs_and_detector_failures_and_is_undoable() {
+        let (mut definition, verification) = image_definition_and_verification();
+        definition.image_rules[0].verification = Some(verification.clone());
+        let mut draft = EditorDraft::new(definition);
+        let target = draft.definition.target.clone();
+        let failed_fingerprint =
+            detector_fingerprint_for_block(&draft.definition, "image-source").unwrap();
+        draft.record_detector_test_failure(
+            "image-source",
+            failed_fingerprint,
+            "known failure before retarget",
+        );
+
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::ReplaceTarget {
+                    target: target.clone(),
+                },
+            ),
+            Ok(EditOutcome::Changed)
+        );
+        assert_eq!(draft.definition.revision, 5);
+        assert_eq!(draft.definition.target, target);
+        assert!(draft.definition.image_rules[0].verification.is_none());
+        assert!(draft.invalidated_source_ids().contains("image-source"));
+        assert!(draft.detector_test_failures.is_empty());
+
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        assert_eq!(draft.definition.revision, 6);
+        assert_eq!(
+            draft.definition.image_rules[0].verification,
+            Some(verification)
+        );
+        assert!(!draft.invalidated_source_ids().contains("image-source"));
+        assert!(draft.detector_test_failures.contains_key("image-source"));
+        assert_eq!(
+            apply_editor_command(&mut draft, EditorCommand::MarkValidated),
+            Err(EditorError::ValidationFailed)
+        );
     }
 
     #[test]

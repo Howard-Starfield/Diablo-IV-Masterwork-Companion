@@ -630,6 +630,8 @@ pub struct MacroStore {
     lock: Arc<Mutex<()>>,
     #[cfg(test)]
     fail_import_after_assets: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_staged_finalize_cleanup: Arc<AtomicBool>,
 }
 
 impl MacroStore {
@@ -653,6 +655,8 @@ impl MacroStore {
             lock,
             #[cfg(test)]
             fail_import_after_assets: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_staged_finalize_cleanup: Arc::new(AtomicBool::new(false)),
         };
         {
             let _guard = lock_store(&store.lock)?;
@@ -663,6 +667,7 @@ impl MacroStore {
             } else {
                 store.assets.load_index_locked()?;
             }
+            store.assets.load_staged_revision_journal_locked()?;
             if first_live_owner {
                 store.recover_staged_asset_revisions_locked()?;
             }
@@ -696,6 +701,7 @@ impl MacroStore {
                 });
             }
         }
+        let staged_after_save = self.prepare_staged_asset_finalization_locked(&definition)?;
 
         let bytes = serde_json::to_vec_pretty(&definition)?;
         let saved = SavedRevision {
@@ -732,7 +738,15 @@ impl MacroStore {
             }
             return Err(error.context("current revision publication failed"));
         }
-        self.finalize_staged_asset_revisions_locked(&saved.definition)?;
+        #[cfg(test)]
+        let skip_staged_cleanup = self.fail_staged_finalize_cleanup.load(Ordering::SeqCst);
+        #[cfg(not(test))]
+        let skip_staged_cleanup = false;
+        if !skip_staged_cleanup {
+            let _ = self
+                .assets
+                .write_staged_revision_journal_locked(&staged_after_save);
+        }
         Ok(saved)
     }
 
@@ -770,23 +784,23 @@ impl MacroStore {
         self.assets.write_staged_revision_journal_locked(&journal)
     }
 
-    fn finalize_staged_asset_revisions_locked(&self, definition: &MacroDefinition) -> Result<()> {
+    fn prepare_staged_asset_finalization_locked(
+        &self,
+        definition: &MacroDefinition,
+    ) -> Result<StagedAssetRevisionJournal> {
         let mut journal = self.assets.load_staged_revision_journal_locked()?;
         if journal.entries.is_empty() {
-            return Ok(());
+            return Ok(journal);
         }
         let referenced_latest = latest_asset_revisions(referenced_assets(definition));
         let index = self.assets.load_index_locked()?;
         for staged in &journal.entries {
-            let is_referenced = referenced_latest
-                .get(staged.successor.id.as_str())
-                .is_some_and(|revision| *revision >= staged.successor.revision);
-            if is_referenced {
-                validate_identity_binding(&index.bindings, &staged.successor)
-                    .context("saved definition references an unavailable staged revision")?;
+            for asset in [&staged.previous, &staged.successor] {
+                validate_identity_binding(&index.bindings, asset)
+                    .context("staged asset finalization has an unavailable identity binding")?;
                 self.assets
-                    .verify_hash_file_locked(&staged.successor.content_hash)
-                    .context("saved staged template bytes are unavailable or corrupt")?;
+                    .verify_hash_file_locked(&asset.content_hash)
+                    .context("staged asset finalization bytes are unavailable or corrupt")?;
             }
         }
         journal.entries.retain(|staged| {
@@ -794,7 +808,7 @@ impl MacroStore {
                 .get(staged.successor.id.as_str())
                 .is_some_and(|revision| *revision >= staged.successor.revision)
         });
-        self.assets.write_staged_revision_journal_locked(&journal)
+        Ok(journal)
     }
 
     fn durable_definition_asset_refs_locked(
@@ -2598,6 +2612,87 @@ mod tests {
 
         let restarted = MacroStore::open(temp.path()).unwrap();
         assert!(restarted.assets().read(&staged).is_err());
+    }
+
+    #[test]
+    fn additional_live_store_open_still_rejects_a_corrupt_staged_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = MacroStore::open(temp.path()).unwrap();
+        fs::write(&first.assets.staged_revision_journal, b"{not valid json").unwrap();
+
+        let error = MacroStore::open(temp.path()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("corrupt staged asset revision journal")
+        );
+    }
+
+    #[test]
+    fn corrupt_staged_journal_blocks_save_before_any_definition_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let original = store.assets().put_png(b"original").unwrap();
+        let staged = store
+            .assets()
+            .stage_next_png_revision(&original, b"successor")
+            .unwrap();
+        fs::write(&store.assets.staged_revision_journal, b"{not valid json").unwrap();
+
+        let error = store.save(fixture_definition(staged)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("corrupt staged asset revision journal")
+        );
+        assert!(
+            !temp
+                .path()
+                .join("macro_data/definitions/macro-one")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn staged_cleanup_failure_after_publication_returns_certain_success_and_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let staged;
+        {
+            let store = MacroStore::open(temp.path()).unwrap();
+            let original = store.assets().put_png(b"original").unwrap();
+            staged = store
+                .assets()
+                .stage_next_png_revision(&original, b"durable successor")
+                .unwrap();
+            store
+                .fail_staged_finalize_cleanup
+                .store(true, Ordering::SeqCst);
+
+            let saved = store
+                .save(fixture_definition(staged.clone()))
+                .expect("durable publication remains a certain success");
+
+            assert_eq!(saved.definition.image_rules[0].template, staged);
+            assert!(store.assets.staged_revision_journal.exists());
+            let current: MacroDefinition = serde_json::from_slice(
+                &fs::read(
+                    temp.path()
+                        .join("macro_data/definitions/macro-one/current.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(current.image_rules[0].template, staged);
+        }
+
+        let reopened = MacroStore::open(temp.path()).unwrap();
+        assert_eq!(
+            reopened.assets().read(&staged).unwrap(),
+            b"durable successor"
+        );
+        assert!(!reopened.assets.staged_revision_journal.exists());
     }
 
     #[test]

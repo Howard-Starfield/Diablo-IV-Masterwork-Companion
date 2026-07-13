@@ -1,7 +1,11 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 use std::{
     fs,
+    io::Cursor,
     path::PathBuf,
     sync::{
         Arc,
@@ -15,6 +19,30 @@ use std::{
 mod engine;
 mod macro_ui;
 
+use crate::engine::{
+    config::{EnchantConfig, MouseMovementProfile, default_mouse_movement_profile},
+    enchant_loop::{EnchantEvent, EnchantRunner, OcrReader, RegionCapture},
+    macro_engine::{
+        AssetStore, ClusterPolicy, DEFAULT_MAX_SCORE_CELLS, ImageMatchConfig, ImageMatcher,
+        ImageRule, ImageRuleVerification, ImageRuleVerificationInput, Limit, MacroStore,
+        MatchSelectionPolicy, NegativeCorpusSample, NegativeSampleEvaluationInputs,
+        authoring_test_text_rule, cluster_peaks,
+    },
+    matcher::{MatchResult, match_affix},
+    platform::{
+        CaptureRequestId, EscStopSignal, MacroCaptureKind, MacroCaptureRequest,
+        MacroCaptureSelection, SendInputController, WindowsOcrReader, XcapRegionCapture,
+        enable_per_monitor_dpi_awareness, record_mouse_movement_profile,
+        resolve_target_from_selection, select_macro_capture, select_screen_rect,
+    },
+    types::{PointRatio, Rect, RectRatio},
+};
+use crate::macro_ui::WIZARD_IMAGE_THRESHOLD;
+use crate::macro_ui::{
+    EditorAuthoringKind, EditorAuthoringOutcome, EditorAuthoringRequest, EditorAuthoringResult,
+    EditorDraft, MacroPage, MacroPageState, WizardAuthoringKind, WizardAuthoringOutcome,
+    WizardAuthoringRequest, WizardAuthoringResult, WizardDetector,
+};
 use eframe::{
     App, CreationContext,
     egui::{
@@ -22,18 +50,9 @@ use eframe::{
         Slider, Stroke, TopBottomPanel, Ui, Vec2, ViewportCommand, Widget,
     },
 };
-use crate::engine::{
-    config::{EnchantConfig, MouseMovementProfile, default_mouse_movement_profile},
-    enchant_loop::{EnchantEvent, EnchantRunner, OcrReader, RegionCapture},
-    matcher::{MatchResult, match_affix},
-    platform::{
-        EscStopSignal, SendInputController, WindowsOcrReader, XcapRegionCapture,
-        enable_per_monitor_dpi_awareness, record_mouse_movement_profile, select_screen_rect,
-    },
-    types::{PointRatio, Rect, RectRatio},
-};
-use crate::macro_ui::{MacroPage, MacroPageState};
+use image::{DynamicImage, ImageFormat};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const APP_WIDTH: f32 = 600.0;
 const APP_HEIGHT: f32 = 760.0;
@@ -203,6 +222,11 @@ enum UiEvent {
     StopRequested,
     BotEvent(EnchantEvent),
     BotFinished(anyhow::Result<()>),
+    MacroAuthoringFinished {
+        result: WizardAuthoringResult,
+        target_client: Option<Rect>,
+    },
+    EditorAuthoringFinished(EditorAuthoringResult),
 }
 
 #[derive(Debug)]
@@ -281,6 +305,8 @@ struct NativeApp {
     stop_watcher_done: Option<Arc<AtomicBool>>,
     active_ocr_rect: Option<Rect>,
     dirty: bool,
+    macro_target_client: Option<Rect>,
+    macro_store: Option<MacroStore>,
 }
 
 impl NativeApp {
@@ -289,6 +315,7 @@ impl NativeApp {
         let (tx, rx) = mpsc::channel();
         let config_path = config_path();
         let (config, migrated_config) = load_native_config(&config_path);
+        let macro_store = open_macro_authoring_store();
         Self {
             page: AppPage::Enchant,
             macro_state: MacroPageState::default(),
@@ -313,6 +340,8 @@ impl NativeApp {
             stop_watcher_done: None,
             active_ocr_rect: None,
             dirty: migrated_config,
+            macro_target_client: None,
+            macro_store,
         }
     }
 
@@ -368,6 +397,63 @@ impl NativeApp {
                 | CaptureKind::CloseButton { .. } => select_screen_rect(10).map(CaptureValue::Rect),
             };
             send_ui_event(&tx, &repaint, UiEvent::CaptureFinished(kind, result));
+        });
+    }
+
+    fn begin_macro_authoring(&mut self, request: WizardAuthoringRequest) {
+        let Some(wizard) = self.macro_state.wizard.clone() else {
+            return;
+        };
+        let target_client = self.macro_target_client;
+        let assets = self
+            .macro_store
+            .as_ref()
+            .map(|store| store.assets().clone());
+        let tx = self.tx.clone();
+        let repaint = self.egui_ctx.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let (outcome, captured_target) =
+                run_macro_authoring_request(&request, &wizard, target_client, assets);
+            let result = WizardAuthoringResult {
+                id: request.id,
+                fingerprint: request.fingerprint,
+                outcome,
+            };
+            send_ui_event(
+                &tx,
+                &repaint,
+                UiEvent::MacroAuthoringFinished {
+                    result,
+                    target_client: captured_target,
+                },
+            );
+        });
+    }
+
+    fn begin_editor_authoring(&mut self, request: EditorAuthoringRequest) {
+        let Some(draft) = self.macro_state.draft.clone() else {
+            return;
+        };
+        let target_client = self.macro_target_client;
+        let assets = self
+            .macro_store
+            .as_ref()
+            .map(|store| store.assets().clone());
+        let tx = self.tx.clone();
+        let repaint = self.egui_ctx.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let outcome = run_editor_authoring_request(&request, &draft, target_client, assets);
+            send_ui_event(
+                &tx,
+                &repaint,
+                UiEvent::EditorAuthoringFinished(EditorAuthoringResult {
+                    id: request.id,
+                    fingerprint: request.fingerprint,
+                    outcome,
+                }),
+            );
         });
     }
 
@@ -506,6 +592,30 @@ impl NativeApp {
                     } else if self.status == BotState::Running {
                         self.status = BotState::Stopped;
                         self.status_message = "Bot stopped.".to_string();
+                    }
+                }
+                UiEvent::MacroAuthoringFinished {
+                    result,
+                    target_client,
+                } => {
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    match self.macro_state.apply_wizard_result(result) {
+                        Ok(()) => {
+                            if let Some(target_client) = target_client {
+                                self.macro_target_client = Some(target_client);
+                            }
+                        }
+                        Err(error) => {
+                            self.macro_state.editor_feedback =
+                                Some(format!("Discarded macro authoring result: {error:?}"));
+                        }
+                    }
+                }
+                UiEvent::EditorAuthoringFinished(result) => {
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    if let Err(error) = self.macro_state.apply_editor_authoring_result(result) {
+                        self.macro_state.editor_feedback =
+                            Some(format!("Discarded editor authoring result: {error:?}"));
                     }
                 }
             }
@@ -766,6 +876,14 @@ impl App for NativeApp {
                         }
                     });
             });
+        if self.page == AppPage::Macro {
+            if let Some(request) = self.macro_state.take_wizard_request() {
+                self.begin_macro_authoring(request);
+            }
+            if let Some(request) = self.macro_state.take_editor_authoring_request() {
+                self.begin_editor_authoring(request);
+            }
+        }
     }
 }
 
@@ -1126,9 +1244,7 @@ impl NativeApp {
                                 ui.add_sized(
                                     [CALIBRATION_BUTTON_WIDTH, ACTION_BUTTON_HEIGHT],
                                     Button::new(
-                                        RichText::new("Start")
-                                            .strong()
-                                            .color(Color32::BLACK),
+                                        RichText::new("Start").strong().color(Color32::BLACK),
                                     )
                                     .fill(Color32::from_rgb(246, 111, 25)),
                                 )
@@ -1142,9 +1258,7 @@ impl NativeApp {
                                 ui.add_sized(
                                     [CALIBRATION_BUTTON_WIDTH, ACTION_BUTTON_HEIGHT],
                                     Button::new(
-                                        RichText::new("Stop")
-                                            .strong()
-                                            .color(Color32::WHITE),
+                                        RichText::new("Stop").strong().color(Color32::WHITE),
                                     ),
                                 )
                             })
@@ -1357,6 +1471,499 @@ fn test_ocr(config: EnchantConfig) -> anyhow::Result<TestOcrResult> {
     })
 }
 
+fn run_macro_authoring_request(
+    request: &WizardAuthoringRequest,
+    wizard: &crate::macro_ui::WizardState,
+    target_client: Option<Rect>,
+    assets: Option<AssetStore>,
+) -> (WizardAuthoringOutcome, Option<Rect>) {
+    let run = || -> anyhow::Result<(WizardAuthoringOutcome, Option<Rect>)> {
+        if request.kind == WizardAuthoringKind::CaptureTarget {
+            let selection = select_screen_rect(40)?;
+            let target = resolve_target_from_selection(selection)?;
+            return Ok((
+                WizardAuthoringOutcome::TargetGeometry {
+                    process_path: target.process_path,
+                    window_class: target.window_class,
+                    title: target.title,
+                    width: target.client_rect.width,
+                    height: target.client_rect.height,
+                    dpi: target.dpi,
+                },
+                Some(target.client_rect),
+            ));
+        }
+        let target = target_client
+            .ok_or_else(|| anyhow::anyhow!("capture the concrete target window region first"))?;
+        if matches!(
+            request.kind,
+            WizardAuthoringKind::TestDetector | WizardAuthoringKind::CaptureImageNegative
+        ) {
+            let capture_rect = target.rect_from_ratio(wizard.region);
+            let started = Instant::now();
+            let capture = XcapRegionCapture;
+            let image = RegionCapture::capture_region(&capture, capture_rect)?;
+            return match &wizard.detector {
+                WizardDetector::Text => {
+                    anyhow::ensure!(
+                        request.kind == WizardAuthoringKind::TestDetector,
+                        "negative samples apply only to image rules"
+                    );
+                    let rule = wizard
+                        .text_rule_for_authoring()
+                        .ok_or_else(|| anyhow::anyhow!("wizard OCR rule is unavailable"))?;
+                    let tested = authoring_test_text_rule(&image, capture_rect, &rule)?;
+                    let evidence = tested
+                        .words
+                        .iter()
+                        .map(|word| word.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    Ok((
+                        WizardAuthoringOutcome::DetectorTest {
+                            passed: tested.text_match.matched,
+                            evidence,
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                            image_verification: None,
+                        },
+                        None,
+                    ))
+                }
+                WizardDetector::Image { template } => {
+                    let store = assets
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
+                    let template_bytes = store.read(template)?;
+                    let template_image =
+                        ImageRuleVerification::decode_template_png(&template_bytes)?;
+                    let config = ImageMatchConfig {
+                        threshold: WIZARD_IMAGE_THRESHOLD,
+                        scales_percent: vec![95, 100, 105],
+                    };
+                    let result = ImageMatcher.match_screen_image(
+                        &image,
+                        capture_rect,
+                        &template_image,
+                        &config,
+                    )?;
+                    let rule = ImageRule {
+                        id: "image-rule".into(),
+                        revision: 1,
+                        region_id: "detect-region".into(),
+                        template: template.clone(),
+                        transparent_mask: None,
+                        threshold: WIZARD_IMAGE_THRESHOLD,
+                        scales_percent: vec![95, 100, 105],
+                        stable_frames: 2,
+                        maximum_center_drift_px: 5,
+                        minimum_runner_up_margin: 0.05,
+                        verification: None,
+                        match_policy: MatchSelectionPolicy::ExactlyOne,
+                        poll_interval_ms: 100,
+                        timeout_ms: Limit::Unlimited,
+                    };
+                    if request.kind == WizardAuthoringKind::CaptureImageNegative {
+                        anyhow::ensure!(
+                            result.candidates.is_empty(),
+                            "current frame still matches the template; show a known-negative frame"
+                        );
+                        let mut png = Vec::new();
+                        DynamicImage::ImageRgba8(image.rgba.clone())
+                            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)?;
+                        let sample = NegativeCorpusSample {
+                            stable_id: format!("wizard/negative/{}", request.id.0),
+                            content_sha256: format!("{:x}", Sha256::digest(&png)),
+                            measured_score: result.best.score,
+                            evaluation: NegativeSampleEvaluationInputs::for_rule(
+                                &rule,
+                                wizard.target.captured_dpi,
+                                1,
+                                (capture_rect.width, capture_rect.height),
+                            ),
+                        };
+                        return Ok((WizardAuthoringOutcome::ImageNegativeSample(sample), None));
+                    }
+                    let passed = !result.candidates.is_empty();
+                    let verification = if passed && !wizard.image_negative_samples.is_empty() {
+                        let clusters =
+                            cluster_peaks(result.candidates.clone(), ClusterPolicy::default())?;
+                        Some(
+                            ImageRuleVerification::verify(ImageRuleVerificationInput {
+                                rule: &rule,
+                                template: &template_image,
+                                mask: None,
+                                captured_dpi: wizard.target.captured_dpi,
+                                current_dpi: wizard.target.captured_dpi,
+                                region_revision: 1,
+                                search_dimensions: (capture_rect.width, capture_rect.height),
+                                negative_samples: &wizard.image_negative_samples,
+                                observed_clusters: &clusters,
+                                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+                            })?
+                            .into_artifact(),
+                        )
+                    } else {
+                        None
+                    };
+                    Ok((
+                        WizardAuthoringOutcome::DetectorTest {
+                            passed: passed && verification.is_some(),
+                            evidence: format!(
+                                "best {:.3}; {} candidate(s); {}",
+                                result.best.score,
+                                result.candidates.len(),
+                                if verification.is_some() {
+                                    "local verification passed"
+                                } else {
+                                    "capture at least one explicit negative sample"
+                                }
+                            ),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                            image_verification: verification,
+                        },
+                        None,
+                    ))
+                }
+            };
+        }
+
+        let capture_kind = match request.kind {
+            WizardAuthoringKind::CaptureTextRegion => MacroCaptureKind::TextRegion,
+            WizardAuthoringKind::CaptureImageRegion => MacroCaptureKind::ImageSearchRegion,
+            WizardAuthoringKind::CaptureTemplate => MacroCaptureKind::TemplateCrop,
+            WizardAuthoringKind::CaptureClickPoint => MacroCaptureKind::ClickPoint,
+            WizardAuthoringKind::CaptureClickRegion => MacroCaptureKind::ClickRegion,
+            WizardAuthoringKind::CaptureTarget
+            | WizardAuthoringKind::TestDetector
+            | WizardAuthoringKind::CaptureImageNegative => unreachable!(),
+        };
+        let response = select_macro_capture(MacroCaptureRequest {
+            id: CaptureRequestId(request.id.0),
+            kind: capture_kind,
+            target_client: target,
+            min_size: if capture_kind == MacroCaptureKind::ClickPoint {
+                1
+            } else {
+                4
+            },
+        })?;
+        let outcome = match response.selection {
+            MacroCaptureSelection::Region(rect) => WizardAuthoringOutcome::Region(rect),
+            MacroCaptureSelection::Point(point) => WizardAuthoringOutcome::Point(point),
+            MacroCaptureSelection::TemplateCrop {
+                region: _,
+                screen_rect,
+            } => {
+                let store = assets
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
+                let capture = XcapRegionCapture;
+                let captured = RegionCapture::capture_region(&capture, screen_rect)?;
+                let mut bytes = Vec::new();
+                DynamicImage::ImageRgba8(captured.rgba)
+                    .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
+                let asset = match &wizard.detector {
+                    WizardDetector::Image { template } if template.revision > 0 => {
+                        store.put_next_png_revision(template, &bytes)?
+                    }
+                    _ => store.put_png(&bytes)?,
+                };
+                WizardAuthoringOutcome::Template { asset }
+            }
+        };
+        Ok((outcome, None))
+    };
+
+    match run() {
+        Ok(result) => result,
+        Err(error) if error.to_string().to_ascii_lowercase().contains("cancel") => {
+            (WizardAuthoringOutcome::Cancelled, None)
+        }
+        Err(error) => (WizardAuthoringOutcome::Failed(error.to_string()), None),
+    }
+}
+
+fn run_editor_authoring_request(
+    request: &EditorAuthoringRequest,
+    draft: &EditorDraft,
+    target_client: Option<Rect>,
+    assets: Option<AssetStore>,
+) -> EditorAuthoringOutcome {
+    let run = || -> anyhow::Result<EditorAuthoringOutcome> {
+        let target = target_client
+            .ok_or_else(|| anyhow::anyhow!("capture a concrete wizard target first"))?;
+        match &request.kind {
+            EditorAuthoringKind::RecaptureRegion { region_id } => {
+                let kind = if draft
+                    .image_rules
+                    .iter()
+                    .any(|rule| rule.region_id == *region_id)
+                {
+                    MacroCaptureKind::ImageSearchRegion
+                } else {
+                    MacroCaptureKind::TextRegion
+                };
+                let response = select_macro_capture(MacroCaptureRequest {
+                    id: CaptureRequestId(request.id.0),
+                    kind,
+                    target_client: target,
+                    min_size: 4,
+                })?;
+                let MacroCaptureSelection::Region(rect) = response.selection else {
+                    anyhow::bail!("region capture returned the wrong result type")
+                };
+                Ok(EditorAuthoringOutcome::Region(rect))
+            }
+            EditorAuthoringKind::RecaptureTemplate { rule_id } => {
+                let rule = draft
+                    .image_rules
+                    .iter()
+                    .find(|rule| rule.id == *rule_id)
+                    .ok_or_else(|| anyhow::anyhow!("image rule is missing"))?;
+                let response = select_macro_capture(MacroCaptureRequest {
+                    id: CaptureRequestId(request.id.0),
+                    kind: MacroCaptureKind::TemplateCrop,
+                    target_client: target,
+                    min_size: 4,
+                })?;
+                let MacroCaptureSelection::TemplateCrop { screen_rect, .. } = response.selection
+                else {
+                    anyhow::bail!("template capture returned the wrong result type")
+                };
+                let captured = RegionCapture::capture_region(&XcapRegionCapture, screen_rect)?;
+                let mut bytes = Vec::new();
+                DynamicImage::ImageRgba8(captured.rgba)
+                    .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
+                let store = assets
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
+                let asset = store.put_next_png_revision(&rule.template, &bytes)?;
+                Ok(EditorAuthoringOutcome::Template { asset })
+            }
+            EditorAuthoringKind::TestOcr { block_id } => {
+                let condition = find_editor_condition(&draft.blocks, block_id)
+                    .ok_or_else(|| anyhow::anyhow!("selected OCR block no longer exists"))?;
+                let crate::engine::macro_engine::Condition::Text { rule_id, .. } = condition else {
+                    anyhow::bail!("selected block is not an OCR condition")
+                };
+                let rule = draft
+                    .text_rules
+                    .iter()
+                    .find(|rule| &rule.id == rule_id)
+                    .ok_or_else(|| anyhow::anyhow!("OCR rule is missing"))?;
+                let region = draft
+                    .regions
+                    .iter()
+                    .find(|region| region.id == rule.region_id)
+                    .ok_or_else(|| anyhow::anyhow!("OCR region is missing"))?;
+                let started = Instant::now();
+                let capture_rect = target.rect_from_ratio(region.rect);
+                let image = RegionCapture::capture_region(&XcapRegionCapture, capture_rect)?;
+                let tested = authoring_test_text_rule(&image, capture_rect, rule)?;
+                let evidence = tested
+                    .words
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Ok(EditorAuthoringOutcome::DetectorTest {
+                    passed: tested.text_match.matched,
+                    evidence,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    rule_id: None,
+                    image_verification: None,
+                })
+            }
+            EditorAuthoringKind::TestImage { block_id }
+            | EditorAuthoringKind::CaptureImageNegative { block_id } => {
+                let condition = find_editor_condition(&draft.blocks, block_id)
+                    .ok_or_else(|| anyhow::anyhow!("selected image block no longer exists"))?;
+                let crate::engine::macro_engine::Condition::Image { rule_id, .. } = condition
+                else {
+                    anyhow::bail!("selected block is not an image condition")
+                };
+                let rule = draft
+                    .image_rules
+                    .iter()
+                    .find(|rule| &rule.id == rule_id)
+                    .ok_or_else(|| anyhow::anyhow!("image rule is missing"))?;
+                let region = draft
+                    .regions
+                    .iter()
+                    .find(|region| region.id == rule.region_id)
+                    .ok_or_else(|| anyhow::anyhow!("image region is missing"))?;
+                let store = assets
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("macro asset store is unavailable"))?;
+                let template =
+                    ImageRuleVerification::decode_template_png(&store.read(&rule.template)?)?;
+                let started = Instant::now();
+                let capture_rect = target.rect_from_ratio(region.rect);
+                let image = RegionCapture::capture_region(&XcapRegionCapture, capture_rect)?;
+                let result = ImageMatcher.match_screen_image(
+                    &image,
+                    capture_rect,
+                    &template,
+                    &ImageMatchConfig {
+                        threshold: rule.threshold,
+                        scales_percent: rule.scales_percent.clone(),
+                    },
+                )?;
+                if matches!(
+                    &request.kind,
+                    EditorAuthoringKind::CaptureImageNegative { .. }
+                ) {
+                    anyhow::ensure!(
+                        result.candidates.is_empty(),
+                        "current frame still matches the template; show a known-negative frame"
+                    );
+                    let mut png = Vec::new();
+                    DynamicImage::ImageRgba8(image.rgba.clone())
+                        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)?;
+                    return Ok(EditorAuthoringOutcome::ImageNegativeSample {
+                        block_id: block_id.clone(),
+                        sample: NegativeCorpusSample {
+                            stable_id: format!("editor/{}/negative/{}", block_id, request.id.0),
+                            content_sha256: format!("{:x}", Sha256::digest(&png)),
+                            measured_score: result.best.score,
+                            evaluation: NegativeSampleEvaluationInputs::for_rule(
+                                rule,
+                                draft.target.captured_dpi,
+                                region.revision,
+                                (capture_rect.width, capture_rect.height),
+                            ),
+                        },
+                    });
+                }
+                let clusters = cluster_peaks(result.candidates.clone(), ClusterPolicy::default())?;
+                let verification =
+                    if !clusters.is_empty() && !request.image_negative_samples.is_empty() {
+                        Some(
+                            ImageRuleVerification::verify(ImageRuleVerificationInput {
+                                rule,
+                                template: &template,
+                                mask: None,
+                                captured_dpi: draft.target.captured_dpi,
+                                current_dpi: draft.target.captured_dpi,
+                                region_revision: region.revision,
+                                search_dimensions: (capture_rect.width, capture_rect.height),
+                                negative_samples: &request.image_negative_samples,
+                                observed_clusters: &clusters,
+                                maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+                            })?
+                            .into_artifact(),
+                        )
+                    } else {
+                        None
+                    };
+                Ok(EditorAuthoringOutcome::DetectorTest {
+                    passed: verification.is_some(),
+                    evidence: format!(
+                        "best {:.3}; {} candidate(s); {}",
+                        result.best.score,
+                        result.candidates.len(),
+                        if verification.is_some() {
+                            "local verification passed"
+                        } else {
+                            "capture a negative frame"
+                        }
+                    ),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    rule_id: Some(rule.id.clone()),
+                    image_verification: verification,
+                })
+            }
+        }
+    };
+    match run() {
+        Ok(outcome) => outcome,
+        Err(error) if error.to_string().to_ascii_lowercase().contains("cancel") => {
+            EditorAuthoringOutcome::Cancelled
+        }
+        Err(error) => EditorAuthoringOutcome::Failed(error.to_string()),
+    }
+}
+
+fn find_editor_condition<'a>(
+    blocks: &'a [crate::engine::macro_engine::Block],
+    id: &str,
+) -> Option<&'a crate::engine::macro_engine::Condition> {
+    use crate::engine::macro_engine::{BlockKind, ObserveMode, TimeoutOutcome};
+    fn timeout_body(
+        condition: &crate::engine::macro_engine::Condition,
+    ) -> Option<&[crate::engine::macro_engine::Block]> {
+        let mode = match condition {
+            crate::engine::macro_engine::Condition::Text { mode, .. }
+            | crate::engine::macro_engine::Condition::Image { mode, .. } => mode,
+        };
+        match mode {
+            ObserveMode::WaitForTrue {
+                timeout_outcome: TimeoutOutcome::RunBody { body },
+                ..
+            }
+            | ObserveMode::WaitForFalse {
+                timeout_outcome: TimeoutOutcome::RunBody { body },
+                ..
+            } => Some(body),
+            _ => None,
+        }
+    }
+    for block in blocks {
+        let condition = match &block.kind {
+            BlockKind::Observe { condition }
+            | BlockKind::If { condition, .. }
+            | BlockKind::RepeatUntil { condition, .. } => Some(condition),
+            _ => None,
+        };
+        if block.id == id {
+            return condition;
+        }
+        let mut children: Vec<&[crate::engine::macro_engine::Block]> = Vec::new();
+        match &block.kind {
+            BlockKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                children.push(then_body);
+                children.push(else_body);
+            }
+            BlockKind::RepeatN { body, .. }
+            | BlockKind::RepeatUntil { body, .. }
+            | BlockKind::Continuous { body } => children.push(body),
+            BlockKind::WatchGroup { group } => {
+                for lane in &group.lanes {
+                    children.push(&lane.then_body);
+                }
+                if let TimeoutOutcome::RunBody { body } = &group.timeout_outcome {
+                    children.push(body);
+                }
+            }
+            _ => {}
+        }
+        if let Some(condition) = condition {
+            if let Some(body) = timeout_body(condition) {
+                children.push(body);
+            }
+        }
+        for child in children {
+            if let Some(found) = find_editor_condition(child, id) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn open_macro_authoring_store() -> Option<MacroStore> {
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("BoBo Companion")
+        .join("Macro Authoring");
+    MacroStore::open(&root).ok()
+}
+
 fn config_path() -> PathBuf {
     exe_root_dir().join("enchant_config_native.json")
 }
@@ -1415,10 +2022,7 @@ mod routing_tests {
             bottom_surface(AppPage::Enchant),
             BottomSurface::EnchantActions
         );
-        assert_eq!(
-            bottom_surface(AppPage::Macro),
-            BottomSurface::MacroMonitor
-        );
+        assert_eq!(bottom_surface(AppPage::Macro), BottomSurface::MacroMonitor);
         assert!(MacroPage::MONITOR_HEIGHT < APP_HEIGHT / 3.0);
     }
 }

@@ -14,6 +14,7 @@ mod watch_group;
 
 #[allow(unused_imports)]
 pub use image_match::*;
+pub(crate) use image_verification::validate_candidate_binding;
 pub use model::*;
 pub use observation::*;
 #[allow(unused_imports)]

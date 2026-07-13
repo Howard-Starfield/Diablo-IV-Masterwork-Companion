@@ -1,9 +1,8 @@
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -50,6 +49,12 @@ pub struct TextMatch {
     pub score: Option<f64>,
     pub match_count: u32,
     pub source_word_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextAuthoringTestResult {
+    pub words: Vec<OcrWord>,
+    pub text_match: TextMatch,
 }
 
 impl TextRule {
@@ -663,6 +668,58 @@ impl PositionedTextRecognizer for WindowsTextRecognizer {
     }
 }
 
+/// Runs one authoring-time OCR observation through the exact preprocessing,
+/// positioned recognition, coordinate mapping, and match semantics used by the
+/// live text detector. It intentionally does not touch runtime stability state.
+pub fn authoring_test_text_rule(
+    image: &ScreenImage,
+    capture_rect: Rect,
+    rule: &TextRule,
+) -> Result<TextAuthoringTestResult> {
+    authoring_test_text_rule_with_recognizer(
+        image,
+        capture_rect,
+        rule,
+        &WindowsTextRecognizer::default(),
+    )
+}
+
+fn authoring_test_text_rule_with_recognizer(
+    image: &ScreenImage,
+    capture_rect: Rect,
+    rule: &TextRule,
+    recognizer: &dyn PositionedTextRecognizer,
+) -> Result<TextAuthoringTestResult> {
+    let mut preprocess = TextPreprocessWorker::default();
+    recognize_and_match(&mut preprocess, recognizer, image, capture_rect, rule)
+}
+
+fn recognize_and_match(
+    preprocess: &mut TextPreprocessWorker,
+    recognizer: &dyn PositionedTextRecognizer,
+    image: &ScreenImage,
+    capture_rect: Rect,
+    rule: &TextRule,
+) -> Result<TextAuthoringTestResult> {
+    let prepared = preprocess.prepare(image, rule.preprocess)?;
+    let relative_words = recognizer.recognize_words(prepared.frame, &rule.language)?;
+    let words = relative_words
+        .into_iter()
+        .map(|word| {
+            Ok(OcrWord {
+                rect: map_processed_rect_to_capture(
+                    word.rect,
+                    prepared.coordinate_scale,
+                    capture_rect,
+                )?,
+                ..word
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let text_match = match_text(&words, rule)?;
+    Ok(TextAuthoringTestResult { words, text_match })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct StabilityKey {
     run_id: String,
@@ -834,24 +891,15 @@ impl TextDetector {
             .preprocess
             .lock()
             .map_err(|_| anyhow::anyhow!("text detector preprocessing lock is poisoned"))?;
-        let prepared = preprocess.prepare(&captured.image, rule.preprocess)?;
-        let relative_words = self
-            .recognizer
-            .recognize_words(prepared.frame, &rule.language)?;
-        let words = relative_words
-            .into_iter()
-            .map(|word| {
-                Ok(OcrWord {
-                    rect: map_processed_rect_to_capture(
-                        word.rect,
-                        prepared.coordinate_scale,
-                        capture_rect,
-                    )?,
-                    ..word
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let text_match = match_text(&words, rule)?;
+        let tested = recognize_and_match(
+            &mut preprocess,
+            self.recognizer.as_ref(),
+            &captured.image,
+            capture_rect,
+            rule,
+        )?;
+        let words = tested.words;
+        let text_match = tested.text_match;
         let key = StabilityKey {
             run_id: request.run_id.to_string(),
             generation: request.generation,
@@ -1173,6 +1221,62 @@ mod tests {
         let mut rule = TextRule::contains(expected);
         rule.match_mode = mode;
         rule
+    }
+
+    #[test]
+    fn authoring_test_uses_runtime_profile_and_match_semantics() {
+        #[derive(Clone)]
+        struct RecordingRecognizer {
+            observed: Arc<Mutex<Vec<(u32, u32, OcrPixelFormat, String)>>>,
+        }
+        impl PositionedTextRecognizer for RecordingRecognizer {
+            fn recognize_words(
+                &self,
+                frame: &OcrFrame,
+                language_tag: &str,
+            ) -> Result<Vec<OcrWord>> {
+                self.observed.lock().unwrap().push((
+                    frame.width,
+                    frame.height,
+                    frame.pixel_format,
+                    language_tag.to_string(),
+                ));
+                Ok(vec![
+                    OcrWord::new("Ancestral", Rect::new(0, 0, 9, 8), 0, 0),
+                    OcrWord::new("Item", Rect::new(10, 0, 8, 8), 0, 1),
+                ])
+            }
+        }
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let recognizer = RecordingRecognizer {
+            observed: observed.clone(),
+        };
+        let image = ScreenImage::new(RgbaImage::from_pixel(20, 10, Rgba([30, 60, 90, 255])));
+        let capture_rect = Rect::new(100, 200, 20, 10);
+        let mut rule = rule("Ancestral", TextMatchMode::Contains);
+        rule.preprocess = PreprocessProfile::Grayscale;
+        rule.language = "en-US".into();
+        rule.match_policy = MatchSelectionPolicy::ExactlyOne;
+
+        let contains =
+            authoring_test_text_rule_with_recognizer(&image, capture_rect, &rule, &recognizer)
+                .unwrap();
+        assert!(contains.text_match.matched);
+        assert_eq!(contains.text_match.rect, Some(Rect::new(100, 200, 9, 8)));
+
+        rule.match_mode = TextMatchMode::Exact;
+        let exact =
+            authoring_test_text_rule_with_recognizer(&image, capture_rect, &rule, &recognizer)
+                .unwrap();
+        assert!(!exact.text_match.matched);
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[
+                (20, 10, OcrPixelFormat::Gray8, "en-US".into()),
+                (20, 10, OcrPixelFormat::Gray8, "en-US".into()),
+            ]
+        );
     }
 
     #[test]

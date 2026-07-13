@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::engine::macro_engine::{
-    Action, Block, BlockKind, Condition, ImageRule, Limit, MacroDefinition, MouseButton,
+    Action, AssetRef, Block, BlockKind, Condition, ImageRule, Limit, MacroDefinition, MouseButton,
     ObserveMode, PassiveCondition, TextRule, TimeoutOutcome, ValidationProblem,
 };
 use crate::engine::types::RectRatio;
@@ -274,9 +274,18 @@ pub enum EditorCommand {
     ReplaceImageRule {
         rule: ImageRule,
     },
-    RecaptureRegion {
+    ApplyRecapture {
         region_id: String,
         rect: RectRatio,
+        image_template: Option<(String, AssetRef)>,
+    },
+    ApplyTemplateRecapture {
+        rule_id: String,
+        template: AssetRef,
+    },
+    ApplyImageVerification {
+        rule_id: String,
+        verification: crate::engine::macro_engine::ImageRuleVerificationArtifact,
     },
     MarkValidated,
     Undo,
@@ -789,35 +798,93 @@ fn apply_to_definition(
                 invalidated.extend(source_ids_for_rule(&definition.blocks, &id));
             }
         }
-        EditorCommand::RecaptureRegion { region_id, rect } => {
+        EditorCommand::ApplyRecapture {
+            region_id,
+            rect,
+            image_template,
+        } => {
+            if let Some((rule_id, template)) = &image_template {
+                let rule = definition
+                    .image_rules
+                    .iter()
+                    .find(|rule| rule.id == *rule_id)
+                    .ok_or_else(|| EditorError::MissingRule(rule_id.clone()))?;
+                if rule.region_id != region_id
+                    || rule.template.id != template.id
+                    || template.revision <= rule.template.revision
+                {
+                    return Err(EditorError::IncompatibleConversion);
+                }
+            }
             let region = definition
                 .regions
                 .iter_mut()
                 .find(|item| item.id == region_id)
                 .ok_or_else(|| EditorError::MissingRegion(region_id.clone()))?;
-            if region.rect != rect {
-                region.rect = rect;
-                region.revision = region.revision.saturating_add(1);
-                let rule_ids: Vec<String> = definition
-                    .text_rules
-                    .iter()
-                    .filter(|r| r.region_id == region_id)
-                    .map(|r| r.id.clone())
-                    .chain(
-                        definition
-                            .image_rules
-                            .iter_mut()
-                            .filter(|r| r.region_id == region_id)
-                            .map(|r| {
-                                r.verification = None;
-                                r.id.clone()
-                            }),
-                    )
-                    .collect();
-                for id in rule_ids {
-                    invalidated.extend(source_ids_for_rule(&definition.blocks, &id));
-                }
+            region.rect = rect;
+            region.revision = region.revision.saturating_add(1);
+
+            let text_rule_ids = definition
+                .text_rules
+                .iter_mut()
+                .filter(|rule| rule.region_id == region_id)
+                .map(|rule| {
+                    rule.revision = rule.revision.saturating_add(1);
+                    rule.id.clone()
+                })
+                .collect::<Vec<_>>();
+            let image_rule_ids = definition
+                .image_rules
+                .iter_mut()
+                .filter(|rule| rule.region_id == region_id)
+                .map(|rule| {
+                    rule.revision = rule.revision.saturating_add(1);
+                    rule.verification = None;
+                    if let Some((target_rule_id, template)) = &image_template {
+                        if rule.id == *target_rule_id {
+                            rule.template = template.clone();
+                        }
+                    }
+                    rule.id.clone()
+                })
+                .collect::<Vec<_>>();
+            for rule_id in text_rule_ids.into_iter().chain(image_rule_ids) {
+                invalidated.extend(source_ids_for_rule(&definition.blocks, &rule_id));
             }
+        }
+        EditorCommand::ApplyTemplateRecapture { rule_id, template } => {
+            let rule = definition
+                .image_rules
+                .iter_mut()
+                .find(|rule| rule.id == rule_id)
+                .ok_or_else(|| EditorError::MissingRule(rule_id.clone()))?;
+            if rule.template.id != template.id || template.revision <= rule.template.revision {
+                return Err(EditorError::IncompatibleConversion);
+            }
+            rule.template = template;
+            rule.revision = rule.revision.saturating_add(1);
+            rule.verification = None;
+            invalidated.extend(source_ids_for_rule(&definition.blocks, &rule_id));
+        }
+        EditorCommand::ApplyImageVerification {
+            rule_id,
+            verification,
+        } => {
+            let rule_index = definition
+                .image_rules
+                .iter()
+                .position(|rule| rule.id == rule_id)
+                .ok_or_else(|| EditorError::MissingRule(rule_id.clone()))?;
+            if crate::engine::macro_engine::validate_candidate_binding(
+                definition,
+                &definition.image_rules[rule_index],
+                &verification,
+            )
+            .is_err()
+            {
+                return Err(EditorError::ValidationFailed);
+            }
+            definition.image_rules[rule_index].verification = Some(verification);
         }
         EditorCommand::MarkValidated | EditorCommand::Undo => unreachable!(),
     }
@@ -1263,6 +1330,16 @@ fn find_block<'a>(blocks: &'a [Block], id: &str) -> Option<&'a Block> {
     }
     None
 }
+
+pub fn condition_for_block<'a>(definition: &'a MacroDefinition, id: &str) -> Option<&'a Condition> {
+    let block = find_block(&definition.blocks, id)?;
+    match &block.kind {
+        BlockKind::Observe { condition }
+        | BlockKind::If { condition, .. }
+        | BlockKind::RepeatUntil { condition, .. } => Some(condition),
+        _ => None,
+    }
+}
 fn find_block_mut<'a>(blocks: &'a mut Vec<Block>, id: &str) -> Option<&'a mut Block> {
     for block in blocks {
         if block.id == id {
@@ -1686,8 +1763,11 @@ pub fn locate_watch_lane(
 mod tests {
     use super::*;
     use crate::engine::macro_engine::{
-        FocusLossPolicy, MACRO_SCHEMA_VERSION, MatchSelectionPolicy, PreprocessProfile,
-        RegionDefinition, SafetyPolicy, TargetProfile, TextMatchMode, WatchGroup, WatchLane,
+        AssetRef, DEFAULT_MAX_SCORE_CELLS, FocusLossPolicy, ImageRule, ImageRuleVerification,
+        ImageRuleVerificationArtifact, ImageRuleVerificationInput, MACRO_SCHEMA_VERSION,
+        MatchSelectionPolicy, NegativeCorpusSample, NegativeSampleEvaluationInputs,
+        PreprocessProfile, RegionDefinition, SafetyPolicy, TargetProfile, TextMatchMode,
+        WatchGroup, WatchLane,
     };
 
     fn def(blocks: Vec<Block>) -> MacroDefinition {
@@ -1731,6 +1811,82 @@ mod tests {
             container: ContainerPath::Root,
             block_id: id.into(),
         }
+    }
+
+    fn image_definition_and_verification() -> (MacroDefinition, ImageRuleVerificationArtifact) {
+        use image::{GrayImage, Luma};
+
+        let mut definition = def(vec![Block {
+            id: "image-source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Image {
+                    source_block_id: "image-source".into(),
+                    rule_id: "image".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        }]);
+        definition.regions.push(RegionDefinition {
+            id: "region".into(),
+            revision: 3,
+            rect: RectRatio {
+                x: 0.25,
+                y: 0.25,
+                width: 0.5,
+                height: 0.2,
+            },
+        });
+        let rule = ImageRule {
+            id: "image".into(),
+            revision: 4,
+            region_id: "region".into(),
+            template: AssetRef {
+                id: "template".into(),
+                revision: 2,
+                content_hash: "template-hash".into(),
+            },
+            transparent_mask: None,
+            threshold: 0.95,
+            scales_percent: vec![100],
+            stable_frames: 2,
+            maximum_center_drift_px: 5,
+            minimum_runner_up_margin: 0.05,
+            verification: None,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 100,
+            timeout_ms: Limit::Unlimited,
+        };
+        let template =
+            GrayImage::from_fn(2, 2, |x, y| Luma([if (x + y) % 2 == 0 { 0 } else { 255 }]));
+        let search_dimensions = (640, 144);
+        let samples = [NegativeCorpusSample {
+            stable_id: "negative/sample".into(),
+            content_sha256: "11".repeat(32),
+            measured_score: 0.1,
+            evaluation: NegativeSampleEvaluationInputs::for_rule(
+                &rule,
+                definition.target.captured_dpi,
+                definition.regions[0].revision,
+                search_dimensions,
+            ),
+        }];
+        let verification = ImageRuleVerification::verify(ImageRuleVerificationInput {
+            rule: &rule,
+            template: &template,
+            mask: None,
+            captured_dpi: definition.target.captured_dpi,
+            current_dpi: definition.target.captured_dpi,
+            region_revision: definition.regions[0].revision,
+            search_dimensions,
+            negative_samples: &samples,
+            observed_clusters: &[],
+            maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+        })
+        .unwrap()
+        .into_artifact();
+        definition.image_rules.push(rule);
+        (definition, verification)
     }
     fn mode_wait_true() -> ObserveMode {
         ObserveMode::WaitForTrue {
@@ -2065,7 +2221,7 @@ mod tests {
         );
         apply_editor_command(
             &mut draft,
-            EditorCommand::RecaptureRegion {
+            EditorCommand::ApplyRecapture {
                 region_id: "region".into(),
                 rect: RectRatio {
                     x: 0.2,
@@ -2073,11 +2229,200 @@ mod tests {
                     width: 0.2,
                     height: 0.2,
                 },
+                image_template: None,
             },
         )
         .unwrap();
         assert_eq!(draft.definition.regions[0].revision, 2);
         assert_eq!(draft.definition.text_rules[0].expected, "Retry");
+    }
+
+    #[test]
+    fn canonical_recapture_bumps_region_and_rule_revisions_even_for_same_rect() {
+        let rect = RectRatio {
+            x: 0.1,
+            y: 0.1,
+            width: 0.2,
+            height: 0.2,
+        };
+        let mut definition = def(vec![Block {
+            id: "source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "source".into(),
+                    rule_id: "text".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        }]);
+        definition.regions.push(RegionDefinition {
+            id: "region".into(),
+            revision: 3,
+            rect,
+        });
+        definition.text_rules.push(TextRule {
+            id: "text".into(),
+            revision: 4,
+            region_id: "region".into(),
+            language: "en-US".into(),
+            preprocess: PreprocessProfile::Grayscale,
+            expected: "Preserve me".into(),
+            match_mode: TextMatchMode::Contains,
+            threshold: 0.9,
+            case_sensitive: false,
+            allow_cross_line: false,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 250,
+            timeout_ms: Limit::Unlimited,
+            stable_frames: 2,
+        });
+        let old_asset = AssetRef {
+            id: "template".into(),
+            revision: 1,
+            content_hash: "old".into(),
+        };
+        let new_asset = AssetRef {
+            id: "template".into(),
+            revision: 2,
+            content_hash: "new".into(),
+        };
+        definition.image_rules.push(ImageRule {
+            id: "image".into(),
+            revision: 6,
+            region_id: "region".into(),
+            template: old_asset,
+            transparent_mask: None,
+            threshold: 0.9,
+            scales_percent: vec![100],
+            stable_frames: 2,
+            maximum_center_drift_px: 5,
+            minimum_runner_up_margin: 0.05,
+            verification: None,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 100,
+            timeout_ms: Limit::Unlimited,
+        });
+        let mut draft = EditorDraft::new(definition);
+
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::ApplyRecapture {
+                region_id: "region".into(),
+                rect,
+                image_template: Some(("image".into(), new_asset.clone())),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(draft.definition.regions[0].revision, 4);
+        assert_eq!(draft.definition.text_rules[0].revision, 5);
+        assert_eq!(draft.definition.text_rules[0].expected, "Preserve me");
+        assert_eq!(draft.definition.image_rules[0].revision, 7);
+        assert_eq!(draft.definition.image_rules[0].template, new_asset);
+        assert_eq!(draft.definition.image_rules[0].verification, None);
+        assert!(draft.invalidated_source_ids().contains("source"));
+    }
+
+    #[test]
+    fn template_only_recapture_keeps_region_revision_and_revises_only_image_rule() {
+        let mut definition = def(vec![Block {
+            id: "image-source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Image {
+                    source_block_id: "image-source".into(),
+                    rule_id: "image".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        }]);
+        definition.regions.push(RegionDefinition {
+            id: "region".into(),
+            revision: 8,
+            rect: RectRatio {
+                x: 0.1,
+                y: 0.1,
+                width: 0.2,
+                height: 0.2,
+            },
+        });
+        definition.image_rules.push(ImageRule {
+            id: "image".into(),
+            revision: 4,
+            region_id: "region".into(),
+            template: AssetRef {
+                id: "template".into(),
+                revision: 2,
+                content_hash: "old".into(),
+            },
+            transparent_mask: None,
+            threshold: 0.9,
+            scales_percent: vec![100],
+            stable_frames: 2,
+            maximum_center_drift_px: 5,
+            minimum_runner_up_margin: 0.05,
+            verification: None,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 100,
+            timeout_ms: Limit::Unlimited,
+        });
+        let mut draft = EditorDraft::new(definition);
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::ApplyTemplateRecapture {
+                rule_id: "image".into(),
+                template: AssetRef {
+                    id: "template".into(),
+                    revision: 3,
+                    content_hash: "new".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(draft.regions[0].revision, 8);
+        assert_eq!(draft.image_rules[0].revision, 5);
+        assert_eq!(draft.image_rules[0].template.revision, 3);
+        assert_eq!(draft.image_rules[0].verification, None);
+        assert!(draft.invalidated_source_ids().contains("image-source"));
+    }
+
+    #[test]
+    fn image_verification_command_rejects_same_rule_stale_or_tampered_artifacts_atomically() {
+        let (definition, verification) = image_definition_and_verification();
+
+        let mut stale_definition = definition.clone();
+        stale_definition.image_rules[0].revision += 1;
+        let mut stale_draft = EditorDraft::new(stale_definition);
+        let stale_before = stale_draft.clone();
+        assert_eq!(
+            apply_editor_command(
+                &mut stale_draft,
+                EditorCommand::ApplyImageVerification {
+                    rule_id: "image".into(),
+                    verification: verification.clone(),
+                },
+            ),
+            Err(EditorError::ValidationFailed)
+        );
+        assert_eq!(stale_draft, stale_before);
+
+        let mut tampered = verification;
+        tampered.verification_fingerprint_sha256 = "00".repeat(32);
+        let mut tampered_draft = EditorDraft::new(definition);
+        let tampered_before = tampered_draft.clone();
+        assert_eq!(
+            apply_editor_command(
+                &mut tampered_draft,
+                EditorCommand::ApplyImageVerification {
+                    rule_id: "image".into(),
+                    verification: tampered,
+                },
+            ),
+            Err(EditorError::ValidationFailed)
+        );
+        assert_eq!(tampered_draft, tampered_before);
     }
 
     #[test]

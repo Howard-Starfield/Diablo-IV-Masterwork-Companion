@@ -17,6 +17,12 @@ pub enum InspectorIntent {
     RecaptureRegion {
         region_id: String,
     },
+    RecaptureTemplate {
+        rule_id: String,
+    },
+    CaptureImageNegative {
+        block_id: String,
+    },
     ReplaceTextRule {
         rule: TextRule,
     },
@@ -321,6 +327,12 @@ fn image_projection(
             },
             InspectorIntent::RecaptureRegion {
                 region_id: rule.region_id.clone(),
+            },
+            InspectorIntent::RecaptureTemplate {
+                rule_id: rule.id.clone(),
+            },
+            InspectorIntent::CaptureImageNegative {
+                block_id: id.into(),
             },
         ],
         problems,
@@ -1037,6 +1049,8 @@ fn actions(
                 InspectorIntent::TestOcr { .. } => Some("Test OCR"),
                 InspectorIntent::TestImage { .. } => Some("Test Image"),
                 InspectorIntent::RecaptureRegion { .. } => Some("Recapture"),
+                InspectorIntent::RecaptureTemplate { .. } => Some("Recapture template"),
+                InspectorIntent::CaptureImageNegative { .. } => Some("Add negative frame"),
                 _ => None,
             }) else {
                 continue;

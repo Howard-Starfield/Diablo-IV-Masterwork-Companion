@@ -247,6 +247,19 @@ pub(crate) fn validate_binding<'a>(
     current.then_some(artifact).ok_or(BindingProblem::Stale)
 }
 
+/// Checks an authoring result before it is attached to a rule. This keeps the
+/// editor command boundary revision-, geometry-, and fingerprint-safe instead
+/// of relying on a later whole-document validation pass.
+pub(crate) fn validate_candidate_binding(
+    definition: &MacroDefinition,
+    rule: &ImageRule,
+    artifact: &ImageRuleVerificationArtifact,
+) -> std::result::Result<(), BindingProblem> {
+    let mut candidate = rule.clone();
+    candidate.verification = Some(artifact.clone());
+    validate_binding(definition, &candidate).map(|_| ())
+}
+
 pub(crate) fn validate_decoded_rule(
     definition: &MacroDefinition,
     rule: &ImageRule,

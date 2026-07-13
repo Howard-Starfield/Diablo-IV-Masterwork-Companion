@@ -37,14 +37,14 @@ use windows::{
             },
             WindowsAndMessaging::{
                 CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-                DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetSystemMetrics,
-                GetWindowLongPtrW, HTCLIENT, IDC_CROSS, LWA_ALPHA, LoadCursorW, MSG, PM_REMOVE,
-                PeekMessageW, PostQuitMessage, RegisterClassW, SM_CXVIRTUALSCREEN,
+                DestroyWindow, DispatchMessageW, GA_ROOT, GWLP_USERDATA, GetAncestor, GetCursorPos,
+                GetSystemMetrics, GetWindowLongPtrW, HTCLIENT, IDC_CROSS, LWA_ALPHA, LoadCursorW,
+                MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SM_CXVIRTUALSCREEN,
                 SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOW, SetCursorPos,
                 SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, ShowWindow,
                 TranslateMessage, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
                 WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_LAYERED,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WindowFromPoint,
             },
         },
     },
@@ -63,7 +63,7 @@ use super::super::{
 };
 use super::windows_snapshot::{
     CanonicalWindowIdentity, Win32WindowsSnapshotSource, WindowsSnapshotSource,
-    client_rect_in_screen,
+    client_rect_in_screen, window_class, window_title,
 };
 use super::windows_target::{DurableTargetHints, WindowsTargetGuard};
 
@@ -732,6 +732,139 @@ impl OverlayState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CaptureRequestId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacroCaptureKind {
+    TextRegion,
+    ImageSearchRegion,
+    ClickRegion,
+    ClickPoint,
+    TemplateCrop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacroCaptureRequest {
+    pub id: CaptureRequestId,
+    pub kind: MacroCaptureKind,
+    pub target_client: Rect,
+    pub min_size: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MacroCaptureSelection {
+    Region(crate::engine::types::RectRatio),
+    Point(crate::engine::types::PointRatio),
+    TemplateCrop {
+        region: crate::engine::types::RectRatio,
+        screen_rect: Rect,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MacroCaptureResponse {
+    pub id: CaptureRequestId,
+    pub kind: MacroCaptureKind,
+    pub selection: MacroCaptureSelection,
+}
+
+pub fn select_macro_capture(request: MacroCaptureRequest) -> Result<MacroCaptureResponse> {
+    let rect = select_screen_rect_overlay(request.min_size)?;
+    normalize_macro_capture(request, rect)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedTargetProfile {
+    pub process_path: String,
+    pub window_class: String,
+    pub title: String,
+    pub client_rect: Rect,
+    pub dpi: u32,
+}
+
+pub fn resolve_target_from_selection(selection: Rect) -> Result<CapturedTargetProfile> {
+    let center = POINT {
+        x: selection.x + i32::try_from(selection.width / 2).unwrap_or(i32::MAX),
+        y: selection.y + i32::try_from(selection.height / 2).unwrap_or(i32::MAX),
+    };
+    let child = unsafe { WindowFromPoint(center) };
+    anyhow::ensure!(
+        !child.is_invalid(),
+        "no window exists under the selected target"
+    );
+    let root = unsafe { GetAncestor(child, GA_ROOT) };
+    anyhow::ensure!(
+        !root.is_invalid(),
+        "failed to resolve the selected top-level window"
+    );
+    let identity = CanonicalWindowIdentity::from_raw_hwnd(root.0 as isize)?;
+    let snapshot = Win32WindowsSnapshotSource.snapshot(identity)?;
+    Ok(CapturedTargetProfile {
+        process_path: snapshot.process_path,
+        window_class: window_class(identity)?,
+        title: window_title(identity)?,
+        client_rect: snapshot.client_rect,
+        dpi: snapshot.dpi,
+    })
+}
+
+fn normalize_macro_capture(
+    request: MacroCaptureRequest,
+    selected: Rect,
+) -> Result<MacroCaptureResponse> {
+    if request.target_client.width == 0 || request.target_client.height == 0 {
+        return Err(anyhow!("target client geometry is empty"));
+    }
+    if selected.width < request.min_size || selected.height < request.min_size {
+        return Err(anyhow!(
+            "selected region is too small: {}x{}",
+            selected.width,
+            selected.height
+        ));
+    }
+    let target_right = i64::from(request.target_client.x) + i64::from(request.target_client.width);
+    let target_bottom =
+        i64::from(request.target_client.y) + i64::from(request.target_client.height);
+    let selected_right = i64::from(selected.x) + i64::from(selected.width);
+    let selected_bottom = i64::from(selected.y) + i64::from(selected.height);
+    if selected.x < request.target_client.x
+        || selected.y < request.target_client.y
+        || selected_right > target_right
+        || selected_bottom > target_bottom
+    {
+        return Err(anyhow!("selection must stay inside the target client area"));
+    }
+
+    let region =
+        crate::engine::types::RectRatio::from_rect_relative(request.target_client, selected);
+    let selection = match request.kind {
+        MacroCaptureKind::TextRegion
+        | MacroCaptureKind::ImageSearchRegion
+        | MacroCaptureKind::ClickRegion => MacroCaptureSelection::Region(region),
+        MacroCaptureKind::ClickPoint => {
+            let center_x = i64::from(selected.x) + i64::from(selected.width) / 2;
+            let center_y = i64::from(selected.y) + i64::from(selected.height) / 2;
+            MacroCaptureSelection::Point(crate::engine::types::PointRatio {
+                x: (center_x - i64::from(request.target_client.x)) as f32
+                    / request.target_client.width as f32,
+                y: (center_y - i64::from(request.target_client.y)) as f32
+                    / request.target_client.height as f32,
+            })
+        }
+        MacroCaptureKind::TemplateCrop => MacroCaptureSelection::TemplateCrop {
+            region,
+            screen_rect: selected,
+        },
+    };
+    Ok(MacroCaptureResponse {
+        id: request.id,
+        kind: request.kind,
+        selection,
+    })
+}
+
+/// Compatibility adapter used by the existing Enchant calibration flow.
 pub fn select_screen_rect(min_size: u32) -> Result<Rect> {
     select_screen_rect_overlay(min_size)
 }
@@ -1437,5 +1570,75 @@ mod tests {
         after.process_started_at_100ns = 101;
 
         assert_ne!(before.window_revision(), after.window_revision());
+    }
+
+    #[test]
+    fn macro_capture_normalizes_virtual_screen_rect_to_target_client() {
+        let request = MacroCaptureRequest {
+            id: CaptureRequestId(9),
+            kind: MacroCaptureKind::TextRegion,
+            target_client: Rect::new(-1_600, 120, 1_280, 720),
+            min_size: 10,
+        };
+
+        let response = normalize_macro_capture(request, Rect::new(-1_320, 390, 420, 86)).unwrap();
+
+        assert_eq!(response.id, CaptureRequestId(9));
+        assert!(matches!(
+            response.selection,
+            MacroCaptureSelection::Region(rect)
+                if rect == crate::engine::types::RectRatio::from_rect_relative(
+                    Rect::new(-1_600, 120, 1_280, 720),
+                    Rect::new(-1_320, 390, 420, 86)
+                )
+        ));
+    }
+
+    #[test]
+    fn macro_capture_distinguishes_point_region_and_template() {
+        let target = Rect::new(100, 200, 800, 600);
+        let rect = Rect::new(300, 350, 200, 120);
+        let point = normalize_macro_capture(
+            MacroCaptureRequest {
+                id: CaptureRequestId(1),
+                kind: MacroCaptureKind::ClickPoint,
+                target_client: target,
+                min_size: 1,
+            },
+            rect,
+        )
+        .unwrap();
+        assert!(matches!(
+            point.selection,
+            MacroCaptureSelection::Point(crate::engine::types::PointRatio { x, y })
+                if (x - 0.375).abs() < f32::EPSILON && (y - 0.35).abs() < f32::EPSILON
+        ));
+
+        let template = normalize_macro_capture(
+            MacroCaptureRequest {
+                id: CaptureRequestId(2),
+                kind: MacroCaptureKind::TemplateCrop,
+                target_client: target,
+                min_size: 4,
+            },
+            rect,
+        )
+        .unwrap();
+        assert!(matches!(
+            template.selection,
+            MacroCaptureSelection::TemplateCrop { screen_rect, .. } if screen_rect == rect
+        ));
+    }
+
+    #[test]
+    fn macro_capture_rejects_too_small_and_outside_target() {
+        let request = MacroCaptureRequest {
+            id: CaptureRequestId(1),
+            kind: MacroCaptureKind::ImageSearchRegion,
+            target_client: Rect::new(100, 100, 500, 400),
+            min_size: 10,
+        };
+        assert!(normalize_macro_capture(request, Rect::new(150, 150, 9, 20)).is_err());
+        assert!(normalize_macro_capture(request, Rect::new(90, 150, 20, 20)).is_err());
     }
 }

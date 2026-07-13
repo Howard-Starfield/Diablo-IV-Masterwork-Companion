@@ -206,6 +206,23 @@ impl AssetStore {
         self.install_locked(asset, bytes).map(|_| ())
     }
 
+    /// Stores a recaptured template under the same logical identity at a new immutable revision.
+    /// The previous binding and bytes remain readable for saved or running snapshots.
+    pub fn put_next_png_revision(&self, previous: &AssetRef, bytes: &[u8]) -> Result<AssetRef> {
+        let revision = previous
+            .revision
+            .checked_add(1)
+            .context("template asset revision overflow")?;
+        let asset = AssetRef {
+            id: previous.id.clone(),
+            revision,
+            content_hash: sha256_hex(bytes),
+        };
+        let _guard = lock_store(&self.lock)?;
+        self.install_locked(asset.clone(), bytes)?;
+        Ok(asset)
+    }
+
     pub fn read(&self, asset: &AssetRef) -> Result<Vec<u8>> {
         let _guard = lock_store(&self.lock)?;
         self.read_locked(asset)
@@ -1913,6 +1930,32 @@ mod tests {
             .put_png_revision(conflicting, conflicting_bytes)
             .unwrap_err();
         assert!(error.to_string().contains("immutable asset identity"));
+    }
+
+    #[test]
+    fn captured_template_recapture_keeps_id_and_preserves_old_revision_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let original = AssetRef {
+            id: "logical-template".into(),
+            revision: 4,
+            content_hash: sha256_hex(b"old png"),
+        };
+        store
+            .assets()
+            .put_png_revision(original.clone(), b"old png")
+            .unwrap();
+
+        let recaptured = store
+            .assets()
+            .put_next_png_revision(&original, b"new png")
+            .unwrap();
+
+        assert_eq!(recaptured.id, original.id);
+        assert_eq!(recaptured.revision, 5);
+        assert_ne!(recaptured.content_hash, original.content_hash);
+        assert_eq!(store.assets().read(&original).unwrap(), b"old png");
+        assert_eq!(store.assets().read(&recaptured).unwrap(), b"new png");
     }
 
     #[test]

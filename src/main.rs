@@ -13,6 +13,7 @@ use std::{
 };
 
 mod engine;
+mod macro_ui;
 
 use eframe::{
     App, CreationContext,
@@ -31,6 +32,7 @@ use crate::engine::{
     },
     types::{PointRatio, Rect, RectRatio},
 };
+use crate::macro_ui::{MacroPage, MacroPageState};
 use serde::{Deserialize, Serialize};
 
 const APP_WIDTH: f32 = 600.0;
@@ -228,6 +230,12 @@ enum BotState {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppPage {
+    Enchant,
+    Macro,
+}
+
 impl BotState {
     fn label(self) -> &'static str {
         match self {
@@ -245,6 +253,8 @@ impl BotState {
 }
 
 struct NativeApp {
+    page: AppPage,
+    macro_state: MacroPageState,
     config: NativeConfig,
     config_path: PathBuf,
     egui_ctx: Context,
@@ -267,6 +277,8 @@ impl NativeApp {
         let config_path = config_path();
         let (config, migrated_config) = load_native_config(&config_path);
         Self {
+            page: AppPage::Enchant,
+            macro_state: MacroPageState::default(),
             config,
             config_path,
             egui_ctx: cc.egui_ctx.clone(),
@@ -681,21 +693,39 @@ impl App for NativeApp {
                     ui.add_space(8.0);
                     ui.label(RichText::new("BoBo Companion").strong().size(15.0));
                     ui.separator();
-                    ui.label(
-                        RichText::new("Occultist Affix Reroll")
-                            .color(Color32::from_rgb(210, 214, 219)),
-                    );
+                    if ui
+                        .selectable_label(self.page == AppPage::Enchant, "Enchant")
+                        .clicked()
+                    {
+                        self.page = AppPage::Enchant;
+                    }
+                    if ui
+                        .selectable_label(self.page == AppPage::Macro, "Macro")
+                        .clicked()
+                    {
+                        self.page = AppPage::Macro;
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        status_pill(ui, self.status, self.status.label());
+                        if self.page == AppPage::Enchant {
+                            status_pill(ui, self.status, self.status.label());
+                        } else {
+                            ui.label(
+                                RichText::new("Macro workspace")
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(194, 143, 94)),
+                            );
+                        }
                     });
                 });
             });
 
-        TopBottomPanel::bottom("action_bar")
-            .exact_height(112.0)
-            .show(ctx, |ui| {
-                self.bottom_bar(ui);
-            });
+        if self.page == AppPage::Enchant {
+            TopBottomPanel::bottom("action_bar")
+                .exact_height(112.0)
+                .show(ctx, |ui| {
+                    self.bottom_bar(ui);
+                });
+        }
 
         CentralPanel::default()
             .frame(
@@ -708,7 +738,10 @@ impl App for NativeApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width((ui.available_width() - 14.0).max(0.0));
-                        self.content(ui, ctx);
+                        match self.page {
+                            AppPage::Enchant => self.content(ui, ctx),
+                            AppPage::Macro => MacroPage::show(ui, &self.macro_state),
+                        }
                     });
             });
     }

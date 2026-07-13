@@ -1,0 +1,344 @@
+use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui};
+
+use crate::engine::macro_engine::{
+    Action, Block, BlockKind, Condition, Limit, ObserveMode, PassiveCondition, TimeoutOutcome,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineRow {
+    pub id: String,
+    pub depth: usize,
+    pub label: String,
+    pub summary: String,
+    pub lane_priority: Option<usize>,
+    pub enabled: bool,
+    pub is_loop_marker: bool,
+    pub is_selectable: bool,
+}
+
+pub fn project_timeline(blocks: &[Block]) -> Vec<TimelineRow> {
+    let mut rows = Vec::new();
+    append_blocks(blocks, 0, &mut rows);
+    rows
+}
+
+fn append_blocks(blocks: &[Block], depth: usize, rows: &mut Vec<TimelineRow>) {
+    for block in blocks {
+        let (label, summary) = block_summary(&block.kind);
+        rows.push(TimelineRow {
+            id: block.id.clone(),
+            depth,
+            label,
+            summary,
+            lane_priority: None,
+            enabled: block.enabled,
+            is_loop_marker: false,
+            is_selectable: true,
+        });
+
+        match &block.kind {
+            BlockKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                append_container(&format!("{}-then", block.id), depth + 1, "THEN", rows);
+                append_blocks(then_body, depth + 2, rows);
+                append_container(&format!("{}-else", block.id), depth + 1, "ELSE", rows);
+                append_blocks(else_body, depth + 2, rows);
+            }
+            BlockKind::RepeatN { body, .. }
+            | BlockKind::RepeatUntil { body, .. }
+            | BlockKind::Continuous { body } => {
+                append_blocks(body, depth + 1, rows);
+                append_loop_marker(block, depth + 1, rows);
+            }
+            BlockKind::WatchGroup { group } => {
+                for (index, lane) in group.lanes.iter().enumerate() {
+                    rows.push(TimelineRow {
+                        id: lane.id.clone(),
+                        depth: depth + 1,
+                        label: format!("Priority {}", index + 1),
+                        summary: passive_condition_summary(&lane.condition),
+                        lane_priority: Some(index + 1),
+                        enabled: lane.enabled,
+                        is_loop_marker: false,
+                        is_selectable: true,
+                    });
+                    append_container(&format!("{}-then", lane.id), depth + 2, "THEN", rows);
+                    append_blocks(&lane.then_body, depth + 3, rows);
+                }
+                if let TimeoutOutcome::RunBody { body } = &group.timeout_outcome {
+                    append_container(
+                        &format!("{}-timeout", block.id),
+                        depth + 1,
+                        "ON TIMEOUT",
+                        rows,
+                    );
+                    append_blocks(body, depth + 2, rows);
+                }
+            }
+            BlockKind::Observe { .. }
+            | BlockKind::Action { .. }
+            | BlockKind::Wait { .. }
+            | BlockKind::StopSuccess
+            | BlockKind::StopError { .. }
+            | BlockKind::Comment { .. } => {}
+        }
+    }
+}
+
+fn append_container(id: &str, depth: usize, label: &str, rows: &mut Vec<TimelineRow>) {
+    rows.push(TimelineRow {
+        id: id.to_string(),
+        depth,
+        label: label.to_string(),
+        summary: "Owned branch".to_string(),
+        lane_priority: None,
+        enabled: true,
+        is_loop_marker: false,
+        is_selectable: false,
+    });
+}
+
+fn append_loop_marker(block: &Block, depth: usize, rows: &mut Vec<TimelineRow>) {
+    rows.push(TimelineRow {
+        id: format!("{}-loop-return", block.id),
+        depth,
+        label: "LOOP".to_string(),
+        summary: "Return to loop start".to_string(),
+        lane_priority: None,
+        enabled: block.enabled,
+        is_loop_marker: true,
+        is_selectable: false,
+    });
+}
+
+fn block_summary(kind: &BlockKind) -> (String, String) {
+    match kind {
+        BlockKind::Observe { condition } => ("OBSERVE".into(), condition_summary(condition)),
+        BlockKind::Action { action } => ("ACTION".into(), action_summary(action)),
+        BlockKind::If { condition, .. } => ("IF".into(), condition_summary(condition)),
+        BlockKind::Wait { duration_ms } => ("WAIT".into(), format_duration(*duration_ms)),
+        BlockKind::RepeatN { count, .. } => ("REPEAT".into(), format!("{count} iterations")),
+        BlockKind::RepeatUntil {
+            condition,
+            max_iterations,
+            ..
+        } => (
+            "REPEAT UNTIL".into(),
+            format!(
+                "{} · {} iterations",
+                condition_summary(condition),
+                format_limit(max_iterations)
+            ),
+        ),
+        BlockKind::Continuous { .. } => ("CONTINUOUS LOOP".into(), "Until stopped".into()),
+        BlockKind::WatchGroup { group } => (
+            "WATCH GROUP".into(),
+            format!(
+                "{} lanes · {} timeout",
+                group.lanes.len(),
+                format_limit(&group.timeout_ms)
+            ),
+        ),
+        BlockKind::StopSuccess => ("STOP".into(), "Complete successfully".into()),
+        BlockKind::StopError { message } => ("STOP ERROR".into(), message.clone()),
+        BlockKind::Comment { text } => ("NOTE".into(), text.clone()),
+    }
+}
+
+fn condition_summary(condition: &Condition) -> String {
+    match condition {
+        Condition::Text { rule_id, mode, .. } => {
+            format!("{} text · {rule_id}", observe_verb(mode))
+        }
+        Condition::Image { rule_id, mode, .. } => {
+            format!("{} image · {rule_id}", observe_verb(mode))
+        }
+    }
+}
+
+fn passive_condition_summary(condition: &PassiveCondition) -> String {
+    match condition {
+        PassiveCondition::Text { rule_id, .. } => format!("Watch text · {rule_id}"),
+        PassiveCondition::Image { rule_id, .. } => format!("Watch image · {rule_id}"),
+    }
+}
+
+fn observe_verb(mode: &ObserveMode) -> &'static str {
+    match mode {
+        ObserveMode::CheckNow => "Check",
+        ObserveMode::WaitForTrue { .. } => "Wait for",
+        ObserveMode::WaitForFalse { .. } => "Wait until absent",
+    }
+}
+
+fn action_summary(action: &Action) -> String {
+    match action {
+        Action::ClickTextMatch { button, .. } => format!("{button:?}-click text match"),
+        Action::ClickImageMatch { button, .. } => format!("{button:?}-click image match"),
+        Action::ClickPoint { point_id, button } => format!("{button:?}-click point · {point_id}"),
+        Action::ClickRegion { region_id, button } => {
+            format!("{button:?}-click region · {region_id}")
+        }
+        Action::MoveOnly { .. } => "Move pointer without clicking".into(),
+    }
+}
+
+fn format_limit<T: std::fmt::Display>(limit: &Limit<T>) -> String {
+    match limit {
+        Limit::Finite(value) => value.to_string(),
+        Limit::Unlimited => "Unlimited".to_string(),
+    }
+}
+
+fn format_duration(duration_ms: u64) -> String {
+    if duration_ms >= 1_000 && duration_ms.is_multiple_of(1_000) {
+        format!("{} seconds", duration_ms / 1_000)
+    } else {
+        format!("{duration_ms} ms")
+    }
+}
+
+pub fn show(ui: &mut Ui, rows: &[TimelineRow], active_block: Option<&str>) {
+    if rows.is_empty() {
+        Frame::none()
+            .fill(Color32::from_rgb(14, 16, 18))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(47, 49, 52)))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::same(18.0))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("No sequence selected")
+                        .strong()
+                        .color(Color32::from_gray(208)),
+                );
+                ui.label(
+                    RichText::new("Create or select a macro to inspect its canonical blocks.")
+                        .size(12.0)
+                        .color(Color32::from_gray(132)),
+                );
+            });
+        return;
+    }
+
+    for row in rows {
+        let active = active_block == Some(row.id.as_str());
+        let fill = if active {
+            Color32::from_rgb(58, 37, 24)
+        } else if row.is_loop_marker {
+            Color32::from_rgb(17, 19, 21)
+        } else {
+            Color32::from_rgb(21, 24, 27)
+        };
+        let stroke = if active {
+            Stroke::new(1.0, Color32::from_rgb(220, 104, 42))
+        } else {
+            Stroke::new(1.0, Color32::from_rgb(47, 51, 55))
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(row.depth as f32 * 14.0);
+            Frame::none()
+                .fill(fill)
+                .stroke(stroke)
+                .rounding(5.0)
+                .inner_margin(egui::Margin::symmetric(9.0, 7.0))
+                .show(ui, |ui| {
+                    ui.set_min_width((ui.available_width() - 8.0).max(120.0));
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(&row.label)
+                                .monospace()
+                                .size(10.0)
+                                .strong()
+                                .color(if active {
+                                    Color32::from_rgb(255, 172, 102)
+                                } else {
+                                    Color32::from_rgb(176, 142, 104)
+                                }),
+                        );
+                        ui.label(RichText::new(&row.summary).color(if row.enabled {
+                            Color32::from_gray(211)
+                        } else {
+                            Color32::from_gray(100)
+                        }));
+                    });
+                });
+        });
+        ui.add_space(4.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::macro_engine::{
+        Block, BlockKind, Limit, PassiveCondition, TimeoutOutcome, WatchGroup, WatchLane,
+    };
+
+    use super::*;
+
+    fn fixture_watch_group_definition() -> Vec<Block> {
+        let lane = |id: &str| WatchLane {
+            id: id.to_string(),
+            enabled: true,
+            condition: PassiveCondition::Text {
+                source_block_id: format!("observe-{id}"),
+                rule_id: "text-rule".to_string(),
+            },
+            then_body: vec![Block {
+                id: format!("comment-{id}"),
+                enabled: true,
+                kind: BlockKind::Comment {
+                    text: format!("Handle {id}"),
+                },
+            }],
+        };
+        vec![Block {
+            id: "watch".to_string(),
+            enabled: true,
+            kind: BlockKind::WatchGroup {
+                group: WatchGroup {
+                    lanes: vec![lane("salvage"), lane("retry"), lane("stop")],
+                    timeout_ms: Limit::Finite(5_000),
+                    timeout_outcome: TimeoutOutcome::Continue,
+                    cooldown_ms: 100,
+                },
+            },
+        }]
+    }
+
+    #[test]
+    fn watch_group_rows_show_lane_order_as_priority() {
+        let rows = project_timeline(&fixture_watch_group_definition());
+
+        assert_eq!(
+            rows.iter()
+                .filter_map(|row| row.lane_priority)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn continuous_loop_projects_a_non_editable_return_marker() {
+        let rows = project_timeline(&[Block {
+            id: "loop".to_string(),
+            enabled: true,
+            kind: BlockKind::Continuous {
+                body: vec![Block {
+                    id: "inside".to_string(),
+                    enabled: true,
+                    kind: BlockKind::Comment {
+                        text: "Still watching".to_string(),
+                    },
+                }],
+            },
+        }]);
+
+        let marker = rows.last().expect("loop marker");
+        assert_eq!(marker.summary, "Return to loop start");
+        assert!(marker.is_loop_marker);
+        assert!(!marker.is_selectable);
+    }
+}

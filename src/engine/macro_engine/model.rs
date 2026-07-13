@@ -320,6 +320,17 @@ pub struct WatchGroup {
     pub cooldown_ms: u64,
 }
 
+impl WatchGroup {
+    /// Persisted vector position is the sole user-authored lane priority in v1. Enumerating before
+    /// filtering keeps disabled lanes from silently renumbering the priorities shown in the editor.
+    pub fn enabled_lanes_in_priority_order(&self) -> impl Iterator<Item = (usize, &WatchLane)> {
+        self.lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, lane)| lane.enabled)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatchLane {
     pub id: String,
@@ -422,6 +433,37 @@ mod tests {
         }"#;
 
         assert!(serde_json::from_str::<PassiveCondition>(json).is_err());
+    }
+
+    #[test]
+    fn watch_lane_priority_is_its_unique_persisted_vector_position() {
+        let lane = |id: &str, enabled| WatchLane {
+            id: id.to_string(),
+            enabled,
+            condition: PassiveCondition::Text {
+                source_block_id: id.to_string(),
+                rule_id: "text".to_string(),
+            },
+            then_body: vec![],
+        };
+        let group = WatchGroup {
+            lanes: vec![
+                lane("disabled", false),
+                lane("first", true),
+                lane("second", true),
+            ],
+            timeout_ms: Limit::Unlimited,
+            timeout_outcome: TimeoutOutcome::Continue,
+            cooldown_ms: 0,
+        };
+
+        assert_eq!(
+            group
+                .enabled_lanes_in_priority_order()
+                .map(|(order, lane)| (order, lane.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "first"), (2, "second")]
+        );
     }
 
     #[test]

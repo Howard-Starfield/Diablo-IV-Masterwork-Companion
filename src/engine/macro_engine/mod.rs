@@ -9,6 +9,8 @@ mod runtime;
 mod semantics;
 mod text;
 mod validate;
+#[allow(dead_code)]
+mod watch_group;
 
 #[allow(unused_imports)]
 pub use image_match::*;
@@ -23,3 +25,4 @@ pub use semantics::*;
 pub use text::*;
 #[allow(unused_imports)]
 pub use validate::*;
+pub use watch_group::*;

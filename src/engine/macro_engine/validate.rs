@@ -275,6 +275,15 @@ fn index_blocks<'a>(
             }
             BlockKind::WatchGroup { group } => {
                 for lane in &group.lanes {
+                    if lane.id.trim().is_empty() {
+                        push_problem(
+                            problems,
+                            "watch_lane.blank_id",
+                            "Watch lane id cannot be blank because it is the defensive arbitration key"
+                                .to_string(),
+                            Some(&block.id),
+                        );
+                    }
                     if !lane_ids.insert(lane.id.as_str()) {
                         push_problem(
                             problems,
@@ -1224,6 +1233,31 @@ mod tests {
         assert!(has_code(
             &validate_macro(&definition),
             "watch_group.no_enabled_lanes"
+        ));
+    }
+
+    #[test]
+    fn rejects_blank_watch_lane_id_used_as_defensive_arbitration_key() {
+        let definition = fixture_macro(vec![block(
+            "watch",
+            BlockKind::WatchGroup {
+                group: WatchGroup {
+                    lanes: vec![WatchLane {
+                        id: "  ".to_string(),
+                        enabled: true,
+                        condition: passive_text_condition("  ", "text-present"),
+                        then_body: vec![],
+                    }],
+                    timeout_ms: Limit::Finite(1_000),
+                    timeout_outcome: TimeoutOutcome::Continue,
+                    cooldown_ms: 0,
+                },
+            },
+        )]);
+
+        assert!(has_code(
+            &validate_macro(&definition),
+            "watch_lane.blank_id"
         ));
     }
 

@@ -19,10 +19,11 @@ use crate::engine::{
 };
 
 use super::{
-    Action, Block, BlockKind, Condition, ConditionDetector, DetectorEvidence, DetectorKind,
-    JournalKind, JournalRecord, Limit, MacroDefinition, ObservationRequest, ObservationToken,
-    ObserveMode, PinnedAsset, SavedRevision, TimeoutOutcome, if_once_decision,
-    observation_satisfies_mode, repeat_n_decision, validate_macro,
+    Action, Block, BlockKind, CandidateEvent, CaptureCoordinator, Condition, ConditionDetector,
+    DetectorEvidence, DetectorKind, JournalKind, JournalRecord, LatchDecision, Limit,
+    MacroDefinition, ObservationRequest, ObservationToken, ObserveMode, PassiveCondition,
+    PinnedAsset, SafetyBypass, SavedRevision, TimeoutOutcome, WatchGroup, WatchGroupRunner,
+    if_once_decision, observation_satisfies_mode, repeat_n_decision, validate_macro,
 };
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
@@ -1374,6 +1375,23 @@ pub enum RunEvent {
         block_id: String,
         completed_iterations: u64,
     },
+    ArbitrationCompleted {
+        sequence: u64,
+        elapsed_ms: u64,
+        run_id: String,
+        block_id: String,
+        winner_lane_id: Option<String>,
+        discarded_lane_ids: Vec<String>,
+        safety_bypassed: bool,
+    },
+    PollingDelayed {
+        sequence: u64,
+        elapsed_ms: u64,
+        run_id: String,
+        block_id: String,
+        lane_id: String,
+        delayed_polls: u64,
+    },
     Error {
         sequence: u64,
         elapsed_ms: u64,
@@ -1402,6 +1420,8 @@ impl RunEvent {
             | Self::ConditionEvaluated { sequence, .. }
             | Self::ObservationProgress { sequence, .. }
             | Self::LoopYielded { sequence, .. }
+            | Self::ArbitrationCompleted { sequence, .. }
+            | Self::PollingDelayed { sequence, .. }
             | Self::Error { sequence, .. }
             | Self::RunStopped { sequence, .. } => *sequence,
         }
@@ -1418,13 +1438,18 @@ impl RunEvent {
             | Self::ConditionEvaluated { elapsed_ms, .. }
             | Self::ObservationProgress { elapsed_ms, .. }
             | Self::LoopYielded { elapsed_ms, .. }
+            | Self::ArbitrationCompleted { elapsed_ms, .. }
+            | Self::PollingDelayed { elapsed_ms, .. }
             | Self::Error { elapsed_ms, .. }
             | Self::RunStopped { elapsed_ms, .. } => *elapsed_ms,
         }
     }
 
     fn is_progress(&self) -> bool {
-        matches!(self, Self::ObservationProgress { .. })
+        matches!(
+            self,
+            Self::ObservationProgress { .. } | Self::PollingDelayed { .. }
+        )
     }
 }
 
@@ -1446,6 +1471,10 @@ impl From<RunEvent> for JournalRecord {
                 (JournalKind::Aggregate, "observation progress")
             }
             RunEvent::LoopYielded { .. } => (JournalKind::Aggregate, "loop yielded"),
+            RunEvent::ArbitrationCompleted { .. } => {
+                (JournalKind::Arbitration, "watch arbitration completed")
+            }
+            RunEvent::PollingDelayed { .. } => (JournalKind::Aggregate, "polling delayed"),
             RunEvent::Error { .. } => (JournalKind::Error, "runtime error"),
             RunEvent::RunStopped { .. } => (JournalKind::StateChange, "run stopped"),
         };
@@ -1954,6 +1983,7 @@ impl MacroRuntime {
             non_authoritative_planned_clicks: 0,
             paused_event_emitted: false,
             detector_generations: HashSet::new(),
+            watch_groups: HashMap::new(),
         };
         let reason = execution
             .execute_blocks(&blocks)
@@ -2069,6 +2099,7 @@ struct RunExecution<'a, 'clock> {
     non_authoritative_planned_clicks: u64,
     paused_event_emitted: bool,
     detector_generations: HashSet<u64>,
+    watch_groups: HashMap<String, WatchGroupRunner>,
 }
 
 impl RunExecution<'_, '_> {
@@ -2175,9 +2206,7 @@ impl RunExecution<'_, '_> {
                     }
                 }
             }
-            BlockKind::WatchGroup { .. } => Some(StopReason::UnsupportedBlock {
-                block_id: block.id.clone(),
-            }),
+            BlockKind::WatchGroup { group } => self.execute_watch_group(&block.id, group),
             BlockKind::StopSuccess => Some(StopReason::StopSuccess),
             BlockKind::StopError { message } => Some(StopReason::StopError {
                 message: message.clone(),
@@ -2188,6 +2217,413 @@ impl RunExecution<'_, '_> {
 
     fn execute_timeout_body(&mut self, body: Option<&[Block]>) -> Option<StopReason> {
         body.and_then(|body| self.execute_blocks(body))
+    }
+
+    fn execute_watch_group(&mut self, block_id: &str, group: &WatchGroup) -> Option<StopReason> {
+        let initial_generation = self.runtime.control_handle().generation();
+        let mut runner = self.watch_groups.remove(block_id).unwrap_or_else(|| {
+            WatchGroupRunner::new(
+                self.emitter.run_id(),
+                initial_generation,
+                group.lanes.len().max(1),
+            )
+        });
+        let capture_coordinator = CaptureCoordinator::new(Arc::clone(&self.runtime.capture));
+        runner.invalidate(initial_generation);
+        let started_at = self.runtime.clock.now_ms();
+        let mut attempts = 0_u64;
+
+        'observe: loop {
+            if let Some(reason) = self.check_control() {
+                let arbitration = runner.arbitrate(Some(safety_bypass_for_stop(&reason)));
+                self.emitter.arbitration_completed(
+                    block_id,
+                    None,
+                    arbitration.discarded_lane_ids,
+                    true,
+                );
+                self.watch_groups.insert(block_id.to_string(), runner);
+                return Some(reason);
+            }
+            if attempts > 0 && watch_timeout_reached(group, started_at, self.runtime.clock.now_ms())
+            {
+                return self.resolve_watch_timeout(block_id, group, runner);
+            }
+            let generation = self.runtime.control_handle().generation();
+            runner.invalidate(generation);
+            attempts = attempts.saturating_add(1);
+            if exceeds_limit(
+                attempts.saturating_sub(1),
+                &self.compiled.definition().safety.max_observation_retries,
+            ) {
+                self.watch_groups.insert(block_id.to_string(), runner);
+                return Some(StopReason::SafetyLimit {
+                    message: format!(
+                        "observation retry limit exceeded in Watch Group '{block_id}'"
+                    ),
+                });
+            }
+            if let Some(reason) = self.pace_observation() {
+                let arbitration = runner.arbitrate(Some(safety_bypass_for_stop(&reason)));
+                self.emitter.arbitration_completed(
+                    block_id,
+                    None,
+                    arbitration.discarded_lane_ids,
+                    true,
+                );
+                self.watch_groups.insert(block_id.to_string(), runner);
+                return Some(reason);
+            }
+            if attempts > 1 && watch_timeout_reached(group, started_at, self.runtime.clock.now_ms())
+            {
+                return self.resolve_watch_timeout(block_id, group, runner);
+            }
+
+            let mut lane_schedule: Vec<_> = group
+                .enabled_lanes_in_priority_order()
+                .map(|(order, _)| order)
+                .collect();
+            if !lane_schedule.is_empty() {
+                let rotation = usize::try_from(attempts.saturating_sub(1)).unwrap_or(usize::MAX)
+                    % lane_schedule.len();
+                lane_schedule.rotate_left(rotation);
+            }
+            let capture_regions = lane_schedule
+                .iter()
+                .map(|lane_order| self.watch_capture_rect(&group.lanes[*lane_order].condition))
+                .collect::<std::result::Result<Vec<_>, _>>();
+            let capture_regions = match capture_regions {
+                Ok(regions) => regions,
+                Err(message) => {
+                    self.watch_groups.insert(block_id.to_string(), runner);
+                    return Some(StopReason::TechnicalFailure { message });
+                }
+            };
+            if let Err(error) = capture_coordinator.begin_cycle(&capture_regions) {
+                if error
+                    .downcast_ref::<crate::engine::automation::StaleCapturedFrameError>()
+                    .is_some()
+                {
+                    let arbitration = runner.arbitrate(Some(SafetyBypass::TargetInvalidated));
+                    self.emitter.arbitration_completed(
+                        block_id,
+                        None,
+                        arbitration.discarded_lane_ids,
+                        true,
+                    );
+                }
+                self.watch_groups.insert(block_id.to_string(), runner);
+                return Some(StopReason::TechnicalFailure {
+                    message: format!("capture failed for Watch Group '{block_id}': {error}"),
+                });
+            }
+            let mut scheduled_text = 0_usize;
+            let mut scheduled_images = 0_usize;
+            for lane_order in lane_schedule {
+                let lane = &group.lanes[lane_order];
+                if !lane.enabled {
+                    continue;
+                }
+                let saturated = match lane.condition {
+                    PassiveCondition::Text { .. } => {
+                        scheduled_text = scheduled_text.saturating_add(1);
+                        scheduled_text > 1
+                    }
+                    PassiveCondition::Image { .. } => {
+                        scheduled_images = scheduled_images.saturating_add(1);
+                        scheduled_images > 2
+                    }
+                };
+                if saturated {
+                    self.emitter.polling_delayed(block_id, &lane.id, attempts);
+                }
+                if let Some(reason) = self.check_control() {
+                    let arbitration = runner.arbitrate(Some(safety_bypass_for_stop(&reason)));
+                    self.emitter.arbitration_completed(
+                        block_id,
+                        None,
+                        arbitration.discarded_lane_ids,
+                        true,
+                    );
+                    self.watch_groups.insert(block_id.to_string(), runner);
+                    return Some(reason);
+                }
+                if self.runtime.control_handle().generation() != generation {
+                    runner.invalidate(self.runtime.control_handle().generation());
+                    continue 'observe;
+                }
+                let condition = passive_condition(&lane.condition);
+                self.detector_generations.insert(generation);
+                let observed_at_ms = self.runtime.clock.now_ms();
+                self.last_observation_at_ms = Some(observed_at_ms);
+                let request = ObservationRequest {
+                    run_id: self.emitter.run_id(),
+                    generation,
+                    condition: &condition,
+                    compiled: self.compiled,
+                    observed_at_ms,
+                };
+                let observation = self
+                    .runtime
+                    .detector
+                    .observe(&request, &capture_coordinator);
+                if let Some(reason) = self.check_control() {
+                    let arbitration = runner.arbitrate(Some(safety_bypass_for_stop(&reason)));
+                    self.emitter.arbitration_completed(
+                        block_id,
+                        None,
+                        arbitration.discarded_lane_ids,
+                        true,
+                    );
+                    self.watch_groups.insert(block_id.to_string(), runner);
+                    return Some(reason);
+                }
+                if self.runtime.control_handle().generation() != generation {
+                    runner.invalidate(self.runtime.control_handle().generation());
+                    self.emitter.observation_progress(block_id, attempts);
+                    continue 'observe;
+                }
+                let evidence = match observation {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        if error
+                            .downcast_ref::<crate::engine::automation::StaleCapturedFrameError>()
+                            .is_some()
+                        {
+                            let arbitration =
+                                runner.arbitrate(Some(SafetyBypass::TargetInvalidated));
+                            self.emitter.arbitration_completed(
+                                block_id,
+                                None,
+                                arbitration.discarded_lane_ids,
+                                true,
+                            );
+                        }
+                        self.watch_groups.insert(block_id.to_string(), runner);
+                        return Some(StopReason::TechnicalFailure {
+                            message: format!(
+                                "detector failed for Watch lane '{}': {error}",
+                                lane.id
+                            ),
+                        });
+                    }
+                };
+                let token = if evidence.matched {
+                    match self.make_token(&condition, &evidence, generation) {
+                        Ok(token) => Some(token),
+                        Err(message) => {
+                            self.watch_groups.insert(block_id.to_string(), runner);
+                            return Some(StopReason::TechnicalFailure { message });
+                        }
+                    }
+                } else {
+                    None
+                };
+                self.emitter
+                    .observation_completed(&lane.id, evidence.clone(), token.clone());
+                self.emitter.condition_evaluated(&lane.id, evidence.matched);
+
+                let latch = runner.observe_latch(&lane.id, evidence.matched, evidence.frame_id);
+                if matches!(latch, LatchDecision::Qualified) {
+                    let candidate = token.as_ref().map(|token| {
+                        CandidateEvent::from_observation(
+                            &lane.id,
+                            lane_order,
+                            self.runtime.clock.now_ms(),
+                            token,
+                        )
+                    });
+                    if let Some(token) = token {
+                        self.observations.insert(lane.id.clone(), token);
+                    }
+                    let Some(candidate) = candidate else {
+                        self.watch_groups.insert(block_id.to_string(), runner);
+                        return Some(StopReason::TechnicalFailure {
+                            message: format!(
+                                "qualified Watch lane '{}' has no evidence token",
+                                lane.id
+                            ),
+                        });
+                    };
+                    if let Err(message) = runner.qualify_preobserved(candidate) {
+                        self.watch_groups.insert(block_id.to_string(), runner);
+                        return Some(StopReason::TechnicalFailure {
+                            message: format!(
+                                "Watch lane '{}' candidate rejected: {message}",
+                                lane.id
+                            ),
+                        });
+                    }
+                } else {
+                    self.observations.remove(&lane.id);
+                }
+            }
+
+            let arbitration = runner.arbitrate(None);
+            if let Some(winner) = arbitration.winner.clone() {
+                if let Some(reason) = self.check_control() {
+                    self.observations.clear();
+                    self.emitter.arbitration_completed(
+                        block_id,
+                        None,
+                        std::iter::once(winner.lane_id)
+                            .chain(arbitration.discarded_lane_ids)
+                            .collect(),
+                        true,
+                    );
+                    runner.invalidate(self.runtime.control_handle().generation());
+                    self.watch_groups.insert(block_id.to_string(), runner);
+                    return Some(reason);
+                }
+                let fresh_winner = self
+                    .observations
+                    .get(&winner.lane_id)
+                    .is_some_and(|token| winner.matches_observation(token))
+                    && winner.generation == self.runtime.control_handle().generation();
+                if !fresh_winner {
+                    self.observations.clear();
+                    runner.invalidate(self.runtime.control_handle().generation());
+                    self.watch_groups.insert(block_id.to_string(), runner);
+                    return Some(StopReason::TechnicalFailure {
+                        message: format!(
+                            "Watch lane '{}' candidate became stale before commit",
+                            winner.lane_id
+                        ),
+                    });
+                }
+                self.emitter.arbitration_completed(
+                    block_id,
+                    Some(winner.lane_id.clone()),
+                    arbitration.discarded_lane_ids.clone(),
+                    false,
+                );
+                let losing: HashSet<_> = arbitration.discarded_lane_ids.iter().collect();
+                self.observations
+                    .retain(|source, _| !losing.contains(source));
+                let winner_body = group
+                    .lanes
+                    .iter()
+                    .find(|lane| lane.id == winner.lane_id)
+                    .map(|lane| lane.then_body.clone())
+                    .unwrap_or_default();
+                runner.begin_execution();
+                let body_reason = self.execute_blocks(&winner_body);
+                runner.settle_and_exit();
+                capture_coordinator.invalidate();
+                self.observations.clear();
+                self.watch_groups.insert(block_id.to_string(), runner);
+                if let Some(reason) = body_reason {
+                    return Some(reason);
+                }
+                return self.cooperative_wait(group.cooldown_ms);
+            }
+
+            if watch_timeout_reached(group, started_at, self.runtime.clock.now_ms()) {
+                return self.resolve_watch_timeout(block_id, group, runner);
+            }
+            self.emitter.observation_progress(block_id, attempts);
+            let poll_ms = group
+                .lanes
+                .iter()
+                .filter(|lane| lane.enabled)
+                .map(|lane| self.watch_poll_interval_ms(&lane.condition))
+                .min()
+                .unwrap_or(1)
+                .max(1);
+            if let Some(reason) = self.cooperative_wait(poll_ms) {
+                let arbitration = runner.arbitrate(Some(safety_bypass_for_stop(&reason)));
+                self.emitter.arbitration_completed(
+                    block_id,
+                    None,
+                    arbitration.discarded_lane_ids,
+                    true,
+                );
+                self.watch_groups.insert(block_id.to_string(), runner);
+                return Some(reason);
+            }
+        }
+    }
+
+    fn resolve_watch_timeout(
+        &mut self,
+        block_id: &str,
+        group: &WatchGroup,
+        mut runner: WatchGroupRunner,
+    ) -> Option<StopReason> {
+        self.emitter
+            .arbitration_completed(block_id, None, Vec::new(), false);
+        runner.settle_and_exit();
+        self.observations.clear();
+        self.watch_groups.insert(block_id.to_string(), runner);
+        match &group.timeout_outcome {
+            TimeoutOutcome::Continue => None,
+            TimeoutOutcome::RunBody { body } => self.execute_blocks(body),
+            TimeoutOutcome::StopError { message } => Some(StopReason::StopError {
+                message: message.clone(),
+            }),
+        }
+    }
+
+    fn watch_poll_interval_ms(&self, condition: &PassiveCondition) -> u64 {
+        match condition {
+            PassiveCondition::Text { rule_id, .. } => self
+                .compiled
+                .definition()
+                .text_rules
+                .iter()
+                .find(|rule| &rule.id == rule_id)
+                .map_or(1, |rule| rule.poll_interval_ms),
+            PassiveCondition::Image { rule_id, .. } => self
+                .compiled
+                .definition()
+                .image_rules
+                .iter()
+                .find(|rule| &rule.id == rule_id)
+                .map_or(1, |rule| rule.poll_interval_ms),
+        }
+    }
+
+    fn watch_capture_rect(
+        &self,
+        condition: &PassiveCondition,
+    ) -> std::result::Result<crate::engine::types::Rect, String> {
+        let region_id = match condition {
+            PassiveCondition::Text { rule_id, .. } => {
+                &self
+                    .compiled
+                    .definition()
+                    .text_rules
+                    .iter()
+                    .find(|rule| &rule.id == rule_id)
+                    .ok_or_else(|| format!("compiled text rule '{rule_id}' is missing"))?
+                    .region_id
+            }
+            PassiveCondition::Image { rule_id, .. } => {
+                &self
+                    .compiled
+                    .definition()
+                    .image_rules
+                    .iter()
+                    .find(|rule| &rule.id == rule_id)
+                    .ok_or_else(|| format!("compiled image rule '{rule_id}' is missing"))?
+                    .region_id
+            }
+        };
+        let region = self
+            .compiled
+            .definition()
+            .regions
+            .iter()
+            .find(|region| &region.id == region_id)
+            .ok_or_else(|| format!("compiled Watch region '{region_id}' is missing"))?;
+        let target = &self.compiled.definition().target;
+        Ok(crate::engine::types::Rect::new(
+            0,
+            0,
+            target.captured_client_width,
+            target.captured_client_height,
+        )
+        .rect_from_ratio(region.rect))
     }
 
     fn evaluate_condition(
@@ -2556,6 +2992,38 @@ impl RunExecution<'_, '_> {
 struct ConditionOutcome {
     matched: bool,
     timeout_body: Option<Vec<Block>>,
+}
+
+fn passive_condition(condition: &PassiveCondition) -> Condition {
+    match condition {
+        PassiveCondition::Text {
+            source_block_id,
+            rule_id,
+        } => Condition::Text {
+            source_block_id: source_block_id.clone(),
+            rule_id: rule_id.clone(),
+            mode: ObserveMode::CheckNow,
+        },
+        PassiveCondition::Image {
+            source_block_id,
+            rule_id,
+        } => Condition::Image {
+            source_block_id: source_block_id.clone(),
+            rule_id: rule_id.clone(),
+            mode: ObserveMode::CheckNow,
+        },
+    }
+}
+
+fn watch_timeout_reached(group: &WatchGroup, started_at: u64, now: u64) -> bool {
+    matches!(group.timeout_ms, Limit::Finite(timeout_ms) if now >= started_at.saturating_add(timeout_ms))
+}
+
+fn safety_bypass_for_stop(reason: &StopReason) -> SafetyBypass {
+    match reason {
+        StopReason::EmergencyStopped => SafetyBypass::EmergencyStop,
+        _ => SafetyBypass::Cancelled,
+    }
 }
 
 fn condition_mode(condition: &Condition) -> &ObserveMode {
@@ -3020,6 +3488,50 @@ impl<'a> EventEmitter<'a> {
         });
     }
 
+    fn arbitration_completed(
+        &mut self,
+        block_id: &str,
+        winner_lane_id: Option<String>,
+        discarded_lane_ids: Vec<String>,
+        safety_bypassed: bool,
+    ) {
+        let (sequence, elapsed_ms, run_id) = self.metadata();
+        self.push_critical(RunEvent::ArbitrationCompleted {
+            sequence,
+            elapsed_ms,
+            run_id,
+            block_id: block_id.to_string(),
+            winner_lane_id,
+            discarded_lane_ids,
+            safety_bypassed,
+        });
+    }
+
+    fn polling_delayed(&mut self, block_id: &str, lane_id: &str, delayed_polls: u64) {
+        let (sequence, elapsed_ms, run_id) = self.metadata();
+        let event = RunEvent::PollingDelayed {
+            sequence,
+            elapsed_ms,
+            run_id,
+            block_id: block_id.to_string(),
+            lane_id: lane_id.to_string(),
+            delayed_polls,
+        };
+        if let Some(last) = self.events.last_mut().filter(|last| {
+            matches!(
+                (&**last, &event),
+                (
+                    RunEvent::PollingDelayed { run_id: previous_run, block_id: previous_block, lane_id: previous_lane, .. },
+                    RunEvent::PollingDelayed { run_id: current_run, block_id: current_block, lane_id: current_lane, .. }
+                ) if previous_run == current_run && previous_block == current_block && previous_lane == current_lane
+            )
+        }) {
+            *last = event;
+        } else if self.events.len() + 1 < self.capacity - FINAL_EVENT_RESERVE {
+            self.events.push(event);
+        }
+    }
+
     fn error(&mut self, block_id: Option<String>, message: String) {
         let (sequence, elapsed_ms, run_id) = self.metadata();
         self.push_critical(RunEvent::Error {
@@ -3053,8 +3565,9 @@ mod tests {
             ImageRule, ImageRuleVerification, ImageRuleVerificationArtifact,
             ImageRuleVerificationInput, ImageVerificationPreprocess, Limit, MACRO_SCHEMA_VERSION,
             MatchSelectionPolicy, NegativeCorpusSample, NegativeSampleEvaluationInputs,
-            ObserveMode, PointDefinition, PreprocessProfile, RegionDefinition, SafetyPolicy,
-            TargetProfile, TextMatchMode, TextRule, TimeoutOutcome,
+            ObserveMode, PassiveCondition, PointDefinition, PreprocessProfile, RegionDefinition,
+            SafetyPolicy, TargetProfile, TextMatchMode, TextRule, TimeoutOutcome, WatchGroup,
+            WatchLane,
         },
         types::{PointRatio, Rect, RectRatio, ScreenImage},
     };
@@ -3070,6 +3583,28 @@ mod tests {
     impl CaptureSource for FakeCapture {
         fn capture(&self, _rect: Rect) -> Result<ScreenImage> {
             bail!("capture should not be called")
+        }
+
+        fn capture_frame(
+            &self,
+            rect: Rect,
+        ) -> Result<crate::engine::automation::CapturedScreenFrame> {
+            Ok(crate::engine::automation::CapturedScreenFrame {
+                image: ScreenImage::new(image::RgbaImage::new(rect.width, rect.height)),
+                metadata: crate::engine::automation::CaptureFrameMetadata {
+                    frame_id: 1,
+                    captured_at_ms: 0,
+                    window_id: 9,
+                    window_revision: 2,
+                    client_x: 0,
+                    client_y: 0,
+                    client_width: 1920,
+                    client_height: 1080,
+                    geometry_revision: 3,
+                    display_profile_revision: 4,
+                    dpi: 96,
+                },
+            })
         }
     }
 
@@ -5224,6 +5759,360 @@ mod tests {
         assert!(error.contains("conflicting hashes for immutable asset identity"));
     }
 
+    #[derive(Debug, Default)]
+    struct WatchSequenceDetector(Mutex<HashMap<String, VecDeque<bool>>>);
+
+    #[derive(Debug, Default)]
+    struct StaleWatchFrameDetector;
+
+    #[derive(Debug, Default)]
+    struct WatchCountingCapture(AtomicU64);
+
+    impl CaptureSource for WatchCountingCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            Ok(ScreenImage::new(image::RgbaImage::new(
+                rect.width,
+                rect.height,
+            )))
+        }
+
+        fn capture_frame(
+            &self,
+            rect: Rect,
+        ) -> Result<crate::engine::automation::CapturedScreenFrame> {
+            let frame_id = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(crate::engine::automation::CapturedScreenFrame {
+                image: ScreenImage::new(image::RgbaImage::new(rect.width, rect.height)),
+                metadata: crate::engine::automation::CaptureFrameMetadata {
+                    frame_id,
+                    captured_at_ms: frame_id,
+                    window_id: 9,
+                    window_revision: 2,
+                    client_x: 0,
+                    client_y: 0,
+                    client_width: 1920,
+                    client_height: 1080,
+                    geometry_revision: 3,
+                    display_profile_revision: 4,
+                    dpi: 96,
+                },
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturingWatchDetector;
+
+    impl ConditionDetector for CapturingWatchDetector {
+        fn observe(
+            &self,
+            request: &super::super::ObservationRequest<'_>,
+            capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            let frame = capture.capture_frame(Rect::new(192, 108, 384, 216))?;
+            Ok(super::super::DetectorEvidence {
+                matched: true,
+                frame_id: frame.metadata.frame_id,
+                captured_at_ms: request.observed_at_ms,
+                match_rect: Some(Rect::new(1, 2, 3, 4)),
+                score: Some(0.99),
+                match_count: 1,
+                stable_frames: 1,
+                frame_metadata: None,
+                details: serde_json::Value::Null,
+            })
+        }
+    }
+
+    impl ConditionDetector for StaleWatchFrameDetector {
+        fn observe(
+            &self,
+            _request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            Err(crate::engine::automation::StaleCapturedFrameError.into())
+        }
+    }
+
+    impl WatchSequenceDetector {
+        fn with(values: impl IntoIterator<Item = (&'static str, Vec<bool>)>) -> Self {
+            Self(Mutex::new(
+                values
+                    .into_iter()
+                    .map(|(lane, values)| (lane.to_string(), values.into_iter().collect()))
+                    .collect(),
+            ))
+        }
+    }
+
+    impl ConditionDetector for WatchSequenceDetector {
+        fn observe(
+            &self,
+            request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            let source = condition_source_id(request.condition);
+            let matched = self
+                .0
+                .lock()
+                .unwrap()
+                .get_mut(source)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or(false);
+            Ok(super::super::DetectorEvidence {
+                matched,
+                frame_id: request.observed_at_ms,
+                captured_at_ms: request.observed_at_ms,
+                match_rect: matched.then(|| Rect::new(1, 2, 3, 4)),
+                score: matched.then_some(0.99),
+                match_count: u32::from(matched),
+                stable_frames: u8::from(matched),
+                frame_metadata: None,
+                details: serde_json::json!({"watch_fixture": source}),
+            })
+        }
+    }
+
+    fn watch_lane(id: &str, then_body: Vec<Block>) -> WatchLane {
+        WatchLane {
+            id: id.to_string(),
+            enabled: true,
+            condition: PassiveCondition::Text {
+                source_block_id: id.to_string(),
+                rule_id: "text".to_string(),
+            },
+            then_body,
+        }
+    }
+
+    fn watch_group(
+        lanes: Vec<WatchLane>,
+        timeout_ms: u64,
+        timeout_outcome: TimeoutOutcome,
+    ) -> Block {
+        block(
+            "watch",
+            BlockKind::WatchGroup {
+                group: WatchGroup {
+                    lanes,
+                    timeout_ms: Limit::Finite(timeout_ms),
+                    timeout_outcome,
+                    cooldown_ms: 0,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn watch_group_executes_one_priority_winner_then_exits_without_queuing_loser() {
+        let macro_revision = saved(fixture_definition(vec![watch_group(
+            vec![
+                watch_lane("lane-1", vec![point_action("lane-1-body")]),
+                watch_lane("lane-2", vec![point_action("lane-2-body")]),
+            ],
+            20,
+            TimeoutOutcome::Continue,
+        )]));
+        let events = fixture_runtime_with_detector(WatchSequenceDetector::with([
+            ("lane-1", vec![true]),
+            ("lane-2", vec![true]),
+        ]))
+        .run(macro_revision, RunMode::DryRun)
+        .unwrap();
+
+        assert!(events.iter().any(|event| matches!(event, RunEvent::ArbitrationCompleted { winner_lane_id: Some(id), .. } if id == "lane-1")));
+        assert!(events.iter().any(|event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "lane-1-body")));
+        assert!(!events.iter().any(|event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "lane-2-body")));
+    }
+
+    #[test]
+    fn watch_group_timeout_runs_only_its_explicit_timeout_body() {
+        let macro_revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![point_action("winner-body")])],
+            2,
+            TimeoutOutcome::RunBody {
+                body: vec![point_action("timeout-body")],
+            },
+        )]));
+        let events = fixture_runtime_with_detector(WatchSequenceDetector::with([(
+            "lane-1",
+            vec![false, false, false],
+        )]))
+        .run(macro_revision, RunMode::DryRun)
+        .unwrap();
+
+        assert!(events.iter().any(|event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "timeout-body")));
+        assert!(!events.iter().any(|event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "winner-body")));
+    }
+
+    #[test]
+    fn watch_lane_latches_persist_across_repeat_entries_and_reset_after_newer_false() {
+        let watch = watch_group(
+            vec![
+                watch_lane("lane-1", vec![point_action("lane-1-body")]),
+                watch_lane("lane-2", vec![point_action("lane-2-body")]),
+            ],
+            2,
+            TimeoutOutcome::Continue,
+        );
+        let macro_revision = saved(fixture_definition(vec![block(
+            "repeat",
+            BlockKind::RepeatN {
+                count: 3,
+                body: vec![watch],
+            },
+        )]));
+        let events = fixture_runtime_with_detector(WatchSequenceDetector::with([
+            ("lane-1", vec![true, false, false]),
+            ("lane-2", vec![true, false, true]),
+        ]))
+        .run(macro_revision, RunMode::DryRun)
+        .unwrap();
+
+        let entered: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::BlockEntered { block_id, .. } if block_id.ends_with("-body") => {
+                    Some(block_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(entered, vec!["lane-1-body", "lane-2-body"]);
+    }
+
+    #[test]
+    fn watch_group_reports_polling_delayed_when_text_worker_is_saturated() {
+        let macro_revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![]), watch_lane("lane-2", vec![])],
+            2,
+            TimeoutOutcome::Continue,
+        )]));
+        let events = fixture_runtime_with_detector(WatchSequenceDetector::with([
+            ("lane-1", vec![false]),
+            ("lane-2", vec![false]),
+        ]))
+        .run(macro_revision, RunMode::ObservationOnly)
+        .unwrap();
+
+        assert!(events.iter().any(|event| matches!(event, RunEvent::PollingDelayed { block_id, lane_id, .. } if block_id == "watch" && lane_id == "lane-2")));
+    }
+
+    #[test]
+    fn target_frame_invalidation_bypasses_watch_arbitration() {
+        let macro_revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![point_action("body")])],
+            20,
+            TimeoutOutcome::Continue,
+        )]));
+        let events = fixture_runtime_with_detector(StaleWatchFrameDetector)
+            .run(macro_revision, RunMode::ObservationOnly)
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEvent::ArbitrationCompleted {
+                safety_bypassed: true,
+                ..
+            }
+        )));
+        assert!(!events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+    }
+
+    #[test]
+    fn pause_resume_generation_change_discards_in_flight_watch_candidate() {
+        let detector = Arc::new(InvalidatingDetector::default());
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeCapture),
+            detector.clone(),
+            Arc::new(FakeClock::default()),
+        );
+        *detector.control.lock().unwrap() = Some(runtime.control_handle());
+        let macro_revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![point_action("body")])],
+            200,
+            TimeoutOutcome::Continue,
+        )]));
+
+        let events = runtime.run(macro_revision, RunMode::DryRun).unwrap();
+
+        assert!(detector.calls.load(Ordering::Relaxed) >= 2);
+        let winner_generation = events.iter().find_map(|event| match event {
+            RunEvent::ObservationCompleted {
+                block_id,
+                token: Some(token),
+                ..
+            } if block_id == "lane-1" => Some(token.generation),
+            _ => None,
+        });
+        assert_eq!(
+            winner_generation,
+            Some(runtime.control_handle().generation())
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+    }
+
+    #[test]
+    fn winning_body_side_effect_invalidates_watch_observation_before_later_action() {
+        let watch = watch_group(
+            vec![watch_lane("lane-1", vec![point_action("body-click")])],
+            20,
+            TimeoutOutcome::Continue,
+        );
+        let later_match_click = block(
+            "later-match-click",
+            BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: "lane-1".to_string(),
+                    button: super::super::MouseButton::Left,
+                },
+            },
+        );
+        let macro_revision = saved(fixture_definition(vec![watch, later_match_click]));
+        let events =
+            fixture_runtime_with_detector(WatchSequenceDetector::with([("lane-1", vec![true])]))
+                .run(macro_revision, RunMode::DryRun)
+                .unwrap();
+
+        assert!(events.iter().any(|event| matches!(event, RunEvent::ActionPlanned { block_id, .. } if block_id == "body-click")));
+        assert!(events.iter().any(|event| matches!(event, RunEvent::ActionBlocked { block_id, reason, .. } if block_id == "later-match-click" && reason.contains("fresh observation"))));
+    }
+
+    #[test]
+    fn watch_runtime_shares_one_capture_frame_across_compatible_lanes() {
+        let capture = Arc::new(WatchCountingCapture::default());
+        let runtime = MacroRuntime::new(
+            capture.clone(),
+            Arc::new(CapturingWatchDetector),
+            Arc::new(FakeClock::default()),
+        );
+        let macro_revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![]), watch_lane("lane-2", vec![])],
+            20,
+            TimeoutOutcome::Continue,
+        )]));
+
+        let events = runtime
+            .run(macro_revision, RunMode::ObservationOnly)
+            .unwrap();
+        let frame_ids: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::ObservationCompleted {
+                    block_id, evidence, ..
+                } if block_id.starts_with("lane-") => Some(evidence.frame_id),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(capture.0.load(Ordering::Relaxed), 1);
+        assert_eq!(frame_ids, vec![1, 1]);
+    }
+
     fn progress_event(attempts: u64) -> RunEvent {
         RunEvent::ObservationProgress {
             sequence: attempts,
@@ -5255,6 +6144,8 @@ mod tests {
             | RunEvent::ConditionEvaluated { run_id, .. }
             | RunEvent::ObservationProgress { run_id, .. }
             | RunEvent::LoopYielded { run_id, .. }
+            | RunEvent::ArbitrationCompleted { run_id, .. }
+            | RunEvent::PollingDelayed { run_id, .. }
             | RunEvent::Error { run_id, .. }
             | RunEvent::RunStopped { run_id, .. } => run_id,
         }

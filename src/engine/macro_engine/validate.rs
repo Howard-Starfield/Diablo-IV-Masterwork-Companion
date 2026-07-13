@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use super::*;
 
@@ -193,7 +193,12 @@ fn index_blocks<'a>(
             BlockKind::Observe { condition }
             | BlockKind::If { condition, .. }
             | BlockKind::RepeatUntil { condition, .. } => {
-                sources.insert(block.id.as_str(), source_info(condition, block_enabled));
+                insert_source(
+                    sources,
+                    block.id.as_str(),
+                    source_info(condition, block_enabled),
+                    problems,
+                );
                 index_condition_timeout_body(
                     condition,
                     block_enabled,
@@ -245,9 +250,11 @@ fn index_blocks<'a>(
                         );
                     }
                     let lane_enabled = block_enabled && lane.enabled;
-                    sources.insert(
+                    insert_source(
+                        sources,
                         lane.id.as_str(),
                         passive_source_info(&lane.condition, lane_enabled),
+                        problems,
                     );
                     index_blocks(
                         &lane.then_body,
@@ -264,6 +271,25 @@ fn index_blocks<'a>(
             }
             _ => {}
         }
+    }
+}
+
+fn insert_source<'a>(
+    sources: &mut HashMap<&'a str, SourceInfo<'a>>,
+    source_id: &'a str,
+    source: SourceInfo<'a>,
+    problems: &mut Vec<ValidationProblem>,
+) {
+    match sources.entry(source_id) {
+        Entry::Vacant(entry) => {
+            entry.insert(source);
+        }
+        Entry::Occupied(_) => push_problem(
+            problems,
+            "source.duplicate_id",
+            format!("duplicate observation source id '{source_id}'"),
+            Some(source_id),
+        ),
     }
 }
 
@@ -1439,6 +1465,39 @@ mod tests {
         assert!(has_code(
             &validate_macro(&definition),
             "continuous.busy_loop"
+        ));
+    }
+
+    #[test]
+    fn rejects_observe_block_and_watch_lane_source_id_collision() {
+        let definition = fixture_macro(vec![
+            block(
+                "shared-source",
+                BlockKind::Observe {
+                    condition: text_condition("shared-source", "text-present"),
+                },
+            ),
+            block(
+                "watch",
+                BlockKind::WatchGroup {
+                    group: WatchGroup {
+                        lanes: vec![WatchLane {
+                            id: "shared-source".to_string(),
+                            enabled: true,
+                            condition: passive_text_condition("shared-source", "text-present"),
+                            then_body: vec![],
+                        }],
+                        timeout_ms: Limit::Finite(1_000),
+                        timeout_outcome: TimeoutOutcome::Continue,
+                        cooldown_ms: 0,
+                    },
+                },
+            ),
+        ]);
+
+        assert!(has_code(
+            &validate_macro(&definition),
+            "source.duplicate_id"
         ));
     }
 }

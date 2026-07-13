@@ -20,6 +20,8 @@ use super::{
     Condition, ConditionDetector, DetectorEvidence, Limit, MatchSelectionPolicy,
     ObservationRequest, PreprocessProfile, TextMatchMode, TextRule,
 };
+
+const DEFAULT_MAX_TEXT_STABILITY_STATES: usize = 256;
 use crate::engine::{automation::CaptureSource, platform::WindowsTextRecognizer};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -680,10 +682,23 @@ struct StabilityState {
     count: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StabilityWatermark {
+    generation: u64,
+    side_effect_epoch: u64,
+}
+
+#[derive(Debug, Default)]
+struct TextDetectorState {
+    stability: HashMap<StabilityKey, StabilityState>,
+    watermark_by_run: HashMap<String, StabilityWatermark>,
+}
+
 pub struct TextDetector {
     recognizer: Arc<dyn PositionedTextRecognizer>,
     preprocess: Mutex<TextPreprocessWorker>,
-    stability: Mutex<HashMap<StabilityKey, StabilityState>>,
+    state: Mutex<TextDetectorState>,
+    maximum_stability_states: usize,
 }
 
 impl Default for TextDetector {
@@ -697,7 +712,43 @@ impl TextDetector {
         Self {
             recognizer,
             preprocess: Mutex::new(TextPreprocessWorker::default()),
-            stability: Mutex::new(HashMap::new()),
+            state: Mutex::new(TextDetectorState::default()),
+            maximum_stability_states: DEFAULT_MAX_TEXT_STABILITY_STATES,
+        }
+    }
+
+    fn begin_observation(
+        &self,
+        run_id: &str,
+        generation: u64,
+        side_effect_epoch: u64,
+    ) -> Result<bool> {
+        let requested = StabilityWatermark {
+            generation,
+            side_effect_epoch,
+        };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("text detector stability lock is poisoned"))?;
+        match state.watermark_by_run.get(run_id).copied() {
+            Some(current) if current == requested => Ok(true),
+            Some(current) if watermark_is_newer(requested, current) => {
+                state.stability.retain(|key, _| key.run_id != run_id);
+                state.watermark_by_run.insert(run_id.to_string(), requested);
+                Ok(true)
+            }
+            Some(_) => Ok(false),
+            None => {
+                if state.watermark_by_run.len() >= self.maximum_stability_states {
+                    bail!(
+                        "text detector run watermark capacity {} is exhausted",
+                        self.maximum_stability_states
+                    );
+                }
+                state.watermark_by_run.insert(run_id.to_string(), requested);
+                Ok(true)
+            }
         }
     }
 
@@ -708,6 +759,16 @@ impl TextDetector {
         source_block_id: &str,
         rule_id: &str,
     ) -> Result<DetectorEvidence> {
+        if !self.begin_observation(
+            request.run_id,
+            request.generation,
+            request.side_effect_epoch,
+        )? {
+            return Ok(DetectorEvidence::unmatched(
+                request.observed_at_ms,
+                request.observed_at_ms,
+            ));
+        }
         let definition = request.compiled.definition();
         let rule = definition
             .text_rules
@@ -826,32 +887,48 @@ impl TextDetector {
     }
 
     fn update_stability(&self, key: &StabilityKey, text_match: &TextMatch) -> Result<u8> {
-        let mut states = self
-            .stability
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| anyhow::anyhow!("text detector stability lock is poisoned"))?;
-        states.retain(|existing, _| {
-            existing.run_id == key.run_id && existing.generation == key.generation
-        });
-        if !text_match.matched {
-            states.remove(key);
+        if state.watermark_by_run.get(&key.run_id).copied()
+            != Some(StabilityWatermark {
+                generation: key.generation,
+                side_effect_epoch: key.side_effect_epoch,
+            })
+        {
             return Ok(0);
         }
-        let state = states.entry(key.clone()).or_insert_with(|| StabilityState {
-            rect: text_match.rect,
-            source_word_indices: text_match.source_word_indices.clone(),
-            count: 0,
-        });
-        if state.rect == text_match.rect
-            && state.source_word_indices == text_match.source_word_indices
-        {
-            state.count = state.count.saturating_add(1);
-        } else {
-            state.rect = text_match.rect;
-            state.source_word_indices = text_match.source_word_indices.clone();
-            state.count = 1;
+        if !text_match.matched {
+            state.stability.remove(key);
+            return Ok(0);
         }
-        Ok(state.count)
+        if !state.stability.contains_key(key)
+            && state.stability.len() >= self.maximum_stability_states
+        {
+            bail!(
+                "text stability state capacity {} is exhausted; clear completed runs",
+                self.maximum_stability_states
+            );
+        }
+        let stability = state
+            .stability
+            .entry(key.clone())
+            .or_insert_with(|| StabilityState {
+                rect: text_match.rect,
+                source_word_indices: text_match.source_word_indices.clone(),
+                count: 0,
+            });
+        if stability.rect == text_match.rect
+            && stability.source_word_indices == text_match.source_word_indices
+        {
+            stability.count = stability.count.saturating_add(1);
+        } else {
+            stability.rect = text_match.rect;
+            stability.source_word_indices = text_match.source_word_indices.clone();
+            stability.count = 1;
+        }
+        Ok(stability.count)
     }
 }
 
@@ -872,11 +949,36 @@ impl ConditionDetector for TextDetector {
     }
 
     fn run_finished(&self, run_id: &str, generations: &[u64]) {
-        if let Ok(mut stability) = self.stability.lock() {
-            stability
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .stability
                 .retain(|key, _| key.run_id != run_id || !generations.contains(&key.generation));
+            if state
+                .watermark_by_run
+                .get(run_id)
+                .is_some_and(|watermark| generations.contains(&watermark.generation))
+            {
+                state.watermark_by_run.remove(run_id);
+            }
         }
     }
+
+    fn side_effect_boundary(&self, run_id: &str, generation: u64, next_epoch: u64) {
+        let _ = self.begin_observation(run_id, generation, next_epoch);
+    }
+}
+
+fn watermark_is_newer(candidate: StabilityWatermark, current: StabilityWatermark) -> bool {
+    if candidate.generation != current.generation {
+        serial_is_newer(candidate.generation, current.generation)
+    } else {
+        serial_is_newer(candidate.side_effect_epoch, current.side_effect_epoch)
+    }
+}
+
+fn serial_is_newer(candidate: u64, current: u64) -> bool {
+    let distance = candidate.wrapping_sub(current);
+    distance != 0 && distance < (1_u64 << 63)
 }
 
 #[derive(Debug, Clone)]
@@ -1049,7 +1151,10 @@ fn evaluate_profile_sample(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Condvar, Mutex, mpsc},
+        thread,
+    };
 
     use anyhow::Result;
     use image::{Rgba, RgbaImage};
@@ -1472,6 +1577,23 @@ mod tests {
                 .unwrap()
                 .push((frame.pixel_format, frame.width, frame.height));
             Ok(self.words.clone())
+        }
+    }
+
+    struct GatedRecognizer {
+        started: mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl PositionedTextRecognizer for GatedRecognizer {
+        fn recognize_words(&self, _frame: &OcrFrame, _language_tag: &str) -> Result<Vec<OcrWord>> {
+            let _ = self.started.send(());
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Ok(vec![OcrWord::new("ready", Rect::new(2, 3, 20, 5), 0, 0)])
         }
     }
 
@@ -1913,11 +2035,134 @@ mod tests {
             match_count: 1,
             source_word_indices: vec![0],
         };
+        detector.begin_observation("run", 2, 0).unwrap();
         assert_eq!(detector.update_stability(&key, &text_match).unwrap(), 1);
         assert_eq!(detector.update_stability(&key, &text_match).unwrap(), 2);
 
         key.side_effect_epoch = 1;
+        detector.side_effect_boundary("run", 2, 1);
 
         assert_eq!(detector.update_stability(&key, &text_match).unwrap(), 1);
+    }
+
+    #[test]
+    fn interleaved_text_runs_preserve_each_others_stability() {
+        let detector = TextDetector::with_recognizer(Arc::new(FakeRecognizer {
+            calls: Mutex::default(),
+            words: vec![],
+        }));
+        let key = |run_id: &str| StabilityKey {
+            run_id: run_id.to_string(),
+            generation: 1,
+            side_effect_epoch: 0,
+            source_block_id: "observe".to_string(),
+            rule_id: "rule".to_string(),
+            rule_revision: 1,
+            region_id: "region".to_string(),
+            region_revision: 1,
+        };
+        let text_match = TextMatch {
+            matched: true,
+            rect: Some(Rect::new(1, 2, 3, 4)),
+            score: Some(1.0),
+            match_count: 1,
+            source_word_indices: vec![0],
+        };
+        detector.begin_observation("run-a", 1, 0).unwrap();
+        assert_eq!(
+            detector
+                .update_stability(&key("run-a"), &text_match)
+                .unwrap(),
+            1
+        );
+        detector.begin_observation("run-b", 1, 0).unwrap();
+        assert_eq!(
+            detector
+                .update_stability(&key("run-b"), &text_match)
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            detector
+                .update_stability(&key("run-a"), &text_match)
+                .unwrap(),
+            2
+        );
+        assert_eq!(detector.state.lock().unwrap().watermark_by_run.len(), 2);
+    }
+
+    #[test]
+    fn late_text_commit_cannot_repopulate_pre_action_epoch_and_boundaries_stay_bounded() {
+        let detector = TextDetector::with_recognizer(Arc::new(FakeRecognizer {
+            calls: Mutex::default(),
+            words: vec![],
+        }));
+        let old_key = StabilityKey {
+            run_id: "run".to_string(),
+            generation: 2,
+            side_effect_epoch: 0,
+            source_block_id: "observe".to_string(),
+            rule_id: "rule".to_string(),
+            rule_revision: 1,
+            region_id: "region".to_string(),
+            region_revision: 1,
+        };
+        let text_match = TextMatch {
+            matched: true,
+            rect: Some(Rect::new(1, 2, 3, 4)),
+            score: Some(1.0),
+            match_count: 1,
+            source_word_indices: vec![0],
+        };
+        detector.begin_observation("run", 2, 0).unwrap();
+        for epoch in 1..=1_000 {
+            detector.side_effect_boundary("run", 2, epoch);
+        }
+
+        assert_eq!(detector.update_stability(&old_key, &text_match).unwrap(), 0);
+        let state = detector.state.lock().unwrap();
+        assert!(state.stability.is_empty());
+        assert_eq!(state.watermark_by_run.len(), 1);
+        assert_eq!(state.watermark_by_run["run"].side_effect_epoch, 1_000);
+    }
+
+    #[test]
+    fn in_flight_text_observation_cannot_commit_after_side_effect_boundary() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let detector = Arc::new(TextDetector::with_recognizer(Arc::new(GatedRecognizer {
+            started: started_tx,
+            release: Arc::clone(&release),
+        })));
+        let worker_detector = Arc::clone(&detector);
+        let handle = thread::spawn(move || {
+            let compiled = compiled_text_macro(PreprocessProfile::Original, 1);
+            let condition = text_condition();
+            worker_detector.observe(
+                &ObservationRequest {
+                    run_id: "run",
+                    generation: 2,
+                    side_effect_epoch: 0,
+                    condition: &condition,
+                    compiled: &compiled,
+                    observed_at_ms: 42,
+                },
+                &FakeCapture::default(),
+            )
+        });
+        started_rx.recv().unwrap();
+
+        detector.side_effect_boundary("run", 2, 1);
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        let evidence = handle.join().unwrap().unwrap();
+
+        assert!(!evidence.matched);
+        assert_eq!(evidence.stable_frames, 0);
+        let state = detector.state.lock().unwrap();
+        assert!(state.stability.is_empty());
+        assert_eq!(state.watermark_by_run["run"].side_effect_epoch, 1);
     }
 }

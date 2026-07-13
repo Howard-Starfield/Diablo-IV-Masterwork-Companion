@@ -395,9 +395,21 @@ struct ImageStabilityKey {
     region_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StabilityWatermark {
+    generation: u64,
+    side_effect_epoch: u64,
+}
+
+#[derive(Debug, Default)]
+struct ImageDetectorState {
+    stability: HashMap<ImageStabilityKey, StabilityTracker>,
+    watermark_by_run: HashMap<String, StabilityWatermark>,
+}
+
 pub struct ImageDetector {
     matcher: ImageMatcher,
-    stability: Mutex<HashMap<ImageStabilityKey, StabilityTracker>>,
+    state: Mutex<ImageDetectorState>,
     maximum_stability_states: usize,
 }
 
@@ -410,19 +422,63 @@ impl ImageDetector {
         assert!(maximum_stability_states > 0);
         Self {
             matcher: ImageMatcher,
-            stability: Mutex::new(HashMap::new()),
+            state: Mutex::new(ImageDetectorState::default()),
             maximum_stability_states,
         }
     }
 
     fn clear_run_generations(&self, run_id: &str, generations: &[u64]) -> Result<usize> {
-        let mut stability = self
-            .stability
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| anyhow::anyhow!("image detector stability lock is poisoned"))?;
-        let before = stability.len();
-        stability.retain(|key, _| key.run_id != run_id || !generations.contains(&key.generation));
-        Ok(before - stability.len())
+        let before = state.stability.len();
+        state
+            .stability
+            .retain(|key, _| key.run_id != run_id || !generations.contains(&key.generation));
+        if state
+            .watermark_by_run
+            .get(run_id)
+            .is_some_and(|watermark| generations.contains(&watermark.generation))
+        {
+            state.watermark_by_run.remove(run_id);
+        }
+        Ok(before - state.stability.len())
+    }
+
+    fn begin_observation(
+        &self,
+        run_id: &str,
+        generation: u64,
+        side_effect_epoch: u64,
+    ) -> Result<bool> {
+        let requested = StabilityWatermark {
+            generation,
+            side_effect_epoch,
+        };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image detector stability lock is poisoned"))?;
+        match state.watermark_by_run.get(run_id).copied() {
+            Some(current) if current == requested => Ok(true),
+            Some(current) if watermark_is_newer(requested, current) => {
+                state.stability.retain(|key, _| key.run_id != run_id);
+                state.watermark_by_run.insert(run_id.to_string(), requested);
+                Ok(true)
+            }
+            Some(_) => Ok(false),
+            None => {
+                if state.watermark_by_run.len() >= self.maximum_stability_states {
+                    bail!(
+                        "image detector run watermark capacity {} is exhausted",
+                        self.maximum_stability_states
+                    );
+                }
+                state.watermark_by_run.insert(run_id.to_string(), requested);
+                Ok(true)
+            }
+        }
     }
 
     fn observe_image(
@@ -432,6 +488,16 @@ impl ImageDetector {
         source_block_id: &str,
         rule_id: &str,
     ) -> Result<DetectorEvidence> {
+        if !self.begin_observation(
+            request.run_id,
+            request.generation,
+            request.side_effect_epoch,
+        )? {
+            return Ok(DetectorEvidence::unmatched(
+                request.observed_at_ms,
+                request.observed_at_ms,
+            ));
+        }
         let definition = request.compiled.definition();
         let rule = definition
             .image_rules
@@ -530,17 +596,33 @@ impl ImageDetector {
             rule_id: rule.id.clone(),
             region_id: region.id.clone(),
         };
-        let mut stability = self
-            .stability
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| anyhow::anyhow!("image detector stability lock is poisoned"))?;
-        if !stability.contains_key(&key) && stability.len() >= self.maximum_stability_states {
+        if !watermark_matches_image_key(&state, &key) {
+            return Ok(DetectorEvidence::image_match(
+                false,
+                frame,
+                None,
+                result
+                    .best
+                    .as_ref()
+                    .map(|cluster| f64::from(cluster.best.score)),
+                u32::try_from(result.clusters.len()).unwrap_or(u32::MAX),
+                0,
+                serde_json::json!({"stale_watermark": true}),
+            ));
+        }
+        if !state.stability.contains_key(&key)
+            && state.stability.len() >= self.maximum_stability_states
+        {
             bail!(
                 "image stability state capacity {} is exhausted; clear completed runs",
                 self.maximum_stability_states
             );
         }
-        let tracker = stability.entry(key).or_insert_with(|| {
+        let tracker = state.stability.entry(key).or_insert_with(|| {
             StabilityTracker::new(
                 rule.stable_frames,
                 rule.poll_interval_ms,
@@ -609,9 +691,30 @@ impl ConditionDetector for ImageDetector {
         let _ = self.clear_run_generations(run_id, generations);
     }
 
-    fn side_effect_boundary(&self, run_id: &str, generation: u64, _next_epoch: u64) {
-        let _ = self.clear_run_generations(run_id, &[generation]);
+    fn side_effect_boundary(&self, run_id: &str, generation: u64, next_epoch: u64) {
+        let _ = self.begin_observation(run_id, generation, next_epoch);
     }
+}
+
+fn watermark_is_newer(candidate: StabilityWatermark, current: StabilityWatermark) -> bool {
+    if candidate.generation != current.generation {
+        serial_is_newer(candidate.generation, current.generation)
+    } else {
+        serial_is_newer(candidate.side_effect_epoch, current.side_effect_epoch)
+    }
+}
+
+fn watermark_matches_image_key(state: &ImageDetectorState, key: &ImageStabilityKey) -> bool {
+    state.watermark_by_run.get(&key.run_id).copied()
+        == Some(StabilityWatermark {
+            generation: key.generation,
+            side_effect_epoch: key.side_effect_epoch,
+        })
+}
+
+fn serial_is_newer(candidate: u64, current: u64) -> bool {
+    let distance = candidate.wrapping_sub(current);
+    distance != 0 && distance < (1_u64 << 63)
 }
 
 fn decode_gray_asset(
@@ -3340,7 +3443,8 @@ mod tests {
     #[test]
     fn side_effect_boundary_clears_image_stability_for_current_generation() {
         let detector = ImageDetector::new();
-        detector.stability.lock().unwrap().insert(
+        detector.begin_observation("run", 3, 0).unwrap();
+        detector.state.lock().unwrap().stability.insert(
             ImageStabilityKey {
                 run_id: "run".to_string(),
                 generation: 3,
@@ -3354,6 +3458,65 @@ mod tests {
 
         detector.side_effect_boundary("run", 3, 1);
 
-        assert!(detector.stability.lock().unwrap().is_empty());
+        let state = detector.state.lock().unwrap();
+        assert!(state.stability.is_empty());
+        assert_eq!(
+            state.watermark_by_run.get("run"),
+            Some(&StabilityWatermark {
+                generation: 3,
+                side_effect_epoch: 1
+            })
+        );
+    }
+
+    #[test]
+    fn late_image_commit_is_rejected_after_boundary_and_other_run_is_preserved() {
+        let detector = ImageDetector::new();
+        detector.begin_observation("run-a", 3, 0).unwrap();
+        detector.begin_observation("run-b", 7, 0).unwrap();
+        let old_a = ImageStabilityKey {
+            run_id: "run-a".to_string(),
+            generation: 3,
+            side_effect_epoch: 0,
+            source_block_id: "observe-a".to_string(),
+            rule_id: "rule".to_string(),
+            region_id: "region".to_string(),
+        };
+        let key_b = ImageStabilityKey {
+            run_id: "run-b".to_string(),
+            generation: 7,
+            side_effect_epoch: 0,
+            source_block_id: "observe-b".to_string(),
+            rule_id: "rule".to_string(),
+            region_id: "region".to_string(),
+        };
+        detector
+            .state
+            .lock()
+            .unwrap()
+            .stability
+            .insert(key_b.clone(), StabilityTracker::new(2, 10, 2));
+
+        detector.side_effect_boundary("run-a", 3, 1);
+
+        let state = detector.state.lock().unwrap();
+        assert!(!watermark_matches_image_key(&state, &old_a));
+        assert!(state.stability.contains_key(&key_b));
+        assert_eq!(state.watermark_by_run.len(), 2);
+    }
+
+    #[test]
+    fn repeated_image_boundaries_keep_one_watermark_per_run() {
+        let detector = ImageDetector::new();
+        detector.begin_observation("run", 3, 0).unwrap();
+
+        for epoch in 1..=1_000 {
+            detector.side_effect_boundary("run", 3, epoch);
+        }
+
+        let state = detector.state.lock().unwrap();
+        assert!(state.stability.is_empty());
+        assert_eq!(state.watermark_by_run.len(), 1);
+        assert_eq!(state.watermark_by_run["run"].side_effect_epoch, 1_000);
     }
 }

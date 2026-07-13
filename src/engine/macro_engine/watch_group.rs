@@ -311,6 +311,17 @@ impl WatchGroupRunner {
             .observe(matched, frame_id)
     }
 
+    pub fn revoke_candidate(&mut self, lane_id: &str) -> bool {
+        let before = self.candidates.len();
+        self.candidates
+            .retain(|candidate| candidate.lane_id != lane_id);
+        before != self.candidates.len()
+    }
+
+    pub fn has_candidates(&self) -> bool {
+        !self.candidates.is_empty()
+    }
+
     pub fn arbitrate(&mut self, safety: Option<SafetyBypass>) -> ArbitrationResult {
         self.transition(LaneState::Arbitrate);
         let result = arbitrate_candidates(std::mem::take(&mut self.candidates), safety);
@@ -756,6 +767,26 @@ mod tests {
         );
         assert_eq!(result.discarded_lane_ids, vec!["lane-2"]);
         assert!(!result.safety_bypassed);
+    }
+
+    #[test]
+    fn newer_false_can_revoke_qualified_candidate_before_arbitration() {
+        let mut runner = WatchGroupRunner::new("run-1", 4, 1);
+        assert_eq!(
+            runner.observe_latch("lane", true, 1),
+            LatchDecision::Qualified
+        );
+        runner
+            .qualify_preobserved(candidate("lane", 0, 100, 1))
+            .unwrap();
+        assert!(runner.has_candidates());
+        assert_eq!(
+            runner.observe_latch("lane", false, 2),
+            LatchDecision::Rearmed
+        );
+
+        assert!(runner.revoke_candidate("lane"));
+        assert!(!runner.has_candidates());
     }
 
     #[test]

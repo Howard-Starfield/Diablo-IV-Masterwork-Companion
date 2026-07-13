@@ -54,7 +54,6 @@ struct WatchDetectorJob {
     condition: Condition,
     compiled: CompiledMacro,
     observed_at_ms: u64,
-    first_waiting_at_ms: u64,
     capture: Arc<super::CapturedCycle>,
     detector: Arc<dyn ConditionDetector>,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -69,12 +68,30 @@ struct WatchDetectorCompletion {
     side_effect_epoch: u64,
     completed_at_ms: u64,
     capture: Arc<super::CapturedCycle>,
-    result: Result<DetectorEvidence>,
+    result: std::result::Result<DetectorEvidence, WatchJobFailure>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum WatchJobFailure {
+    #[error("detector returned an error: {0}")]
+    Detector(#[source] anyhow::Error),
+    #[error("Watch detector panicked")]
+    DetectorPanicked,
+    #[error("Watch completion clock panicked")]
+    CompletionClockPanicked,
+    #[error("Watch worker iteration panicked")]
+    WorkerIterationPanicked,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Watch detector pool is unavailable: {message}")]
+struct WatchPoolUnavailable {
+    message: String,
 }
 
 struct PendingWatchJob {
     newest: WatchDetectorJob,
-    first_waiting_at_ms: u64,
+    enqueue_sequence: u64,
 }
 
 #[derive(Default)]
@@ -82,6 +99,9 @@ struct WatchPoolState {
     active: HashMap<WatchJobKey, (u64, super::DetectorFamily)>,
     pending: HashMap<WatchJobKey, PendingWatchJob>,
     cleanups: HashMap<String, WatchRunCleanup>,
+    run_failures: HashMap<String, String>,
+    global_failure: Option<String>,
+    cleanup_failures: VecDeque<String>,
 }
 
 struct WatchRunCleanup {
@@ -93,6 +113,10 @@ struct WatchPoolInner {
     state: Mutex<WatchPoolState>,
     ready: Condvar,
     started_workers: AtomicU64,
+    next_enqueue_sequence: AtomicU64,
+    live_text_workers: AtomicU64,
+    live_image_workers: AtomicU64,
+    enforce_health: bool,
 }
 
 struct WatchDetectorPool {
@@ -119,6 +143,10 @@ impl WatchDetectorPool {
                 state: Mutex::new(WatchPoolState::default()),
                 ready: Condvar::new(),
                 started_workers: AtomicU64::new(0),
+                next_enqueue_sequence: AtomicU64::new(1),
+                live_text_workers: AtomicU64::new(0),
+                live_image_workers: AtomicU64::new(0),
+                enforce_health: true,
             });
             spawn_watch_worker(Arc::clone(&inner), super::DetectorFamily::Text);
             spawn_watch_worker(Arc::clone(&inner), super::DetectorFamily::Image);
@@ -127,18 +155,23 @@ impl WatchDetectorPool {
         })
     }
 
-    fn submit(&self, mut job: WatchDetectorJob) -> super::SubmitOutcome {
-        let mut state = self.inner.state.lock().expect("watch pool state poisoned");
+    fn submit(
+        &self,
+        job: WatchDetectorJob,
+    ) -> std::result::Result<super::SubmitOutcome, WatchPoolUnavailable> {
+        let mut state = lock_watch_pool_state(&self.inner);
+        if let Some(message) = self.health_failure_locked(&state, job.family, &job.key.run_id) {
+            return Err(WatchPoolUnavailable { message });
+        }
         if let Some(pending) = state.pending.get_mut(&job.key) {
             let dropped_frame_id = pending.newest.capture.frame_id();
-            job.first_waiting_at_ms = pending.first_waiting_at_ms;
             pending.newest = job;
-            return super::SubmitOutcome::ReplacedPending { dropped_frame_id };
+            return Ok(super::SubmitOutcome::ReplacedPending { dropped_frame_id });
         }
         let active_same_lane = state.active.contains_key(&job.key);
         let known_lanes = state.active.len().saturating_add(state.pending.len());
         if !active_same_lane && known_lanes >= MAX_GLOBAL_WATCH_LANES {
-            return super::SubmitOutcome::PollingDelayed;
+            return Ok(super::SubmitOutcome::PollingDelayed);
         }
         let active_family = state
             .active
@@ -160,33 +193,72 @@ impl WatchDetectorPool {
         } else {
             super::SubmitOutcome::Started
         };
-        let first_waiting_at_ms = job.first_waiting_at_ms;
+        let enqueue_sequence = self
+            .inner
+            .next_enqueue_sequence
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
+                sequence.checked_add(1)
+            })
+            .map_err(|_| {
+                let message = "global enqueue sequence exhausted".to_string();
+                state.global_failure = Some(message.clone());
+                WatchPoolUnavailable { message }
+            })?;
         state.pending.insert(
             job.key.clone(),
             PendingWatchJob {
                 newest: job,
-                first_waiting_at_ms,
+                enqueue_sequence,
             },
         );
         drop(state);
         self.inner.ready.notify_all();
-        outcome
+        Ok(outcome)
+    }
+
+    fn health_failure_locked(
+        &self,
+        state: &WatchPoolState,
+        family: super::DetectorFamily,
+        run_id: &str,
+    ) -> Option<String> {
+        state
+            .global_failure
+            .clone()
+            .or_else(|| state.run_failures.get(run_id).cloned())
+            .or_else(|| {
+                if !self.inner.enforce_health {
+                    return None;
+                }
+                let (live, expected) = match family {
+                    super::DetectorFamily::Text => {
+                        (self.inner.live_text_workers.load(Ordering::Acquire), 1)
+                    }
+                    super::DetectorFamily::Image => {
+                        (self.inner.live_image_workers.load(Ordering::Acquire), 2)
+                    }
+                };
+                (live < expected)
+                    .then(|| format!("{family:?} worker topology degraded: {live}/{expected} live"))
+            })
+    }
+
+    fn failure_for_run(&self, run_id: &str) -> Option<String> {
+        let state = lock_watch_pool_state(&self.inner);
+        state
+            .global_failure
+            .clone()
+            .or_else(|| state.run_failures.get(run_id).cloned())
     }
 
     fn cancel_scope(&self, run_id: &str, entry_id: u64) {
-        self.inner
-            .state
-            .lock()
-            .expect("watch pool state poisoned")
+        lock_watch_pool_state(&self.inner)
             .pending
             .retain(|key, _| key.run_id != run_id || key.entry_id != entry_id);
     }
 
     fn cancel_old_epoch(&self, run_id: &str, current_epoch: u64) {
-        self.inner
-            .state
-            .lock()
-            .expect("watch pool state poisoned")
+        lock_watch_pool_state(&self.inner)
             .pending
             .retain(|key, pending| {
                 key.run_id != run_id || pending.newest.side_effect_epoch == current_epoch
@@ -194,12 +266,9 @@ impl WatchDetectorPool {
     }
 
     fn cancel_run(&self, run_id: &str) {
-        self.inner
-            .state
-            .lock()
-            .expect("watch pool state poisoned")
-            .pending
-            .retain(|key, _| key.run_id != run_id);
+        let mut state = lock_watch_pool_state(&self.inner);
+        state.pending.retain(|key, _| key.run_id != run_id);
+        state.run_failures.remove(run_id);
     }
 
     fn finish_run(
@@ -209,7 +278,7 @@ impl WatchDetectorPool {
         generations: Vec<u64>,
     ) {
         let cleanup = {
-            let mut state = self.inner.state.lock().expect("watch pool state poisoned");
+            let mut state = lock_watch_pool_state(&self.inner);
             let still_active = state.active.keys().any(|key| key.run_id == run_id)
                 || state.pending.keys().any(|key| key.run_id == run_id);
             if still_active {
@@ -229,7 +298,7 @@ impl WatchDetectorPool {
             }
         };
         if let Some(cleanup) = cleanup {
-            cleanup.detector.run_finished(run_id, &cleanup.generations);
+            run_cleanup_contained(&self.inner, run_id, cleanup);
         }
     }
 
@@ -241,35 +310,164 @@ impl WatchDetectorPool {
 
 fn spawn_watch_worker(inner: Arc<WatchPoolInner>, family: super::DetectorFamily) {
     let worker_inner = Arc::clone(&inner);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name(match family {
             super::DetectorFamily::Text => "macro-watch-ocr".to_string(),
             super::DetectorFamily::Image => "macro-watch-image".to_string(),
         })
-        .spawn(move || watch_worker_loop(worker_inner, family))
+        .spawn(move || {
+            worker_live_counter(&worker_inner, family).fetch_add(1, Ordering::Release);
+            let _liveness = WorkerLivenessGuard {
+                inner: Arc::clone(&worker_inner),
+                family,
+            };
+            let _ = ready_tx.send(());
+            let escaped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                watch_worker_loop(worker_inner, family)
+            }));
+            if escaped.is_err() {
+                record_global_pool_failure(
+                    &_liveness.inner,
+                    format!("{family:?} Watch worker exited after an unexpected panic"),
+                );
+            }
+        })
         .expect("failed to start fixed macro Watch worker");
+    ready_rx
+        .recv()
+        .expect("fixed macro Watch worker exited before readiness");
     inner.started_workers.fetch_add(1, Ordering::Release);
+}
+
+fn worker_live_counter(inner: &WatchPoolInner, family: super::DetectorFamily) -> &AtomicU64 {
+    match family {
+        super::DetectorFamily::Text => &inner.live_text_workers,
+        super::DetectorFamily::Image => &inner.live_image_workers,
+    }
+}
+
+struct WorkerLivenessGuard {
+    inner: Arc<WatchPoolInner>,
+    family: super::DetectorFamily,
+}
+
+impl Drop for WorkerLivenessGuard {
+    fn drop(&mut self) {
+        worker_live_counter(&self.inner, self.family).fetch_sub(1, Ordering::AcqRel);
+        self.inner.ready.notify_all();
+    }
+}
+
+struct ActiveWatchJobLease {
+    inner: Arc<WatchPoolInner>,
+    key: WatchJobKey,
+    job_id: u64,
+}
+
+impl Drop for ActiveWatchJobLease {
+    fn drop(&mut self) {
+        let cleanup = {
+            let mut state = lock_watch_pool_state(&self.inner);
+            if state.active.get(&self.key).map(|(job_id, _)| *job_id) == Some(self.job_id) {
+                state.active.remove(&self.key);
+            }
+            let run_still_active = state.active.keys().any(|key| key.run_id == self.key.run_id)
+                || state
+                    .pending
+                    .keys()
+                    .any(|key| key.run_id == self.key.run_id);
+            if run_still_active {
+                None
+            } else {
+                state.cleanups.remove(&self.key.run_id)
+            }
+        };
+        self.inner.ready.notify_all();
+        if let Some(cleanup) = cleanup {
+            run_cleanup_contained(&self.inner, &self.key.run_id, cleanup);
+        }
+    }
+}
+
+fn lock_watch_pool_state(inner: &WatchPoolInner) -> std::sync::MutexGuard<'_, WatchPoolState> {
+    inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn record_global_pool_failure(inner: &WatchPoolInner, message: String) {
+    let mut state = lock_watch_pool_state(inner);
+    state.global_failure.get_or_insert(message);
+    drop(state);
+    inner.ready.notify_all();
+}
+
+fn record_run_pool_failure(inner: &WatchPoolInner, run_id: &str, message: String) {
+    let mut state = lock_watch_pool_state(inner);
+    if state.run_failures.len() < MAX_GLOBAL_WATCH_LANES || state.run_failures.contains_key(run_id)
+    {
+        state
+            .run_failures
+            .entry(run_id.to_string())
+            .or_insert(message);
+    } else {
+        state.global_failure = Some("Watch run failure capacity exhausted".to_string());
+    }
+    drop(state);
+    inner.ready.notify_all();
+}
+
+fn run_cleanup_contained(inner: &WatchPoolInner, run_id: &str, cleanup: WatchRunCleanup) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cleanup.detector.run_finished(run_id, &cleanup.generations)
+    }))
+    .is_err()
+    {
+        let mut state = lock_watch_pool_state(inner);
+        if state.cleanup_failures.len() == 64 {
+            state.cleanup_failures.pop_front();
+        }
+        state
+            .cleanup_failures
+            .push_back(format!("detector cleanup panicked for run {run_id}"));
+    }
+}
+
+fn oldest_pending_key(
+    state: &WatchPoolState,
+    family: super::DetectorFamily,
+) -> Option<WatchJobKey> {
+    state
+        .pending
+        .iter()
+        .filter(|(key, pending)| {
+            pending.newest.family == family && !state.active.contains_key(*key)
+        })
+        .min_by(|(left_key, left), (right_key, right)| {
+            left.enqueue_sequence
+                .cmp(&right.enqueue_sequence)
+                .then_with(|| left_key.run_id.cmp(&right_key.run_id))
+                .then_with(|| left_key.entry_id.cmp(&right_key.entry_id))
+                .then_with(|| left_key.lane_id.cmp(&right_key.lane_id))
+        })
+        .map(|(key, _)| key.clone())
 }
 
 fn watch_worker_loop(inner: Arc<WatchPoolInner>, family: super::DetectorFamily) {
     loop {
         let job = {
-            let mut state = inner.state.lock().expect("watch pool state poisoned");
+            let mut state = lock_watch_pool_state(&inner);
             loop {
-                let next_key = state
-                    .pending
-                    .iter()
-                    .filter(|(key, pending)| {
-                        pending.newest.family == family && !state.active.contains_key(*key)
-                    })
-                    .min_by(|(left_key, left), (right_key, right)| {
-                        left.first_waiting_at_ms
-                            .cmp(&right.first_waiting_at_ms)
-                            .then_with(|| left_key.run_id.cmp(&right_key.run_id))
-                            .then_with(|| left_key.entry_id.cmp(&right_key.entry_id))
-                            .then_with(|| left_key.lane_id.cmp(&right_key.lane_id))
-                    })
-                    .map(|(key, _)| key.clone());
+                if state.global_failure.is_some() {
+                    state = inner
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    continue;
+                }
+                let next_key = oldest_pending_key(&state, family);
                 if let Some(key) = next_key {
                     let pending = state
                         .pending
@@ -280,53 +478,100 @@ fn watch_worker_loop(inner: Arc<WatchPoolInner>, family: super::DetectorFamily) 
                         .insert(key, (pending.newest.job_id, pending.newest.family));
                     break pending.newest;
                 }
-                state = inner.ready.wait(state).expect("watch pool state poisoned");
+                state = inner
+                    .ready
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         };
 
-        let request = ObservationRequest {
-            run_id: &job.key.run_id,
-            generation: job.generation,
-            side_effect_epoch: job.side_effect_epoch,
-            condition: &job.condition,
-            compiled: &job.compiled,
-            observed_at_ms: job.observed_at_ms,
-        };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            job.detector.observe(&request, job.capture.as_ref())
-        }))
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("Watch detector worker panicked")));
-        let completed_at_ms = job.clock.now_ms();
-        let cleanup = {
-            let mut state = inner.state.lock().expect("watch pool state poisoned");
-            if state.active.get(&job.key).map(|(job_id, _)| *job_id) == Some(job.job_id) {
-                state.active.remove(&job.key);
-            }
-            let run_still_active = state.active.keys().any(|key| key.run_id == job.key.run_id)
-                || state.pending.keys().any(|key| key.run_id == job.key.run_id);
-            if run_still_active {
-                None
-            } else {
-                state.cleanups.remove(&job.key.run_id)
-            }
-        };
-        inner.ready.notify_all();
-        let completed_run_id = job.key.run_id.clone();
-        let _ = job.completion.send(WatchDetectorCompletion {
+        let _lease = ActiveWatchJobLease {
+            inner: Arc::clone(&inner),
+            key: job.key.clone(),
             job_id: job.job_id,
-            key: job.key,
-            lane_order: job.lane_order,
-            generation: job.generation,
-            side_effect_epoch: job.side_effect_epoch,
-            completed_at_ms,
-            capture: job.capture,
-            result,
+        };
+
+        let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_watch_completion(&job)
+        }))
+        .unwrap_or_else(|_| {
+            failed_watch_completion(&job, WatchJobFailure::WorkerIterationPanicked)
         });
-        if let Some(cleanup) = cleanup {
-            cleanup
-                .detector
-                .run_finished(&completed_run_id, &cleanup.generations);
+        let run_id = job.key.run_id.clone();
+        let send = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match job.completion.try_send(completion) {
+                Ok(()) => 0_u8,
+                Err(TrySendError::Full(_)) => 1,
+                Err(TrySendError::Disconnected(_)) => 2,
+            }
+        }));
+        match send {
+            Ok(1) => record_run_pool_failure(
+                &inner,
+                &run_id,
+                "Watch completion channel remained full".to_string(),
+            ),
+            Err(_) => record_run_pool_failure(
+                &inner,
+                &run_id,
+                "Watch completion dispatch panicked".to_string(),
+            ),
+            Ok(0 | 2) => {}
+            Ok(_) => unreachable!("unknown Watch completion send status"),
         }
+    }
+}
+
+fn build_watch_completion(job: &WatchDetectorJob) -> WatchDetectorCompletion {
+    let request = ObservationRequest {
+        run_id: &job.key.run_id,
+        generation: job.generation,
+        side_effect_epoch: job.side_effect_epoch,
+        condition: &job.condition,
+        compiled: &job.compiled,
+        observed_at_ms: job.observed_at_ms,
+    };
+    let observation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        job.detector.observe(&request, job.capture.as_ref())
+    }));
+    let (result, completed_at_ms) = match observation {
+        Ok(Ok(evidence)) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.clock.now_ms())) {
+                Ok(completed_at_ms) => (Ok(evidence), completed_at_ms),
+                Err(_) => (
+                    Err(WatchJobFailure::CompletionClockPanicked),
+                    job.observed_at_ms,
+                ),
+            }
+        }
+        Ok(Err(error)) => (Err(WatchJobFailure::Detector(error)), job.observed_at_ms),
+        Err(_) => (Err(WatchJobFailure::DetectorPanicked), job.observed_at_ms),
+    };
+    WatchDetectorCompletion {
+        job_id: job.job_id,
+        key: job.key.clone(),
+        lane_order: job.lane_order,
+        generation: job.generation,
+        side_effect_epoch: job.side_effect_epoch,
+        completed_at_ms,
+        capture: Arc::clone(&job.capture),
+        result,
+    }
+}
+
+fn failed_watch_completion(
+    job: &WatchDetectorJob,
+    failure: WatchJobFailure,
+) -> WatchDetectorCompletion {
+    WatchDetectorCompletion {
+        job_id: job.job_id,
+        key: job.key.clone(),
+        lane_order: job.lane_order,
+        generation: job.generation,
+        side_effect_epoch: job.side_effect_epoch,
+        completed_at_ms: job.observed_at_ms,
+        capture: Arc::clone(&job.capture),
+        result: Err(failure),
     }
 }
 
@@ -2571,7 +2816,7 @@ impl RunExecution<'_, '_> {
         };
         let (completion_tx, completion_rx) = mpsc::sync_channel::<WatchDetectorCompletion>(3);
         let mut candidate_cycles: HashMap<String, Arc<super::CapturedCycle>> = HashMap::new();
-        let mut latest_job_ids: HashMap<String, u64> = HashMap::new();
+        let mut completed_job_ids: HashMap<String, u64> = HashMap::new();
         let mut arbitration_deadline = None;
         let mut next_poll_at = started_at;
         let mut runner_generation = initial_generation;
@@ -2582,6 +2827,14 @@ impl RunExecution<'_, '_> {
         let mut attempts = 0_u64;
 
         loop {
+            if let Some(message) = self
+                .runtime
+                .watch_pool
+                .failure_for_run(self.emitter.run_id())
+            {
+                self.watch_groups.insert(block_id.to_string(), runner);
+                return Some(StopReason::TechnicalFailure { message });
+            }
             if let Some(reason) = self.check_control() {
                 self.runtime
                     .watch_pool
@@ -2611,7 +2864,7 @@ impl RunExecution<'_, '_> {
                 runner_generation = generation;
                 arbitration_deadline = None;
                 candidate_cycles.clear();
-                latest_job_ids.clear();
+                completed_job_ids.clear();
                 self.observations.clear();
                 self.runtime
                     .watch_pool
@@ -2628,10 +2881,11 @@ impl RunExecution<'_, '_> {
                     || completion.key.entry_id != entry_id
                     || completion.generation != generation
                     || completion.side_effect_epoch != self.side_effect_epoch
-                    || latest_job_ids.get(&completion.key.lane_id) != Some(&completion.job_id)
+                    || completed_job_ids.get(&completion.key.lane_id) == Some(&completion.job_id)
                 {
                     continue;
                 }
+                completed_job_ids.insert(completion.key.lane_id.clone(), completion.job_id);
                 if deadline.is_some_and(|deadline| completion.completed_at_ms >= deadline) {
                     continue;
                 }
@@ -2646,10 +2900,11 @@ impl RunExecution<'_, '_> {
                 let evidence = match completion.result {
                     Ok(evidence) => evidence,
                     Err(error) => {
-                        if error
-                            .downcast_ref::<crate::engine::automation::StaleCapturedFrameError>()
-                            .is_some()
-                        {
+                        if matches!(
+                            &error,
+                            WatchJobFailure::Detector(source)
+                                if source.downcast_ref::<crate::engine::automation::StaleCapturedFrameError>().is_some()
+                        ) {
                             let arbitration =
                                 runner.arbitrate(Some(SafetyBypass::TargetInvalidated));
                             self.emitter.arbitration_completed(
@@ -2754,11 +3009,18 @@ impl RunExecution<'_, '_> {
                     let candidate_deadline = completion
                         .completed_at_ms
                         .saturating_add(super::ARBITRATION_WINDOW_MS);
-                    arbitration_deadline = Some(deadline.map_or(candidate_deadline, |deadline| {
-                        candidate_deadline.min(deadline)
-                    }));
-                } else {
+                    arbitration_deadline = establish_arbitration_deadline(
+                        arbitration_deadline,
+                        candidate_deadline,
+                        deadline,
+                    );
+                } else if matches!(latch, LatchDecision::Rearmed | LatchDecision::Unmatched) {
                     self.observations.remove(&completion.key.lane_id);
+                    candidate_cycles.remove(&completion.key.lane_id);
+                    runner.revoke_candidate(&completion.key.lane_id);
+                    if !runner.has_candidates() {
+                        arbitration_deadline = None;
+                    }
                 }
             }
 
@@ -2977,7 +3239,7 @@ impl RunExecution<'_, '_> {
                     let job_id = NEXT_WATCH_JOB_ID.fetch_add(1, Ordering::Relaxed);
                     self.detector_generations.insert(generation);
                     self.last_observation_at_ms = Some(dispatch_at);
-                    let outcome = self.runtime.watch_pool.submit(WatchDetectorJob {
+                    let outcome = match self.runtime.watch_pool.submit(WatchDetectorJob {
                         job_id,
                         key: WatchJobKey {
                             run_id: self.emitter.run_id().to_string(),
@@ -2992,15 +3254,19 @@ impl RunExecution<'_, '_> {
                         condition: passive_condition(&lane.condition),
                         compiled: self.compiled.clone(),
                         observed_at_ms: dispatch_at,
-                        first_waiting_at_ms: dispatch_at,
                         capture: Arc::clone(&cycle),
                         detector: Arc::clone(&self.runtime.detector),
                         clock: Arc::clone(&self.runtime.clock),
                         completion: completion_tx.clone(),
-                    });
-                    if !matches!(outcome, super::SubmitOutcome::PollingDelayed) {
-                        latest_job_ids.insert(lane.id.clone(), job_id);
-                    }
+                    }) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            self.watch_groups.insert(block_id.to_string(), runner);
+                            return Some(StopReason::TechnicalFailure {
+                                message: error.to_string(),
+                            });
+                        }
+                    };
                     if !matches!(outcome, super::SubmitOutcome::Started) {
                         self.emitter.polling_delayed(block_id, &lane.id, attempts);
                     }
@@ -3407,6 +3673,7 @@ impl RunExecution<'_, '_> {
 
     fn invalidate_after_side_effect(&mut self) {
         let generation = self.runtime.control_handle().generation();
+        self.detector_generations.insert(generation);
         self.side_effect_epoch = self.side_effect_epoch.wrapping_add(1);
         self.observations.clear();
         for runner in self.watch_groups.values_mut() {
@@ -3537,6 +3804,18 @@ fn frame_matches_capture(
         && frame.is_visible == capture.is_visible
         && frame.is_minimized == capture.is_minimized
         && frame.is_foreground == capture.is_foreground
+}
+
+fn establish_arbitration_deadline(
+    current: Option<u64>,
+    candidate_deadline: u64,
+    absolute_deadline: Option<u64>,
+) -> Option<u64> {
+    current.or_else(|| {
+        Some(absolute_deadline.map_or(candidate_deadline, |deadline| {
+            candidate_deadline.min(deadline)
+        }))
+    })
 }
 
 fn watch_timeout_reached(group: &WatchGroup, started_at: u64, now: u64) -> bool {
@@ -7231,6 +7510,115 @@ mod tests {
         release: Arc<(Mutex<bool>, Condvar)>,
     }
 
+    struct FirstGatedSequenceDetector {
+        started: mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        calls: AtomicU64,
+        first_matched: bool,
+    }
+
+    impl ConditionDetector for FirstGatedSequenceDetector {
+        fn observe(
+            &self,
+            _request: &super::super::ObservationRequest<'_>,
+            capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if call == 1 {
+                let _ = self.started.send(());
+                let (lock, wake) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+            let frame = capture.capture_frame(Rect::new(192, 108, 384, 216))?;
+            let metadata = watch_frame_metadata(frame.metadata);
+            let matched = self.first_matched || call > 1;
+            Ok(super::super::DetectorEvidence {
+                matched,
+                frame_id: metadata.frame_id,
+                captured_at_ms: metadata.captured_at_ms,
+                match_rect: matched.then(|| Rect::new(1, 2, 3, 4)),
+                score: matched.then_some(0.99),
+                match_count: u32::from(matched),
+                stable_frames: u8::from(matched),
+                frame_metadata: Some(metadata),
+                details: serde_json::Value::Null,
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PanickingWatchDetector;
+
+    impl ConditionDetector for PanickingWatchDetector {
+        fn observe(
+            &self,
+            _request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            panic!("injected detector panic")
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PanickingCompletionClock;
+
+    impl Clock for PanickingCompletionClock {
+        fn now_ms(&self) -> u64 {
+            panic!("injected completion clock panic")
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PanickingCleanupDetector;
+
+    impl ConditionDetector for PanickingCleanupDetector {
+        fn observe(
+            &self,
+            request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            Ok(super::super::DetectorEvidence::unmatched(
+                request.observed_at_ms,
+                request.observed_at_ms,
+            ))
+        }
+
+        fn run_finished(&self, _run_id: &str, _generations: &[u64]) {
+            panic!("injected cleanup panic")
+        }
+    }
+
+    struct GatedPanickingCleanupDetector {
+        started: mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl ConditionDetector for GatedPanickingCleanupDetector {
+        fn observe(
+            &self,
+            request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            let _ = self.started.send(());
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Ok(super::super::DetectorEvidence::unmatched(
+                request.observed_at_ms,
+                request.observed_at_ms,
+            ))
+        }
+
+        fn run_finished(&self, _run_id: &str, _generations: &[u64]) {
+            panic!("injected deferred cleanup panic")
+        }
+    }
+
     impl ConditionDetector for GatedWatchDetector {
         fn observe(
             &self,
@@ -7282,11 +7670,73 @@ mod tests {
             },
             compiled: compiled.clone(),
             observed_at_ms: job_id,
-            first_waiting_at_ms: job_id,
             capture: Arc::clone(capture),
             detector,
             clock: Arc::new(FakeClock::default()),
             completion: completion.clone(),
+        }
+    }
+
+    fn isolated_text_watch_pool(enforce_health: bool) -> &'static WatchDetectorPool {
+        let pool = Box::leak(Box::new(WatchDetectorPool {
+            inner: Arc::new(WatchPoolInner {
+                state: Mutex::new(WatchPoolState::default()),
+                ready: Condvar::new(),
+                started_workers: AtomicU64::new(0),
+                next_enqueue_sequence: AtomicU64::new(1),
+                live_text_workers: AtomicU64::new(0),
+                live_image_workers: AtomicU64::new(0),
+                enforce_health,
+            }),
+        }));
+        spawn_watch_worker(Arc::clone(&pool.inner), super::super::DetectorFamily::Text);
+        pool
+    }
+
+    fn isolated_full_watch_pool() -> &'static WatchDetectorPool {
+        let pool = isolated_text_watch_pool(false);
+        spawn_watch_worker(Arc::clone(&pool.inner), super::super::DetectorFamily::Image);
+        spawn_watch_worker(Arc::clone(&pool.inner), super::super::DetectorFamily::Image);
+        pool
+    }
+
+    fn wait_for_pool_idle(pool: &WatchDetectorPool) {
+        let started = std::time::Instant::now();
+        loop {
+            let idle = {
+                let state = lock_watch_pool_state(&pool.inner);
+                state.active.is_empty() && state.pending.is_empty()
+            };
+            if idle {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "Watch worker did not release its slot"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_for_counter(counter: &AtomicU64, minimum: u64) {
+        let started = std::time::Instant::now();
+        while counter.load(Ordering::Acquire) < minimum {
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "counter did not reach {minimum}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_for_cleanup_failures(pool: &WatchDetectorPool, minimum: usize) {
+        let started = std::time::Instant::now();
+        while lock_watch_pool_state(&pool.inner).cleanup_failures.len() < minimum {
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "cleanup failure was not recorded"
+            );
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -7299,6 +7749,409 @@ mod tests {
         assert!(std::ptr::eq(first.watch_pool, second.watch_pool));
         assert!(std::ptr::eq(first.watch_pool, cloned.watch_pool));
         assert_eq!(first.watch_pool.worker_count(), 3);
+        assert_eq!(
+            first
+                .watch_pool
+                .inner
+                .live_text_workers
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            first
+                .watch_pool
+                .inner
+                .live_image_workers
+                .load(Ordering::Acquire),
+            2
+        );
+    }
+
+    #[test]
+    fn detector_and_completion_clock_panics_are_typed_and_worker_slot_recovers() {
+        let pool = isolated_text_watch_pool(false);
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+
+        let (panic_tx, panic_rx) = mpsc::sync_channel(1);
+        let panic_job = direct_watch_job(
+            "panic-detector",
+            1,
+            "lane",
+            super::super::DetectorFamily::Text,
+            Arc::new(PanickingWatchDetector),
+            &compiled,
+            &capture,
+            &panic_tx,
+        );
+        pool.submit(panic_job).unwrap();
+        assert!(matches!(
+            panic_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .result,
+            Err(WatchJobFailure::DetectorPanicked)
+        ));
+        wait_for_pool_idle(pool);
+
+        let (clock_tx, clock_rx) = mpsc::sync_channel(1);
+        let mut clock_job = direct_watch_job(
+            "panic-clock",
+            2,
+            "lane",
+            super::super::DetectorFamily::Text,
+            Arc::new(CountingUnmatchedDetector::default()),
+            &compiled,
+            &capture,
+            &clock_tx,
+        );
+        clock_job.clock = Arc::new(PanickingCompletionClock);
+        pool.submit(clock_job).unwrap();
+        assert!(matches!(
+            clock_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .result,
+            Err(WatchJobFailure::CompletionClockPanicked)
+        ));
+        wait_for_pool_idle(pool);
+
+        let (normal_tx, normal_rx) = mpsc::sync_channel(1);
+        pool.submit(direct_watch_job(
+            "normal-after-panic",
+            3,
+            "lane",
+            super::super::DetectorFamily::Text,
+            Arc::new(CountingUnmatchedDetector::default()),
+            &compiled,
+            &capture,
+            &normal_tx,
+        ))
+        .unwrap();
+        assert!(
+            normal_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .result
+                .is_ok()
+        );
+        wait_for_pool_idle(pool);
+        assert_eq!(pool.inner.started_workers.load(Ordering::Acquire), 1);
+        assert_eq!(pool.inner.live_text_workers.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn detector_panic_fails_unlimited_watch_group_without_hanging() {
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeCapture),
+            Arc::new(PanickingWatchDetector),
+            Arc::new(FrozenClock),
+        );
+        let mut watch = watch_group(
+            vec![watch_lane("lane-1", vec![point_action("body")])],
+            1,
+            TimeoutOutcome::Continue,
+        );
+        if let BlockKind::WatchGroup { group } = &mut watch.kind {
+            group.timeout_ms = Limit::Unlimited;
+        }
+
+        let events = runtime
+            .run(saved(fixture_definition(vec![watch])), RunMode::DryRun)
+            .unwrap();
+
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::TechnicalFailure { message },
+                ..
+            }) if message.contains("panicked")
+        ));
+        assert!(!events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+    }
+
+    #[test]
+    fn cleanup_panic_is_contained_without_killing_worker() {
+        let pool = isolated_text_watch_pool(false);
+        pool.finish_run("cleanup-now", Arc::new(PanickingCleanupDetector), vec![1]);
+        assert_eq!(lock_watch_pool_state(&pool.inner).cleanup_failures.len(), 1);
+
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let deferred_detector: Arc<dyn ConditionDetector> =
+            Arc::new(GatedPanickingCleanupDetector {
+                started: started_tx,
+                release: Arc::clone(&release),
+            });
+        let (deferred_tx, deferred_rx) = mpsc::sync_channel(1);
+        pool.submit(direct_watch_job(
+            "cleanup-later",
+            1,
+            "lane",
+            super::super::DetectorFamily::Text,
+            Arc::clone(&deferred_detector),
+            &compiled,
+            &capture,
+            &deferred_tx,
+        ))
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        pool.finish_run("cleanup-later", deferred_detector, vec![1]);
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        let _ = deferred_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wait_for_pool_idle(pool);
+        wait_for_cleanup_failures(pool, 2);
+
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        pool.submit(direct_watch_job(
+            "normal-after-cleanup-panic",
+            1,
+            "lane",
+            super::super::DetectorFamily::Text,
+            Arc::new(CountingUnmatchedDetector::default()),
+            &compiled,
+            &capture,
+            &completion_tx,
+        ))
+        .unwrap();
+        assert!(
+            completion_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .result
+                .is_ok()
+        );
+        wait_for_pool_idle(pool);
+        assert_eq!(pool.inner.live_text_workers.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn disconnected_or_full_completion_channel_never_pins_worker() {
+        let pool = isolated_text_watch_pool(false);
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let detector: Arc<dyn ConditionDetector> = Arc::new(CountingUnmatchedDetector::default());
+
+        let (disconnected_tx, disconnected_rx) = mpsc::sync_channel(1);
+        drop(disconnected_rx);
+        pool.submit(direct_watch_job(
+            "disconnected",
+            1,
+            "lane",
+            super::super::DetectorFamily::Text,
+            Arc::clone(&detector),
+            &compiled,
+            &capture,
+            &disconnected_tx,
+        ))
+        .unwrap();
+        wait_for_pool_idle(pool);
+
+        let (full_tx, _full_rx) = mpsc::sync_channel(1);
+        for lane in ["first", "second"] {
+            pool.submit(direct_watch_job(
+                "full-channel",
+                2,
+                lane,
+                super::super::DetectorFamily::Text,
+                Arc::clone(&detector),
+                &compiled,
+                &capture,
+                &full_tx,
+            ))
+            .unwrap();
+            wait_for_pool_idle(pool);
+        }
+        assert!(
+            lock_watch_pool_state(&pool.inner)
+                .run_failures
+                .contains_key("full-channel")
+        );
+
+        let (normal_tx, normal_rx) = mpsc::sync_channel(1);
+        pool.submit(direct_watch_job(
+            "normal-after-channel-failure",
+            3,
+            "lane",
+            super::super::DetectorFamily::Text,
+            detector,
+            &compiled,
+            &capture,
+            &normal_tx,
+        ))
+        .unwrap();
+        assert!(
+            normal_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .result
+                .is_ok()
+        );
+        wait_for_pool_idle(pool);
+    }
+
+    #[test]
+    fn pool_aging_uses_first_enqueue_sequence_not_runtime_clock_epoch() {
+        let pool = Box::leak(Box::new(WatchDetectorPool {
+            inner: Arc::new(WatchPoolInner {
+                state: Mutex::new(WatchPoolState::default()),
+                ready: Condvar::new(),
+                started_workers: AtomicU64::new(0),
+                next_enqueue_sequence: AtomicU64::new(1),
+                live_text_workers: AtomicU64::new(0),
+                live_image_workers: AtomicU64::new(0),
+                enforce_health: false,
+            }),
+        }));
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let (completion_tx, _completion_rx) = mpsc::sync_channel(3);
+        let detector: Arc<dyn ConditionDetector> = Arc::new(CountingUnmatchedDetector::default());
+        let old_run = format!("old-{}", NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed));
+        let new_run = format!("new-{}", NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed));
+
+        let mut old = direct_watch_job(
+            &old_run,
+            1,
+            "old-lane",
+            super::super::DetectorFamily::Text,
+            Arc::clone(&detector),
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        old.observed_at_ms = u64::MAX - 1;
+        pool.submit(old).unwrap();
+        let mut new = direct_watch_job(
+            &new_run,
+            1,
+            "new-lane",
+            super::super::DetectorFamily::Text,
+            Arc::clone(&detector),
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        new.observed_at_ms = 0;
+        pool.submit(new).unwrap();
+        let replacement = direct_watch_job(
+            &old_run,
+            1,
+            "old-lane",
+            super::super::DetectorFamily::Text,
+            detector,
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        pool.submit(replacement).unwrap();
+
+        let state = pool.inner.state.lock().unwrap();
+        let oldest = oldest_pending_key(&state, super::super::DetectorFamily::Text).unwrap();
+        assert_eq!(oldest.run_id, old_run);
+        assert!(
+            state.pending[&oldest].enqueue_sequence
+                < state
+                    .pending
+                    .iter()
+                    .find(|(key, _)| key.run_id == new_run)
+                    .unwrap()
+                    .1
+                    .enqueue_sequence
+        );
+    }
+
+    #[test]
+    fn degraded_worker_topology_and_enqueue_wrap_fail_closed() {
+        let pool = Box::leak(Box::new(WatchDetectorPool {
+            inner: Arc::new(WatchPoolInner {
+                state: Mutex::new(WatchPoolState::default()),
+                ready: Condvar::new(),
+                started_workers: AtomicU64::new(0),
+                next_enqueue_sequence: AtomicU64::new(1),
+                live_text_workers: AtomicU64::new(0),
+                live_image_workers: AtomicU64::new(0),
+                enforce_health: true,
+            }),
+        }));
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let (completion_tx, _completion_rx) = mpsc::sync_channel(1);
+        let job = direct_watch_job(
+            "degraded",
+            1,
+            "lane",
+            super::super::DetectorFamily::Text,
+            Arc::new(CountingUnmatchedDetector::default()),
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        assert!(pool.submit(job).unwrap_err().message.contains("degraded"));
+
+        pool.inner.live_text_workers.store(1, Ordering::Release);
+        pool.inner
+            .next_enqueue_sequence
+            .store(u64::MAX, Ordering::Release);
+        let wrap_job = direct_watch_job(
+            "wrap",
+            2,
+            "lane",
+            super::super::DetectorFamily::Text,
+            Arc::new(CountingUnmatchedDetector::default()),
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        assert!(
+            pool.submit(wrap_job)
+                .unwrap_err()
+                .message
+                .contains("exhausted")
+        );
+    }
+
+    #[test]
+    fn first_candidate_fixes_arbitration_deadline_for_unlimited_and_finite_groups() {
+        assert_eq!(establish_arbitration_deadline(None, 125, None), Some(125));
+        assert_eq!(
+            establish_arbitration_deadline(Some(125), 149, None),
+            Some(125)
+        );
+        assert_eq!(
+            establish_arbitration_deadline(None, 125, Some(120)),
+            Some(120)
+        );
+        assert_eq!(
+            establish_arbitration_deadline(Some(120), 119, Some(120)),
+            Some(120)
+        );
     }
 
     #[test]
@@ -7308,6 +8161,10 @@ mod tests {
                 state: Mutex::new(WatchPoolState::default()),
                 ready: Condvar::new(),
                 started_workers: AtomicU64::new(0),
+                next_enqueue_sequence: AtomicU64::new(1),
+                live_text_workers: AtomicU64::new(0),
+                live_image_workers: AtomicU64::new(0),
+                enforce_health: false,
             }),
         }));
         let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
@@ -7332,7 +8189,10 @@ mod tests {
             &capture,
             &completion_tx,
         );
-        assert_eq!(pool.submit(job), super::super::SubmitOutcome::Started);
+        assert_eq!(
+            pool.submit(job).unwrap(),
+            super::super::SubmitOutcome::Started
+        );
         assert_eq!(pool.inner.state.lock().unwrap().pending.len(), 1);
 
         drop(WatchScopeCleanup {
@@ -7346,6 +8206,7 @@ mod tests {
 
     #[test]
     fn slow_ocr_job_does_not_block_unrelated_image_worker_completion() {
+        let pool = isolated_full_watch_pool();
         let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
         let capture = super::super::CapturedCycle::capture(
             Arc::new(FakeCapture),
@@ -7376,7 +8237,7 @@ mod tests {
             &completion_tx,
         );
         assert_eq!(
-            WatchDetectorPool::global().submit(slow),
+            pool.submit(slow).unwrap(),
             super::super::SubmitOutcome::Started
         );
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -7390,7 +8251,7 @@ mod tests {
             &capture,
             &completion_tx,
         );
-        WatchDetectorPool::global().submit(fast);
+        pool.submit(fast).unwrap();
 
         let fast_completion = completion_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(fast_completion.key.lane_id, "fast");
@@ -7410,7 +8271,8 @@ mod tests {
             started: started_tx,
             release: Arc::clone(&release),
         });
-        let runtime = MacroRuntime::new(Arc::new(FakeCapture), detector, Arc::new(FrozenClock));
+        let mut runtime = MacroRuntime::new(Arc::new(FakeCapture), detector, Arc::new(FrozenClock));
+        runtime.watch_pool = isolated_text_watch_pool(false);
         let mut watch = watch_group(
             vec![watch_lane("lane-1", vec![point_action("body")])],
             1,
@@ -7450,7 +8312,141 @@ mod tests {
     }
 
     #[test]
+    fn replacing_pending_frames_never_invalidates_active_completion() {
+        let clock = Arc::new(ManualClock::default());
+        let capture = Arc::new(WatchCountingCapture::default());
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let detector = Arc::new(FirstGatedSequenceDetector {
+            started: started_tx,
+            release: Arc::clone(&release),
+            calls: AtomicU64::new(0),
+            first_matched: false,
+        });
+        let mut runtime = MacroRuntime::new(capture.clone(), detector.clone(), clock.clone());
+        runtime.watch_pool = isolated_text_watch_pool(false);
+        let mut watch = watch_group(
+            vec![watch_lane(
+                "lane-1",
+                vec![block(
+                    "body",
+                    BlockKind::Comment {
+                        text: "winner".to_string(),
+                    },
+                )],
+            )],
+            1,
+            TimeoutOutcome::Continue,
+        );
+        if let BlockKind::WatchGroup { group } = &mut watch.kind {
+            group.timeout_ms = Limit::Unlimited;
+        }
+        let revision = saved(fixture_definition(vec![watch]));
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _ = done_tx.send(runtime.run(revision, RunMode::DryRun));
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        clock.set(60);
+        wait_for_counter(&capture.0, 2);
+        clock.set(120);
+        wait_for_counter(&capture.0, 3);
+        clock.set(121);
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        wait_for_counter(&detector.calls, 2);
+        thread::sleep(Duration::from_millis(20));
+        clock.set(146);
+
+        let events = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Watch Group hung after active/pending replacement")
+            .unwrap();
+        handle.join().unwrap();
+        let observed_frames: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::ObservationCompleted {
+                    block_id, evidence, ..
+                } if block_id == "lane-1" => Some(evidence.frame_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(observed_frames.first(), Some(&1), "{events:#?}");
+        assert!(observed_frames.iter().any(|frame_id| *frame_id >= 3));
+        assert!(events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+    }
+
+    #[test]
+    fn newer_matched_completion_preserves_qualified_candidate_until_arbitration() {
+        let clock = Arc::new(ManualClock::default());
+        let capture = Arc::new(WatchCountingCapture::default());
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let detector = Arc::new(FirstGatedSequenceDetector {
+            started: started_tx,
+            release: Arc::clone(&release),
+            calls: AtomicU64::new(0),
+            first_matched: true,
+        });
+        let mut runtime = MacroRuntime::new(capture.clone(), detector.clone(), clock.clone());
+        runtime.watch_pool = isolated_text_watch_pool(false);
+        let mut watch = watch_group(
+            vec![watch_lane(
+                "lane-1",
+                vec![block(
+                    "body",
+                    BlockKind::Comment {
+                        text: "winner".to_string(),
+                    },
+                )],
+            )],
+            1,
+            TimeoutOutcome::Continue,
+        );
+        if let BlockKind::WatchGroup { group } = &mut watch.kind {
+            group.timeout_ms = Limit::Unlimited;
+        }
+        let revision = saved(fixture_definition(vec![watch]));
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _ = done_tx.send(runtime.run(revision, RunMode::DryRun));
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        clock.set(60);
+        wait_for_counter(&capture.0, 2);
+        clock.set(61);
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        wait_for_counter(&detector.calls, 2);
+        thread::sleep(Duration::from_millis(20));
+        clock.set(86);
+
+        let events = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("consecutive matched completions invalidated the candidate")
+            .unwrap();
+        handle.join().unwrap();
+        assert!(events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RunEvent::RunStopped {
+                reason: StopReason::TechnicalFailure { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn active_lane_keeps_only_newest_pending_detector_job() {
+        let pool = isolated_text_watch_pool(false);
         let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
         let capture = super::super::CapturedCycle::capture(
             Arc::new(FakeCapture),
@@ -7480,7 +8476,7 @@ mod tests {
             &completion_tx,
         );
         let first_id = first.job_id;
-        WatchDetectorPool::global().submit(first);
+        pool.submit(first).unwrap();
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let second = direct_watch_job(
             &run_id,
@@ -7494,7 +8490,7 @@ mod tests {
         );
         let second_id = second.job_id;
         assert_eq!(
-            WatchDetectorPool::global().submit(second),
+            pool.submit(second).unwrap(),
             super::super::SubmitOutcome::Pending
         );
         let third = direct_watch_job(
@@ -7509,7 +8505,7 @@ mod tests {
         );
         let third_id = third.job_id;
         assert_eq!(
-            WatchDetectorPool::global().submit(third),
+            pool.submit(third).unwrap(),
             super::super::SubmitOutcome::ReplacedPending {
                 dropped_frame_id: capture.frame_id(),
             }

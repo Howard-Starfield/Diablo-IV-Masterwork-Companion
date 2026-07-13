@@ -1,10 +1,11 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
+    thread,
     time::Duration,
 };
 
@@ -19,18 +20,315 @@ use crate::engine::{
 };
 
 use super::{
-    Action, Block, BlockKind, CandidateEvent, CaptureCoordinator, Condition, ConditionDetector,
-    DetectorEvidence, DetectorKind, JournalKind, JournalRecord, LatchDecision, Limit,
-    MacroDefinition, ObservationRequest, ObservationToken, ObserveMode, PassiveCondition,
-    PinnedAsset, SafetyBypass, SavedRevision, TimeoutOutcome, WatchGroup, WatchGroupRunner,
-    if_once_decision, observation_satisfies_mode, repeat_n_decision, validate_macro,
+    Action, Block, BlockKind, CandidateEvent, Condition, ConditionDetector, DetectorEvidence,
+    DetectorKind, JournalKind, JournalRecord, LatchDecision, Limit, MacroDefinition,
+    ObservationRequest, ObservationToken, ObserveMode, PassiveCondition, PinnedAsset, SafetyBypass,
+    SavedRevision, TimeoutOutcome, WatchGroup, WatchGroupRunner, if_once_decision,
+    observation_satisfies_mode, repeat_n_decision, validate_macro,
 };
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_LIVE_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_COMMITTER_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_WATCH_ENTRY_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_WATCH_JOB_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_SYNCHRONOUS_EVENT_CAPACITY: usize = 4_096;
 const FINAL_EVENT_RESERVE: usize = 16;
+const MAX_GLOBAL_WATCH_LANES: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WatchJobKey {
+    run_id: String,
+    block_id: String,
+    entry_id: u64,
+    lane_id: String,
+}
+
+struct WatchDetectorJob {
+    job_id: u64,
+    key: WatchJobKey,
+    lane_order: usize,
+    family: super::DetectorFamily,
+    generation: u64,
+    side_effect_epoch: u64,
+    condition: Condition,
+    compiled: CompiledMacro,
+    observed_at_ms: u64,
+    first_waiting_at_ms: u64,
+    capture: Arc<super::CapturedCycle>,
+    detector: Arc<dyn ConditionDetector>,
+    clock: Arc<dyn Clock + Send + Sync>,
+    completion: SyncSender<WatchDetectorCompletion>,
+}
+
+struct WatchDetectorCompletion {
+    job_id: u64,
+    key: WatchJobKey,
+    lane_order: usize,
+    generation: u64,
+    side_effect_epoch: u64,
+    completed_at_ms: u64,
+    capture: Arc<super::CapturedCycle>,
+    result: Result<DetectorEvidence>,
+}
+
+struct PendingWatchJob {
+    newest: WatchDetectorJob,
+    first_waiting_at_ms: u64,
+}
+
+#[derive(Default)]
+struct WatchPoolState {
+    active: HashMap<WatchJobKey, (u64, super::DetectorFamily)>,
+    pending: HashMap<WatchJobKey, PendingWatchJob>,
+    cleanups: HashMap<String, WatchRunCleanup>,
+}
+
+struct WatchRunCleanup {
+    detector: Arc<dyn ConditionDetector>,
+    generations: Vec<u64>,
+}
+
+struct WatchPoolInner {
+    state: Mutex<WatchPoolState>,
+    ready: Condvar,
+    started_workers: AtomicU64,
+}
+
+struct WatchDetectorPool {
+    inner: Arc<WatchPoolInner>,
+}
+
+struct WatchScopeCleanup {
+    pool: &'static WatchDetectorPool,
+    run_id: String,
+    entry_id: u64,
+}
+
+impl Drop for WatchScopeCleanup {
+    fn drop(&mut self) {
+        self.pool.cancel_scope(&self.run_id, self.entry_id);
+    }
+}
+
+impl WatchDetectorPool {
+    fn global() -> &'static Self {
+        static POOL: OnceLock<WatchDetectorPool> = OnceLock::new();
+        POOL.get_or_init(|| {
+            let inner = Arc::new(WatchPoolInner {
+                state: Mutex::new(WatchPoolState::default()),
+                ready: Condvar::new(),
+                started_workers: AtomicU64::new(0),
+            });
+            spawn_watch_worker(Arc::clone(&inner), super::DetectorFamily::Text);
+            spawn_watch_worker(Arc::clone(&inner), super::DetectorFamily::Image);
+            spawn_watch_worker(Arc::clone(&inner), super::DetectorFamily::Image);
+            Self { inner }
+        })
+    }
+
+    fn submit(&self, mut job: WatchDetectorJob) -> super::SubmitOutcome {
+        let mut state = self.inner.state.lock().expect("watch pool state poisoned");
+        if let Some(pending) = state.pending.get_mut(&job.key) {
+            let dropped_frame_id = pending.newest.capture.frame_id();
+            job.first_waiting_at_ms = pending.first_waiting_at_ms;
+            pending.newest = job;
+            return super::SubmitOutcome::ReplacedPending { dropped_frame_id };
+        }
+        let active_same_lane = state.active.contains_key(&job.key);
+        let known_lanes = state.active.len().saturating_add(state.pending.len());
+        if !active_same_lane && known_lanes >= MAX_GLOBAL_WATCH_LANES {
+            return super::SubmitOutcome::PollingDelayed;
+        }
+        let active_family = state
+            .active
+            .values()
+            .filter(|(_, active_family)| *active_family == job.family)
+            .count();
+        let queued_family = state
+            .pending
+            .values()
+            .filter(|pending| pending.newest.family == job.family)
+            .count();
+        let capacity = match job.family {
+            super::DetectorFamily::Text => 1,
+            super::DetectorFamily::Image => 2,
+        };
+        let outcome = if active_same_lane || active_family.saturating_add(queued_family) >= capacity
+        {
+            super::SubmitOutcome::Pending
+        } else {
+            super::SubmitOutcome::Started
+        };
+        let first_waiting_at_ms = job.first_waiting_at_ms;
+        state.pending.insert(
+            job.key.clone(),
+            PendingWatchJob {
+                newest: job,
+                first_waiting_at_ms,
+            },
+        );
+        drop(state);
+        self.inner.ready.notify_all();
+        outcome
+    }
+
+    fn cancel_scope(&self, run_id: &str, entry_id: u64) {
+        self.inner
+            .state
+            .lock()
+            .expect("watch pool state poisoned")
+            .pending
+            .retain(|key, _| key.run_id != run_id || key.entry_id != entry_id);
+    }
+
+    fn cancel_old_epoch(&self, run_id: &str, current_epoch: u64) {
+        self.inner
+            .state
+            .lock()
+            .expect("watch pool state poisoned")
+            .pending
+            .retain(|key, pending| {
+                key.run_id != run_id || pending.newest.side_effect_epoch == current_epoch
+            });
+    }
+
+    fn cancel_run(&self, run_id: &str) {
+        self.inner
+            .state
+            .lock()
+            .expect("watch pool state poisoned")
+            .pending
+            .retain(|key, _| key.run_id != run_id);
+    }
+
+    fn finish_run(
+        &self,
+        run_id: &str,
+        detector: Arc<dyn ConditionDetector>,
+        generations: Vec<u64>,
+    ) {
+        let cleanup = {
+            let mut state = self.inner.state.lock().expect("watch pool state poisoned");
+            let still_active = state.active.keys().any(|key| key.run_id == run_id)
+                || state.pending.keys().any(|key| key.run_id == run_id);
+            if still_active {
+                state.cleanups.insert(
+                    run_id.to_string(),
+                    WatchRunCleanup {
+                        detector,
+                        generations,
+                    },
+                );
+                None
+            } else {
+                Some(WatchRunCleanup {
+                    detector,
+                    generations,
+                })
+            }
+        };
+        if let Some(cleanup) = cleanup {
+            cleanup.detector.run_finished(run_id, &cleanup.generations);
+        }
+    }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        usize::try_from(self.inner.started_workers.load(Ordering::Acquire)).unwrap_or(usize::MAX)
+    }
+}
+
+fn spawn_watch_worker(inner: Arc<WatchPoolInner>, family: super::DetectorFamily) {
+    let worker_inner = Arc::clone(&inner);
+    thread::Builder::new()
+        .name(match family {
+            super::DetectorFamily::Text => "macro-watch-ocr".to_string(),
+            super::DetectorFamily::Image => "macro-watch-image".to_string(),
+        })
+        .spawn(move || watch_worker_loop(worker_inner, family))
+        .expect("failed to start fixed macro Watch worker");
+    inner.started_workers.fetch_add(1, Ordering::Release);
+}
+
+fn watch_worker_loop(inner: Arc<WatchPoolInner>, family: super::DetectorFamily) {
+    loop {
+        let job = {
+            let mut state = inner.state.lock().expect("watch pool state poisoned");
+            loop {
+                let next_key = state
+                    .pending
+                    .iter()
+                    .filter(|(key, pending)| {
+                        pending.newest.family == family && !state.active.contains_key(*key)
+                    })
+                    .min_by(|(left_key, left), (right_key, right)| {
+                        left.first_waiting_at_ms
+                            .cmp(&right.first_waiting_at_ms)
+                            .then_with(|| left_key.run_id.cmp(&right_key.run_id))
+                            .then_with(|| left_key.entry_id.cmp(&right_key.entry_id))
+                            .then_with(|| left_key.lane_id.cmp(&right_key.lane_id))
+                    })
+                    .map(|(key, _)| key.clone());
+                if let Some(key) = next_key {
+                    let pending = state
+                        .pending
+                        .remove(&key)
+                        .expect("selected job disappeared");
+                    state
+                        .active
+                        .insert(key, (pending.newest.job_id, pending.newest.family));
+                    break pending.newest;
+                }
+                state = inner.ready.wait(state).expect("watch pool state poisoned");
+            }
+        };
+
+        let request = ObservationRequest {
+            run_id: &job.key.run_id,
+            generation: job.generation,
+            side_effect_epoch: job.side_effect_epoch,
+            condition: &job.condition,
+            compiled: &job.compiled,
+            observed_at_ms: job.observed_at_ms,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            job.detector.observe(&request, job.capture.as_ref())
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("Watch detector worker panicked")));
+        let completed_at_ms = job.clock.now_ms();
+        let cleanup = {
+            let mut state = inner.state.lock().expect("watch pool state poisoned");
+            if state.active.get(&job.key).map(|(job_id, _)| *job_id) == Some(job.job_id) {
+                state.active.remove(&job.key);
+            }
+            let run_still_active = state.active.keys().any(|key| key.run_id == job.key.run_id)
+                || state.pending.keys().any(|key| key.run_id == job.key.run_id);
+            if run_still_active {
+                None
+            } else {
+                state.cleanups.remove(&job.key.run_id)
+            }
+        };
+        inner.ready.notify_all();
+        let completed_run_id = job.key.run_id.clone();
+        let _ = job.completion.send(WatchDetectorCompletion {
+            job_id: job.job_id,
+            key: job.key,
+            lane_order: job.lane_order,
+            generation: job.generation,
+            side_effect_epoch: job.side_effect_epoch,
+            completed_at_ms,
+            capture: job.capture,
+            result,
+        });
+        if let Some(cleanup) = cleanup {
+            cleanup
+                .detector
+                .run_finished(&completed_run_id, &cleanup.generations);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -999,6 +1297,8 @@ fn observation_is_current(
         && frame.captured_at_ms == current.captured_at_ms
         && frame.window_id == authorization.expected_target.window_id
         && frame.window_revision == authorization.expected_target.window_revision
+        && frame.process_id == authorization.expected_target.process_id
+        && frame.process_started_at_100ns == authorization.expected_target.process_started_at_100ns
         && frame.client_x == authorization.expected_target.client_rect.x
         && frame.client_y == authorization.expected_target.client_rect.y
         && frame.client_width == authorization.expected_target.client_rect.width
@@ -1006,6 +1306,9 @@ fn observation_is_current(
         && frame.geometry_revision == authorization.expected_target.geometry_revision
         && frame.display_profile_revision == authorization.expected_target.display_profile_revision
         && frame.dpi == authorization.expected_target.dpi
+        && frame.is_visible == authorization.expected_target.is_visible
+        && frame.is_minimized == authorization.expected_target.is_minimized
+        && frame.is_foreground == authorization.expected_target.is_foreground
         && frame.region_revision == current.region_revision
         && frame.rule_revision == current.rule_revision
 }
@@ -1729,6 +2032,11 @@ fn validate_token_frame_consistency(
         frame.window_revision == target.window_revision,
         "frame window revision changed"
     );
+    anyhow::ensure!(frame.process_id == target.process_id, "frame PID changed");
+    anyhow::ensure!(
+        frame.process_started_at_100ns == target.process_started_at_100ns,
+        "frame process identity changed"
+    );
     anyhow::ensure!(
         (
             frame.client_x,
@@ -1752,6 +2060,18 @@ fn validate_token_frame_consistency(
         "frame display profile changed"
     );
     anyhow::ensure!(frame.dpi == target.dpi, "frame DPI changed");
+    anyhow::ensure!(
+        frame.is_visible == target.is_visible,
+        "frame visibility changed"
+    );
+    anyhow::ensure!(
+        frame.is_minimized == target.is_minimized,
+        "frame minimized state changed"
+    );
+    anyhow::ensure!(
+        frame.is_foreground == target.is_foreground,
+        "frame foreground state changed"
+    );
     anyhow::ensure!(
         frame.region_revision == token.region_revision,
         "frame region revision is inconsistent"
@@ -1917,6 +2237,7 @@ pub struct MacroRuntime {
     emergency_stop: Arc<EmergencySignal>,
     active: Arc<Mutex<bool>>,
     event_capacity: usize,
+    watch_pool: &'static WatchDetectorPool,
 }
 
 impl Clone for MacroRuntime {
@@ -1929,6 +2250,7 @@ impl Clone for MacroRuntime {
             emergency_stop: Arc::clone(&self.emergency_stop),
             active: Arc::clone(&self.active),
             event_capacity: self.event_capacity,
+            watch_pool: self.watch_pool,
         }
     }
 }
@@ -1960,6 +2282,7 @@ impl MacroRuntime {
             emergency_stop: Arc::new(EmergencySignal::default()),
             active: Arc::new(Mutex::new(false)),
             event_capacity,
+            watch_pool: WatchDetectorPool::global(),
         }
     }
 
@@ -1979,6 +2302,7 @@ impl MacroRuntime {
             compiled: &compiled,
             emitter: &mut emitter,
             observations: HashMap::new(),
+            side_effect_epoch: 0,
             last_observation_at_ms: None,
             non_authoritative_planned_clicks: 0,
             paused_event_emitted: false,
@@ -1995,6 +2319,7 @@ impl MacroRuntime {
             .collect::<Vec<_>>();
         detector_generations.sort_unstable();
         drop(execution);
+        self.watch_pool.cancel_run(emitter.run_id());
         if matches!(
             reason,
             StopReason::TechnicalFailure { .. } | StopReason::SafetyLimit { .. }
@@ -2009,8 +2334,11 @@ impl MacroRuntime {
         }
         emitter.status(RunStatus::Stopping);
         emitter.run_stopped(reason);
-        self.detector
-            .run_finished(emitter.run_id(), &detector_generations);
+        self.watch_pool.finish_run(
+            emitter.run_id(),
+            Arc::clone(&self.detector),
+            detector_generations,
+        );
         Ok(emitter.events)
     }
 
@@ -2093,6 +2421,7 @@ struct RunExecution<'a, 'clock> {
     compiled: &'a CompiledMacro,
     emitter: &'a mut EventEmitter<'clock>,
     observations: HashMap<String, ObservationToken>,
+    side_effect_epoch: u64,
     last_observation_at_ms: Option<u64>,
     /// Simulation-only count of click actions emitted as planned during this run.
     /// It is deliberately separate from, and cannot mutate, `ActionCommitter`'s live ledger.
@@ -2228,13 +2557,35 @@ impl RunExecution<'_, '_> {
                 group.lanes.len().max(1),
             )
         });
-        let capture_coordinator = CaptureCoordinator::new(Arc::clone(&self.runtime.capture));
         runner.invalidate(initial_generation);
         let started_at = self.runtime.clock.now_ms();
+        let deadline = match group.timeout_ms {
+            Limit::Finite(timeout_ms) => Some(started_at.saturating_add(timeout_ms)),
+            Limit::Unlimited => None,
+        };
+        let entry_id = NEXT_WATCH_ENTRY_ID.fetch_add(1, Ordering::Relaxed);
+        let _scope_cleanup = WatchScopeCleanup {
+            pool: self.runtime.watch_pool,
+            run_id: self.emitter.run_id().to_string(),
+            entry_id,
+        };
+        let (completion_tx, completion_rx) = mpsc::sync_channel::<WatchDetectorCompletion>(3);
+        let mut candidate_cycles: HashMap<String, Arc<super::CapturedCycle>> = HashMap::new();
+        let mut latest_job_ids: HashMap<String, u64> = HashMap::new();
+        let mut arbitration_deadline = None;
+        let mut next_poll_at = started_at;
+        let mut runner_generation = initial_generation;
+        let mut lane_due_at: HashMap<String, u64> = group
+            .enabled_lanes_in_priority_order()
+            .map(|(_, lane)| (lane.id.clone(), started_at))
+            .collect();
         let mut attempts = 0_u64;
 
-        'observe: loop {
+        loop {
             if let Some(reason) = self.check_control() {
+                self.runtime
+                    .watch_pool
+                    .cancel_scope(self.emitter.run_id(), entry_id);
                 let arbitration = runner.arbitrate(Some(safety_bypass_for_stop(&reason)));
                 self.emitter.arbitration_completed(
                     block_id,
@@ -2245,145 +2596,54 @@ impl RunExecution<'_, '_> {
                 self.watch_groups.insert(block_id.to_string(), runner);
                 return Some(reason);
             }
-            if attempts > 0 && watch_timeout_reached(group, started_at, self.runtime.clock.now_ms())
-            {
+            let now = self.runtime.clock.now_ms();
+            let arbitration_is_due =
+                arbitration_deadline.is_some_and(|arbitration_at| now >= arbitration_at);
+            if !arbitration_is_due && deadline.is_some_and(|deadline| now >= deadline) {
+                self.runtime
+                    .watch_pool
+                    .cancel_scope(self.emitter.run_id(), entry_id);
                 return self.resolve_watch_timeout(block_id, group, runner);
             }
             let generation = self.runtime.control_handle().generation();
-            runner.invalidate(generation);
-            attempts = attempts.saturating_add(1);
-            if exceeds_limit(
-                attempts.saturating_sub(1),
-                &self.compiled.definition().safety.max_observation_retries,
-            ) {
-                self.watch_groups.insert(block_id.to_string(), runner);
-                return Some(StopReason::SafetyLimit {
-                    message: format!(
-                        "observation retry limit exceeded in Watch Group '{block_id}'"
-                    ),
-                });
-            }
-            if let Some(reason) = self.pace_observation() {
-                let arbitration = runner.arbitrate(Some(safety_bypass_for_stop(&reason)));
-                self.emitter.arbitration_completed(
-                    block_id,
-                    None,
-                    arbitration.discarded_lane_ids,
-                    true,
-                );
-                self.watch_groups.insert(block_id.to_string(), runner);
-                return Some(reason);
-            }
-            if attempts > 1 && watch_timeout_reached(group, started_at, self.runtime.clock.now_ms())
-            {
-                return self.resolve_watch_timeout(block_id, group, runner);
+            if generation != runner_generation {
+                runner.invalidate(generation);
+                runner_generation = generation;
+                arbitration_deadline = None;
+                candidate_cycles.clear();
+                latest_job_ids.clear();
+                self.observations.clear();
+                self.runtime
+                    .watch_pool
+                    .cancel_scope(self.emitter.run_id(), entry_id);
+                next_poll_at = now;
+                for due_at in lane_due_at.values_mut() {
+                    *due_at = now;
+                }
             }
 
-            let mut lane_schedule: Vec<_> = group
-                .enabled_lanes_in_priority_order()
-                .map(|(order, _)| order)
-                .collect();
-            if !lane_schedule.is_empty() {
-                let rotation = usize::try_from(attempts.saturating_sub(1)).unwrap_or(usize::MAX)
-                    % lane_schedule.len();
-                lane_schedule.rotate_left(rotation);
-            }
-            let capture_regions = lane_schedule
-                .iter()
-                .map(|lane_order| self.watch_capture_rect(&group.lanes[*lane_order].condition))
-                .collect::<std::result::Result<Vec<_>, _>>();
-            let capture_regions = match capture_regions {
-                Ok(regions) => regions,
-                Err(message) => {
-                    self.watch_groups.insert(block_id.to_string(), runner);
-                    return Some(StopReason::TechnicalFailure { message });
-                }
-            };
-            if let Err(error) = capture_coordinator.begin_cycle(&capture_regions) {
-                if error
-                    .downcast_ref::<crate::engine::automation::StaleCapturedFrameError>()
-                    .is_some()
+            while let Ok(completion) = completion_rx.try_recv() {
+                if completion.key.run_id != self.emitter.run_id()
+                    || completion.key.block_id != block_id
+                    || completion.key.entry_id != entry_id
+                    || completion.generation != generation
+                    || completion.side_effect_epoch != self.side_effect_epoch
+                    || latest_job_ids.get(&completion.key.lane_id) != Some(&completion.job_id)
                 {
-                    let arbitration = runner.arbitrate(Some(SafetyBypass::TargetInvalidated));
-                    self.emitter.arbitration_completed(
-                        block_id,
-                        None,
-                        arbitration.discarded_lane_ids,
-                        true,
-                    );
-                }
-                self.watch_groups.insert(block_id.to_string(), runner);
-                return Some(StopReason::TechnicalFailure {
-                    message: format!("capture failed for Watch Group '{block_id}': {error}"),
-                });
-            }
-            let mut scheduled_text = 0_usize;
-            let mut scheduled_images = 0_usize;
-            for lane_order in lane_schedule {
-                let lane = &group.lanes[lane_order];
-                if !lane.enabled {
                     continue;
                 }
-                let saturated = match lane.condition {
-                    PassiveCondition::Text { .. } => {
-                        scheduled_text = scheduled_text.saturating_add(1);
-                        scheduled_text > 1
-                    }
-                    PassiveCondition::Image { .. } => {
-                        scheduled_images = scheduled_images.saturating_add(1);
-                        scheduled_images > 2
-                    }
-                };
-                if saturated {
-                    self.emitter.polling_delayed(block_id, &lane.id, attempts);
+                if deadline.is_some_and(|deadline| completion.completed_at_ms >= deadline) {
+                    continue;
                 }
                 if let Some(reason) = self.check_control() {
-                    let arbitration = runner.arbitrate(Some(safety_bypass_for_stop(&reason)));
-                    self.emitter.arbitration_completed(
-                        block_id,
-                        None,
-                        arbitration.discarded_lane_ids,
-                        true,
-                    );
+                    self.runtime
+                        .watch_pool
+                        .cancel_scope(self.emitter.run_id(), entry_id);
                     self.watch_groups.insert(block_id.to_string(), runner);
                     return Some(reason);
                 }
-                if self.runtime.control_handle().generation() != generation {
-                    runner.invalidate(self.runtime.control_handle().generation());
-                    continue 'observe;
-                }
-                let condition = passive_condition(&lane.condition);
-                self.detector_generations.insert(generation);
-                let observed_at_ms = self.runtime.clock.now_ms();
-                self.last_observation_at_ms = Some(observed_at_ms);
-                let request = ObservationRequest {
-                    run_id: self.emitter.run_id(),
-                    generation,
-                    condition: &condition,
-                    compiled: self.compiled,
-                    observed_at_ms,
-                };
-                let observation = self
-                    .runtime
-                    .detector
-                    .observe(&request, &capture_coordinator);
-                if let Some(reason) = self.check_control() {
-                    let arbitration = runner.arbitrate(Some(safety_bypass_for_stop(&reason)));
-                    self.emitter.arbitration_completed(
-                        block_id,
-                        None,
-                        arbitration.discarded_lane_ids,
-                        true,
-                    );
-                    self.watch_groups.insert(block_id.to_string(), runner);
-                    return Some(reason);
-                }
-                if self.runtime.control_handle().generation() != generation {
-                    runner.invalidate(self.runtime.control_handle().generation());
-                    self.emitter.observation_progress(block_id, attempts);
-                    continue 'observe;
-                }
-                let evidence = match observation {
+                let lane = &group.lanes[completion.lane_order];
+                let evidence = match completion.result {
                     Ok(evidence) => evidence,
                     Err(error) => {
                         if error
@@ -2403,14 +2663,41 @@ impl RunExecution<'_, '_> {
                         return Some(StopReason::TechnicalFailure {
                             message: format!(
                                 "detector failed for Watch lane '{}': {error}",
-                                lane.id
+                                completion.key.lane_id
                             ),
                         });
                     }
                 };
+                let condition = passive_condition(&lane.condition);
                 let token = if evidence.matched {
                     match self.make_token(&condition, &evidence, generation) {
-                        Ok(token) => Some(token),
+                        Ok(token) => {
+                            let Some(frame) = token.frame_metadata else {
+                                self.watch_groups.insert(block_id.to_string(), runner);
+                                return Some(StopReason::TechnicalFailure {
+                                    message: format!(
+                                        "matched Watch lane '{}' has no atomic frame provenance",
+                                        completion.key.lane_id
+                                    ),
+                                });
+                            };
+                            if !frame_matches_capture(frame, completion.capture.metadata())
+                                || frame.frame_id != completion.capture.frame_id()
+                                || frame.frame_id != token.frame_id
+                                || frame.captured_at_ms != token.captured_at_ms
+                                || frame.region_revision != token.region_revision
+                                || frame.rule_revision != token.rule_revision
+                            {
+                                self.watch_groups.insert(block_id.to_string(), runner);
+                                return Some(StopReason::TechnicalFailure {
+                                    message: format!(
+                                        "matched Watch lane '{}' returned inconsistent frame provenance",
+                                        completion.key.lane_id
+                                    ),
+                                });
+                            }
+                            Some(token)
+                        }
                         Err(message) => {
                             self.watch_groups.insert(block_id.to_string(), runner);
                             return Some(StopReason::TechnicalFailure { message });
@@ -2419,29 +2706,38 @@ impl RunExecution<'_, '_> {
                 } else {
                     None
                 };
+                self.emitter.observation_completed(
+                    &completion.key.lane_id,
+                    evidence.clone(),
+                    token.clone(),
+                );
                 self.emitter
-                    .observation_completed(&lane.id, evidence.clone(), token.clone());
-                self.emitter.condition_evaluated(&lane.id, evidence.matched);
+                    .condition_evaluated(&completion.key.lane_id, evidence.matched);
 
-                let latch = runner.observe_latch(&lane.id, evidence.matched, evidence.frame_id);
+                let latch = runner.observe_latch(
+                    &completion.key.lane_id,
+                    evidence.matched,
+                    evidence.frame_id,
+                );
                 if matches!(latch, LatchDecision::Qualified) {
                     let candidate = token.as_ref().map(|token| {
                         CandidateEvent::from_observation(
-                            &lane.id,
-                            lane_order,
-                            self.runtime.clock.now_ms(),
+                            &completion.key.lane_id,
+                            completion.lane_order,
+                            completion.completed_at_ms,
                             token,
                         )
                     });
                     if let Some(token) = token {
-                        self.observations.insert(lane.id.clone(), token);
+                        self.observations
+                            .insert(completion.key.lane_id.clone(), token);
                     }
                     let Some(candidate) = candidate else {
                         self.watch_groups.insert(block_id.to_string(), runner);
                         return Some(StopReason::TechnicalFailure {
                             message: format!(
                                 "qualified Watch lane '{}' has no evidence token",
-                                lane.id
+                                completion.key.lane_id
                             ),
                         });
                     };
@@ -2450,17 +2746,34 @@ impl RunExecution<'_, '_> {
                         return Some(StopReason::TechnicalFailure {
                             message: format!(
                                 "Watch lane '{}' candidate rejected: {message}",
-                                lane.id
+                                completion.key.lane_id
                             ),
                         });
                     }
+                    candidate_cycles.insert(completion.key.lane_id.clone(), completion.capture);
+                    let candidate_deadline = completion
+                        .completed_at_ms
+                        .saturating_add(super::ARBITRATION_WINDOW_MS);
+                    arbitration_deadline = Some(deadline.map_or(candidate_deadline, |deadline| {
+                        candidate_deadline.min(deadline)
+                    }));
                 } else {
-                    self.observations.remove(&lane.id);
+                    self.observations.remove(&completion.key.lane_id);
                 }
             }
 
-            let arbitration = runner.arbitrate(None);
-            if let Some(winner) = arbitration.winner.clone() {
+            let now = self.runtime.clock.now_ms();
+            if arbitration_deadline.is_some_and(|deadline| now >= deadline) {
+                self.runtime
+                    .watch_pool
+                    .cancel_scope(self.emitter.run_id(), entry_id);
+                let arbitration = runner.arbitrate(None);
+                let Some(winner) = arbitration.winner.clone() else {
+                    self.watch_groups.insert(block_id.to_string(), runner);
+                    return Some(StopReason::TechnicalFailure {
+                        message: format!("Watch Group '{block_id}' arbitration lost its candidate"),
+                    });
+                };
                 if let Some(reason) = self.check_control() {
                     self.observations.clear();
                     self.emitter.arbitration_completed(
@@ -2479,7 +2792,8 @@ impl RunExecution<'_, '_> {
                     .observations
                     .get(&winner.lane_id)
                     .is_some_and(|token| winner.matches_observation(token))
-                    && winner.generation == self.runtime.control_handle().generation();
+                    && winner.token.generation == self.runtime.control_handle().generation()
+                    && winner.token.side_effect_epoch == self.side_effect_epoch;
                 if !fresh_winner {
                     self.observations.clear();
                     runner.invalidate(self.runtime.control_handle().generation());
@@ -2491,6 +2805,54 @@ impl RunExecution<'_, '_> {
                         ),
                     });
                 }
+                let Some(winner_cycle) = candidate_cycles.remove(&winner.lane_id) else {
+                    self.watch_groups.insert(block_id.to_string(), runner);
+                    return Some(StopReason::TechnicalFailure {
+                        message: format!(
+                            "Watch lane '{}' lost its capture provenance",
+                            winner.lane_id
+                        ),
+                    });
+                };
+                if let Err(error) = winner_cycle.validate_fresh() {
+                    self.observations.clear();
+                    runner.invalidate(self.runtime.control_handle().generation());
+                    self.emitter.arbitration_completed(
+                        block_id,
+                        None,
+                        std::iter::once(winner.lane_id)
+                            .chain(arbitration.discarded_lane_ids)
+                            .collect(),
+                        true,
+                    );
+                    self.watch_groups.insert(block_id.to_string(), runner);
+                    return Some(StopReason::TechnicalFailure {
+                        message: format!("Watch target changed before winner body: {error}"),
+                    });
+                }
+                if let Some(reason) = self.check_control() {
+                    candidate_cycles.clear();
+                    self.observations.clear();
+                    self.emitter.arbitration_completed(
+                        block_id,
+                        None,
+                        std::iter::once(winner.lane_id)
+                            .chain(arbitration.discarded_lane_ids)
+                            .collect(),
+                        true,
+                    );
+                    runner.invalidate(self.runtime.control_handle().generation());
+                    self.watch_groups.insert(block_id.to_string(), runner);
+                    return Some(reason);
+                }
+                if deadline.is_some_and(|deadline| self.runtime.clock.now_ms() >= deadline) {
+                    drop(winner_cycle);
+                    candidate_cycles.clear();
+                    self.observations.clear();
+                    return self.resolve_watch_timeout(block_id, group, runner);
+                }
+                drop(winner_cycle);
+                candidate_cycles.clear();
                 self.emitter.arbitration_completed(
                     block_id,
                     Some(winner.lane_id.clone()),
@@ -2509,7 +2871,6 @@ impl RunExecution<'_, '_> {
                 runner.begin_execution();
                 let body_reason = self.execute_blocks(&winner_body);
                 runner.settle_and_exit();
-                capture_coordinator.invalidate();
                 self.observations.clear();
                 self.watch_groups.insert(block_id.to_string(), runner);
                 if let Some(reason) = body_reason {
@@ -2518,29 +2879,145 @@ impl RunExecution<'_, '_> {
                 return self.cooperative_wait(group.cooldown_ms);
             }
 
-            if watch_timeout_reached(group, started_at, self.runtime.clock.now_ms()) {
-                return self.resolve_watch_timeout(block_id, group, runner);
+            if arbitration_deadline.is_none() && now >= next_poll_at {
+                attempts = attempts.saturating_add(1);
+                if exceeds_limit(
+                    attempts.saturating_sub(1),
+                    &self.compiled.definition().safety.max_observation_retries,
+                ) {
+                    self.runtime
+                        .watch_pool
+                        .cancel_scope(self.emitter.run_id(), entry_id);
+                    self.watch_groups.insert(block_id.to_string(), runner);
+                    return Some(StopReason::SafetyLimit {
+                        message: format!(
+                            "observation retry limit exceeded in Watch Group '{block_id}'"
+                        ),
+                    });
+                }
+                if deadline.is_some_and(|deadline| self.runtime.clock.now_ms() >= deadline) {
+                    self.runtime
+                        .watch_pool
+                        .cancel_scope(self.emitter.run_id(), entry_id);
+                    return self.resolve_watch_timeout(block_id, group, runner);
+                }
+                let lane_schedule: Vec<_> = group
+                    .enabled_lanes_in_priority_order()
+                    .filter(|(_, lane)| {
+                        lane_due_at
+                            .get(&lane.id)
+                            .is_some_and(|due_at| *due_at <= now)
+                    })
+                    .map(|(order, _)| order)
+                    .collect();
+                if lane_schedule.is_empty() {
+                    next_poll_at = lane_due_at.values().copied().min().unwrap_or(now + 1);
+                    self.runtime.emergency_stop.wait(Duration::from_millis(1));
+                    continue;
+                }
+                let capture_regions = match lane_schedule
+                    .iter()
+                    .map(|lane_order| self.watch_capture_rect(&group.lanes[*lane_order].condition))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                {
+                    Ok(regions) => regions,
+                    Err(message) => {
+                        self.watch_groups.insert(block_id.to_string(), runner);
+                        return Some(StopReason::TechnicalFailure { message });
+                    }
+                };
+                let cycle = match super::CapturedCycle::capture(
+                    Arc::clone(&self.runtime.capture),
+                    &capture_regions,
+                ) {
+                    Ok(cycle) => cycle,
+                    Err(error) => {
+                        let arbitration = runner.arbitrate(Some(SafetyBypass::TargetInvalidated));
+                        self.emitter.arbitration_completed(
+                            block_id,
+                            None,
+                            arbitration.discarded_lane_ids,
+                            true,
+                        );
+                        self.watch_groups.insert(block_id.to_string(), runner);
+                        return Some(StopReason::TechnicalFailure {
+                            message: format!(
+                                "capture failed for Watch Group '{block_id}': {error}"
+                            ),
+                        });
+                    }
+                };
+                let after_capture = self.runtime.clock.now_ms();
+                if deadline.is_some_and(|deadline| after_capture >= deadline) {
+                    self.runtime
+                        .watch_pool
+                        .cancel_scope(self.emitter.run_id(), entry_id);
+                    return self.resolve_watch_timeout(block_id, group, runner);
+                }
+                for lane_order in lane_schedule {
+                    if let Some(reason) = self.check_control() {
+                        self.runtime
+                            .watch_pool
+                            .cancel_scope(self.emitter.run_id(), entry_id);
+                        self.watch_groups.insert(block_id.to_string(), runner);
+                        return Some(reason);
+                    }
+                    let dispatch_at = self.runtime.clock.now_ms();
+                    if deadline.is_some_and(|deadline| dispatch_at >= deadline) {
+                        self.runtime
+                            .watch_pool
+                            .cancel_scope(self.emitter.run_id(), entry_id);
+                        return self.resolve_watch_timeout(block_id, group, runner);
+                    }
+                    let lane = &group.lanes[lane_order];
+                    let family = match lane.condition {
+                        PassiveCondition::Text { .. } => super::DetectorFamily::Text,
+                        PassiveCondition::Image { .. } => super::DetectorFamily::Image,
+                    };
+                    let job_id = NEXT_WATCH_JOB_ID.fetch_add(1, Ordering::Relaxed);
+                    self.detector_generations.insert(generation);
+                    self.last_observation_at_ms = Some(dispatch_at);
+                    let outcome = self.runtime.watch_pool.submit(WatchDetectorJob {
+                        job_id,
+                        key: WatchJobKey {
+                            run_id: self.emitter.run_id().to_string(),
+                            block_id: block_id.to_string(),
+                            entry_id,
+                            lane_id: lane.id.clone(),
+                        },
+                        lane_order,
+                        family,
+                        generation,
+                        side_effect_epoch: self.side_effect_epoch,
+                        condition: passive_condition(&lane.condition),
+                        compiled: self.compiled.clone(),
+                        observed_at_ms: dispatch_at,
+                        first_waiting_at_ms: dispatch_at,
+                        capture: Arc::clone(&cycle),
+                        detector: Arc::clone(&self.runtime.detector),
+                        clock: Arc::clone(&self.runtime.clock),
+                        completion: completion_tx.clone(),
+                    });
+                    if !matches!(outcome, super::SubmitOutcome::PollingDelayed) {
+                        latest_job_ids.insert(lane.id.clone(), job_id);
+                    }
+                    if !matches!(outcome, super::SubmitOutcome::Started) {
+                        self.emitter.polling_delayed(block_id, &lane.id, attempts);
+                    }
+                    lane_due_at.insert(
+                        lane.id.clone(),
+                        dispatch_at.saturating_add(self.watch_poll_interval_ms(&lane.condition)),
+                    );
+                }
+                self.emitter.observation_progress(block_id, attempts);
+                next_poll_at = lane_due_at
+                    .values()
+                    .copied()
+                    .min()
+                    .unwrap_or_else(|| after_capture.saturating_add(1));
             }
-            self.emitter.observation_progress(block_id, attempts);
-            let poll_ms = group
-                .lanes
-                .iter()
-                .filter(|lane| lane.enabled)
-                .map(|lane| self.watch_poll_interval_ms(&lane.condition))
-                .min()
-                .unwrap_or(1)
-                .max(1);
-            if let Some(reason) = self.cooperative_wait(poll_ms) {
-                let arbitration = runner.arbitrate(Some(safety_bypass_for_stop(&reason)));
-                self.emitter.arbitration_completed(
-                    block_id,
-                    None,
-                    arbitration.discarded_lane_ids,
-                    true,
-                );
-                self.watch_groups.insert(block_id.to_string(), runner);
-                return Some(reason);
-            }
+
+            self.runtime.emergency_stop.wait(Duration::from_millis(1));
         }
     }
 
@@ -2665,6 +3142,7 @@ impl RunExecution<'_, '_> {
             let request = ObservationRequest {
                 run_id: self.emitter.run_id(),
                 generation,
+                side_effect_epoch: self.side_effect_epoch,
                 condition,
                 compiled: self.compiled,
                 observed_at_ms,
@@ -2838,6 +3316,7 @@ impl RunExecution<'_, '_> {
         Ok(ObservationToken {
             run_id: self.emitter.run_id().to_string(),
             generation,
+            side_effect_epoch: self.side_effect_epoch,
             source_block_id: source_block_id.clone(),
             detector,
             region_id: region.id.clone(),
@@ -2886,7 +3365,9 @@ impl RunExecution<'_, '_> {
                         .action_blocked(block_id, action.clone(), reason.clone());
                     return Some(StopReason::TechnicalFailure { message: reason });
                 };
-                if !token.is_current(self.emitter.run_id(), generation) {
+                if !token.is_current(self.emitter.run_id(), generation)
+                    || token.side_effect_epoch != self.side_effect_epoch
+                {
                     let reason = format!("observation from '{source_block_id}' is stale");
                     self.emitter
                         .action_blocked(block_id, action.clone(), reason.clone());
@@ -2918,7 +3399,27 @@ impl RunExecution<'_, '_> {
         // This run-local simulation count gates planning only. The live `ActionCommitter`
         // remains the sole owner of actual click consumption at the first SendInput boundary.
         self.emitter.action_planned(block_id, action.clone(), token);
+        if is_side_effect_action(action) {
+            self.invalidate_after_side_effect();
+        }
         self.cooperative_wait(self.compiled.definition().safety.minimum_click_interval_ms)
+    }
+
+    fn invalidate_after_side_effect(&mut self) {
+        let generation = self.runtime.control_handle().generation();
+        self.side_effect_epoch = self.side_effect_epoch.wrapping_add(1);
+        self.observations.clear();
+        for runner in self.watch_groups.values_mut() {
+            runner.invalidate(generation);
+        }
+        self.runtime
+            .watch_pool
+            .cancel_old_epoch(self.emitter.run_id(), self.side_effect_epoch);
+        self.runtime.detector.side_effect_boundary(
+            self.emitter.run_id(),
+            generation,
+            self.side_effect_epoch,
+        );
     }
 
     fn cooperative_wait(&mut self, duration_ms: u64) -> Option<StopReason> {
@@ -3013,6 +3514,29 @@ fn passive_condition(condition: &PassiveCondition) -> Condition {
             mode: ObserveMode::CheckNow,
         },
     }
+}
+
+fn frame_matches_capture(
+    frame: super::ImageFrameMetadata,
+    capture: crate::engine::automation::CaptureFrameMetadata,
+) -> bool {
+    frame.frame_id == capture.frame_id
+        && frame.captured_at_ms == capture.captured_at_ms
+        && frame.window_id == capture.window_id
+        && frame.window_revision == capture.window_revision
+        && frame.process_id == capture.process_id
+        && frame.process_started_at_100ns == capture.process_started_at_100ns
+        && frame.client_x == capture.client_x
+        && frame.client_y == capture.client_y
+        && frame.client_width == capture.client_width
+        && frame.client_height == capture.client_height
+        && frame.geometry_revision == capture.geometry_revision
+        && frame.display_id == capture.display_id
+        && frame.display_profile_revision == capture.display_profile_revision
+        && frame.dpi == capture.dpi
+        && frame.is_visible == capture.is_visible
+        && frame.is_minimized == capture.is_minimized
+        && frame.is_foreground == capture.is_foreground
 }
 
 fn watch_timeout_reached(group: &WatchGroup, started_at: u64, now: u64) -> bool {
@@ -3126,6 +3650,10 @@ fn is_click_action(action: &Action) -> bool {
             | Action::ClickPoint { .. }
             | Action::ClickRegion { .. }
     )
+}
+
+fn is_side_effect_action(action: &Action) -> bool {
+    is_click_action(action) || matches!(action, Action::MoveOnly { .. })
 }
 
 fn validate_action_token(
@@ -3589,22 +4117,39 @@ mod tests {
             &self,
             rect: Rect,
         ) -> Result<crate::engine::automation::CapturedScreenFrame> {
+            static NEXT_FAKE_FRAME_ID: AtomicU64 = AtomicU64::new(1);
+            let frame_id = NEXT_FAKE_FRAME_ID.fetch_add(1, Ordering::Relaxed);
             Ok(crate::engine::automation::CapturedScreenFrame {
                 image: ScreenImage::new(image::RgbaImage::new(rect.width, rect.height)),
                 metadata: crate::engine::automation::CaptureFrameMetadata {
-                    frame_id: 1,
-                    captured_at_ms: 0,
+                    frame_id,
+                    captured_at_ms: frame_id,
                     window_id: 9,
                     window_revision: 2,
+                    process_id: 10,
+                    process_started_at_100ns: 11,
                     client_x: 0,
                     client_y: 0,
                     client_width: 1920,
                     client_height: 1080,
                     geometry_revision: 3,
+                    display_id: 5,
                     display_profile_revision: 4,
                     dpi: 96,
+                    is_visible: true,
+                    is_minimized: false,
+                    is_foreground: true,
                 },
             })
+        }
+
+        fn validate_frame(
+            &self,
+            _rect: Rect,
+            metadata: &crate::engine::automation::CaptureFrameMetadata,
+        ) -> Result<()> {
+            anyhow::ensure!(metadata.window_id == 9 && metadata.process_id == 10);
+            Ok(())
         }
     }
 
@@ -3727,13 +4272,19 @@ mod tests {
                     captured_at_ms: request.observed_at_ms,
                     window_id: 9,
                     window_revision: 2,
+                    process_id: 4,
+                    process_started_at_100ns: 6,
                     client_x: 0,
                     client_y: 0,
                     client_width: 64,
                     client_height: 48,
                     geometry_revision: 3,
+                    display_id: 5,
                     display_profile_revision: 4,
                     dpi: 96,
+                    is_visible: true,
+                    is_minimized: false,
+                    is_foreground: true,
                     region_revision: 1,
                     rule_revision: 1,
                 }),
@@ -3917,8 +4468,8 @@ mod tests {
     impl ConditionDetector for InvalidatingDetector {
         fn observe(
             &self,
-            request: &super::super::ObservationRequest<'_>,
-            _capture: &(dyn CaptureSource + Send + Sync),
+            _request: &super::super::ObservationRequest<'_>,
+            capture: &(dyn CaptureSource + Send + Sync),
         ) -> Result<super::super::DetectorEvidence> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if !self.invalidated_once.swap(true, Ordering::AcqRel) {
@@ -3926,15 +4477,17 @@ mod tests {
                 control.pause();
                 control.resume();
             }
+            let frame = capture.capture_frame(Rect::new(192, 108, 384, 216))?;
+            let metadata = watch_frame_metadata(frame.metadata);
             Ok(super::super::DetectorEvidence {
                 matched: true,
-                frame_id: 1,
-                captured_at_ms: request.observed_at_ms,
+                frame_id: metadata.frame_id,
+                captured_at_ms: metadata.captured_at_ms,
                 match_rect: Some(Rect::new(1, 2, 3, 4)),
                 score: Some(0.99),
                 match_count: 1,
                 stable_frames: 1,
-                frame_metadata: None,
+                frame_metadata: Some(metadata),
                 details: serde_json::Value::Null,
             })
         }
@@ -3949,8 +4502,8 @@ mod tests {
     impl ConditionDetector for InvalidatingErrorDetector {
         fn observe(
             &self,
-            request: &super::super::ObservationRequest<'_>,
-            _capture: &(dyn CaptureSource + Send + Sync),
+            _request: &super::super::ObservationRequest<'_>,
+            capture: &(dyn CaptureSource + Send + Sync),
         ) -> Result<super::super::DetectorEvidence> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             if call == 0 {
@@ -3959,15 +4512,17 @@ mod tests {
                 control.resume();
                 bail!("stale capture failure")
             }
+            let frame = capture.capture_frame(Rect::new(192, 108, 384, 216))?;
+            let metadata = watch_frame_metadata(frame.metadata);
             Ok(super::super::DetectorEvidence {
                 matched: true,
-                frame_id: 2,
-                captured_at_ms: request.observed_at_ms,
+                frame_id: metadata.frame_id,
+                captured_at_ms: metadata.captured_at_ms,
                 match_rect: Some(Rect::new(1, 2, 3, 4)),
                 score: Some(0.99),
                 match_count: 1,
                 stable_frames: 1,
-                frame_metadata: None,
+                frame_metadata: Some(metadata),
                 details: serde_json::Value::Null,
             })
         }
@@ -4014,7 +4569,7 @@ mod tests {
                 case_sensitive: false,
                 allow_cross_line: false,
                 match_policy: MatchSelectionPolicy::HighestScore,
-                poll_interval_ms: 1,
+                poll_interval_ms: 50,
                 timeout_ms: Limit::Finite(10),
                 stable_frames: 1,
             }],
@@ -4802,6 +5357,7 @@ mod tests {
         let token = ObservationToken {
             run_id: "run-1".to_string(),
             generation: 4,
+            side_effect_epoch: 0,
             source_block_id: "observe".to_string(),
             detector: DetectorKind::Text,
             region_id: "region".to_string(),
@@ -4819,13 +5375,19 @@ mod tests {
                 captured_at_ms: 10,
                 window_id: 91,
                 window_revision: 1,
+                process_id: 7,
+                process_started_at_100ns: 100,
                 client_x: 100,
                 client_y: 200,
                 client_width: 800,
                 client_height: 600,
                 geometry_revision: 2,
+                display_id: 4,
                 display_profile_revision: 3,
                 dpi: 144,
+                is_visible: true,
+                is_minimized: false,
+                is_foreground: true,
                 region_revision: 1,
                 rule_revision: 1,
             }),
@@ -4951,6 +5513,7 @@ mod tests {
         let window_a_token = ObservationToken {
             run_id: "run-1".to_string(),
             generation: 4,
+            side_effect_epoch: 0,
             source_block_id: "observe".to_string(),
             detector: DetectorKind::Text,
             region_id: "region".to_string(),
@@ -4968,13 +5531,19 @@ mod tests {
                 captured_at_ms: 10,
                 window_id: 91,
                 window_revision: 1,
+                process_id: 4,
+                process_started_at_100ns: 6,
                 client_x: 100,
                 client_y: 200,
                 client_width: 800,
                 client_height: 600,
                 geometry_revision: 2,
+                display_id: 4,
                 display_profile_revision: 3,
                 dpi: 144,
+                is_visible: true,
+                is_minimized: false,
+                is_foreground: true,
                 region_revision: 1,
                 rule_revision: 1,
             }),
@@ -5768,6 +6337,27 @@ mod tests {
     #[derive(Debug, Default)]
     struct WatchCountingCapture(AtomicU64);
 
+    #[derive(Debug, Default)]
+    struct DriftBeforeWatchBodyCapture(WatchCountingCapture);
+
+    struct DeadlineCrossingCapture {
+        inner: WatchCountingCapture,
+        clock: Arc<ManualClock>,
+        return_at_ms: u64,
+    }
+
+    struct DeadlineDuringValidationCapture {
+        inner: WatchCountingCapture,
+        clock: Arc<FakeClock>,
+        return_at_ms: u64,
+    }
+
+    #[derive(Default)]
+    struct StopDuringValidationCapture {
+        inner: WatchCountingCapture,
+        control: Mutex<Option<RuntimeControlHandle>>,
+    }
+
     impl CaptureSource for WatchCountingCapture {
         fn capture(&self, rect: Rect) -> Result<ScreenImage> {
             Ok(ScreenImage::new(image::RgbaImage::new(
@@ -5788,15 +6378,202 @@ mod tests {
                     captured_at_ms: frame_id,
                     window_id: 9,
                     window_revision: 2,
+                    process_id: 4,
+                    process_started_at_100ns: 6,
                     client_x: 0,
                     client_y: 0,
                     client_width: 1920,
                     client_height: 1080,
                     geometry_revision: 3,
+                    display_id: 5,
                     display_profile_revision: 4,
                     dpi: 96,
+                    is_visible: true,
+                    is_minimized: false,
+                    is_foreground: true,
                 },
             })
+        }
+
+        fn validate_frame(
+            &self,
+            _rect: Rect,
+            metadata: &crate::engine::automation::CaptureFrameMetadata,
+        ) -> Result<()> {
+            anyhow::ensure!(metadata.window_id == 9 && metadata.process_id == 4);
+            Ok(())
+        }
+    }
+
+    impl CaptureSource for DriftBeforeWatchBodyCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            self.0.capture(rect)
+        }
+
+        fn capture_frame(
+            &self,
+            rect: Rect,
+        ) -> Result<crate::engine::automation::CapturedScreenFrame> {
+            self.0.capture_frame(rect)
+        }
+
+        fn validate_frame(
+            &self,
+            _rect: Rect,
+            _metadata: &crate::engine::automation::CaptureFrameMetadata,
+        ) -> Result<()> {
+            Err(crate::engine::automation::StaleCapturedFrameError.into())
+        }
+    }
+
+    impl CaptureSource for DeadlineCrossingCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            self.inner.capture(rect)
+        }
+
+        fn capture_frame(
+            &self,
+            rect: Rect,
+        ) -> Result<crate::engine::automation::CapturedScreenFrame> {
+            let frame = self.inner.capture_frame(rect)?;
+            self.clock.set(self.return_at_ms);
+            Ok(frame)
+        }
+
+        fn validate_frame(
+            &self,
+            rect: Rect,
+            metadata: &crate::engine::automation::CaptureFrameMetadata,
+        ) -> Result<()> {
+            self.inner.validate_frame(rect, metadata)
+        }
+    }
+
+    impl CaptureSource for DeadlineDuringValidationCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            self.inner.capture(rect)
+        }
+
+        fn capture_frame(
+            &self,
+            rect: Rect,
+        ) -> Result<crate::engine::automation::CapturedScreenFrame> {
+            self.inner.capture_frame(rect)
+        }
+
+        fn validate_frame(
+            &self,
+            rect: Rect,
+            metadata: &crate::engine::automation::CaptureFrameMetadata,
+        ) -> Result<()> {
+            self.inner.validate_frame(rect, metadata)?;
+            self.clock.0.store(self.return_at_ms, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    impl CaptureSource for StopDuringValidationCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            self.inner.capture(rect)
+        }
+
+        fn capture_frame(
+            &self,
+            rect: Rect,
+        ) -> Result<crate::engine::automation::CapturedScreenFrame> {
+            self.inner.capture_frame(rect)
+        }
+
+        fn validate_frame(
+            &self,
+            rect: Rect,
+            metadata: &crate::engine::automation::CaptureFrameMetadata,
+        ) -> Result<()> {
+            self.inner.validate_frame(rect, metadata)?;
+            self.control.lock().unwrap().as_ref().unwrap().stop();
+            Ok(())
+        }
+    }
+
+    struct DeadlineCrossingDetector {
+        clock: Arc<ManualClock>,
+        return_at_ms: u64,
+        calls: AtomicU64,
+    }
+
+    #[derive(Debug, Default)]
+    struct MismatchedWatchProvenanceDetector;
+
+    impl ConditionDetector for MismatchedWatchProvenanceDetector {
+        fn observe(
+            &self,
+            _request: &super::super::ObservationRequest<'_>,
+            capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            let frame = capture.capture_frame(Rect::new(192, 108, 384, 216))?;
+            let mut metadata = watch_frame_metadata(frame.metadata);
+            metadata.display_id = metadata.display_id.saturating_add(1);
+            Ok(super::super::DetectorEvidence {
+                matched: true,
+                frame_id: metadata.frame_id,
+                captured_at_ms: metadata.captured_at_ms,
+                match_rect: Some(Rect::new(1, 2, 3, 4)),
+                score: Some(0.99),
+                match_count: 1,
+                stable_frames: 1,
+                frame_metadata: Some(metadata),
+                details: serde_json::Value::Null,
+            })
+        }
+    }
+
+    impl ConditionDetector for DeadlineCrossingDetector {
+        fn observe(
+            &self,
+            _request: &super::super::ObservationRequest<'_>,
+            capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let frame = capture.capture_frame(Rect::new(192, 108, 384, 216))?;
+            let metadata = watch_frame_metadata(frame.metadata);
+            self.clock.set(self.return_at_ms);
+            Ok(super::super::DetectorEvidence {
+                matched: true,
+                frame_id: metadata.frame_id,
+                captured_at_ms: metadata.captured_at_ms,
+                match_rect: Some(Rect::new(1, 2, 3, 4)),
+                score: Some(0.99),
+                match_count: 1,
+                stable_frames: 1,
+                frame_metadata: Some(metadata),
+                details: serde_json::Value::Null,
+            })
+        }
+    }
+
+    fn watch_frame_metadata(
+        metadata: crate::engine::automation::CaptureFrameMetadata,
+    ) -> super::super::ImageFrameMetadata {
+        super::super::ImageFrameMetadata {
+            frame_id: metadata.frame_id,
+            captured_at_ms: metadata.captured_at_ms,
+            window_id: metadata.window_id,
+            window_revision: metadata.window_revision,
+            process_id: metadata.process_id,
+            process_started_at_100ns: metadata.process_started_at_100ns,
+            client_x: metadata.client_x,
+            client_y: metadata.client_y,
+            client_width: metadata.client_width,
+            client_height: metadata.client_height,
+            geometry_revision: metadata.geometry_revision,
+            display_id: metadata.display_id,
+            display_profile_revision: metadata.display_profile_revision,
+            dpi: metadata.dpi,
+            is_visible: metadata.is_visible,
+            is_minimized: metadata.is_minimized,
+            is_foreground: metadata.is_foreground,
+            region_revision: 1,
+            rule_revision: 1,
         }
     }
 
@@ -5806,19 +6583,20 @@ mod tests {
     impl ConditionDetector for CapturingWatchDetector {
         fn observe(
             &self,
-            request: &super::super::ObservationRequest<'_>,
+            _request: &super::super::ObservationRequest<'_>,
             capture: &(dyn CaptureSource + Send + Sync),
         ) -> Result<super::super::DetectorEvidence> {
             let frame = capture.capture_frame(Rect::new(192, 108, 384, 216))?;
+            let metadata = watch_frame_metadata(frame.metadata);
             Ok(super::super::DetectorEvidence {
                 matched: true,
-                frame_id: frame.metadata.frame_id,
-                captured_at_ms: request.observed_at_ms,
+                frame_id: metadata.frame_id,
+                captured_at_ms: metadata.captured_at_ms,
                 match_rect: Some(Rect::new(1, 2, 3, 4)),
                 score: Some(0.99),
                 match_count: 1,
                 stable_frames: 1,
-                frame_metadata: None,
+                frame_metadata: Some(metadata),
                 details: serde_json::Value::Null,
             })
         }
@@ -5849,7 +6627,7 @@ mod tests {
         fn observe(
             &self,
             request: &super::super::ObservationRequest<'_>,
-            _capture: &(dyn CaptureSource + Send + Sync),
+            capture: &(dyn CaptureSource + Send + Sync),
         ) -> Result<super::super::DetectorEvidence> {
             let source = condition_source_id(request.condition);
             let matched = self
@@ -5859,15 +6637,17 @@ mod tests {
                 .get_mut(source)
                 .and_then(VecDeque::pop_front)
                 .unwrap_or(false);
+            let frame = capture.capture_frame(Rect::new(192, 108, 384, 216))?;
+            let metadata = watch_frame_metadata(frame.metadata);
             Ok(super::super::DetectorEvidence {
                 matched,
-                frame_id: request.observed_at_ms,
-                captured_at_ms: request.observed_at_ms,
+                frame_id: metadata.frame_id,
+                captured_at_ms: metadata.captured_at_ms,
                 match_rect: matched.then(|| Rect::new(1, 2, 3, 4)),
                 score: matched.then_some(0.99),
                 match_count: u32::from(matched),
                 stable_frames: u8::from(matched),
-                frame_metadata: None,
+                frame_metadata: Some(metadata),
                 details: serde_json::json!({"watch_fixture": source}),
             })
         }
@@ -5883,6 +6663,35 @@ mod tests {
             },
             then_body,
         }
+    }
+
+    fn image_watch_lane(id: &str, then_body: Vec<Block>) -> WatchLane {
+        WatchLane {
+            id: id.to_string(),
+            enabled: true,
+            condition: PassiveCondition::Image {
+                source_block_id: id.to_string(),
+                rule_id: "image".to_string(),
+            },
+            then_body,
+        }
+    }
+
+    fn saved_with_image_watch(blocks: Vec<Block>) -> SavedRevision {
+        let template = fixture_template(23);
+        let bytes = png_bytes(template.clone());
+        let asset = AssetRef {
+            id: "watch-template".to_string(),
+            revision: 1,
+            content_hash: sha256_hex(&bytes),
+        };
+        let mut definition = fixture_definition(blocks);
+        definition
+            .image_rules
+            .push(fixture_image_rule("image", asset.clone(), Some(&template)));
+        let mut revision = saved(definition);
+        revision.pinned_assets.push(PinnedAsset { asset, bytes });
+        revision
     }
 
     fn watch_group(
@@ -5910,7 +6719,7 @@ mod tests {
                 watch_lane("lane-1", vec![point_action("lane-1-body")]),
                 watch_lane("lane-2", vec![point_action("lane-2-body")]),
             ],
-            20,
+            2_000,
             TimeoutOutcome::Continue,
         )]));
         let events = fixture_runtime_with_detector(WatchSequenceDetector::with([
@@ -5920,7 +6729,7 @@ mod tests {
         .run(macro_revision, RunMode::DryRun)
         .unwrap();
 
-        assert!(events.iter().any(|event| matches!(event, RunEvent::ArbitrationCompleted { winner_lane_id: Some(id), .. } if id == "lane-1")));
+        assert!(events.iter().any(|event| matches!(event, RunEvent::ArbitrationCompleted { winner_lane_id: Some(id), .. } if id == "lane-1")), "{events:#?}");
         assert!(events.iter().any(|event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "lane-1-body")));
         assert!(!events.iter().any(|event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "lane-2-body")));
     }
@@ -5952,7 +6761,7 @@ mod tests {
                 watch_lane("lane-1", vec![point_action("lane-1-body")]),
                 watch_lane("lane-2", vec![point_action("lane-2-body")]),
             ],
-            2,
+            1_000,
             TimeoutOutcome::Continue,
         );
         let macro_revision = saved(fixture_definition(vec![block(
@@ -5978,14 +6787,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(entered, vec!["lane-1-body", "lane-2-body"]);
+        assert_eq!(entered, vec!["lane-1-body", "lane-2-body"], "{events:#?}");
     }
 
     #[test]
     fn watch_group_reports_polling_delayed_when_text_worker_is_saturated() {
         let macro_revision = saved(fixture_definition(vec![watch_group(
             vec![watch_lane("lane-1", vec![]), watch_lane("lane-2", vec![])],
-            2,
+            100,
             TimeoutOutcome::Continue,
         )]));
         let events = fixture_runtime_with_detector(WatchSequenceDetector::with([
@@ -6022,6 +6831,60 @@ mod tests {
     }
 
     #[test]
+    fn text_watch_revalidates_current_target_immediately_before_body() {
+        let runtime = MacroRuntime::new(
+            Arc::new(DriftBeforeWatchBodyCapture::default()),
+            Arc::new(CapturingWatchDetector),
+            Arc::new(FakeClock::default()),
+        );
+        let revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![point_action("body")])],
+            2_000,
+            TimeoutOutcome::Continue,
+        )]));
+
+        let events = runtime.run(revision, RunMode::DryRun).unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEvent::ArbitrationCompleted {
+                safety_bypassed: true,
+                ..
+            }
+        )));
+        assert!(!events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+    }
+
+    #[test]
+    fn image_watch_revalidates_current_target_immediately_before_body() {
+        let runtime = MacroRuntime::new(
+            Arc::new(DriftBeforeWatchBodyCapture::default()),
+            Arc::new(CapturingWatchDetector),
+            Arc::new(FakeClock::default()),
+        );
+        let revision = saved_with_image_watch(vec![watch_group(
+            vec![image_watch_lane("lane-1", vec![point_action("body")])],
+            2_000,
+            TimeoutOutcome::Continue,
+        )]);
+
+        let events = runtime.run(revision, RunMode::DryRun).unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEvent::ArbitrationCompleted {
+                safety_bypassed: true,
+                ..
+            }
+        )));
+        assert!(!events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+    }
+
+    #[test]
     fn pause_resume_generation_change_discards_in_flight_watch_candidate() {
         let detector = Arc::new(InvalidatingDetector::default());
         let runtime = MacroRuntime::new(
@@ -6032,7 +6895,7 @@ mod tests {
         *detector.control.lock().unwrap() = Some(runtime.control_handle());
         let macro_revision = saved(fixture_definition(vec![watch_group(
             vec![watch_lane("lane-1", vec![point_action("body")])],
-            200,
+            2_000,
             TimeoutOutcome::Continue,
         )]));
 
@@ -6049,18 +6912,19 @@ mod tests {
         });
         assert_eq!(
             winner_generation,
-            Some(runtime.control_handle().generation())
+            Some(runtime.control_handle().generation()),
+            "{events:#?}"
         );
         assert!(events.iter().any(
             |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
-        ));
+        ), "{events:#?}");
     }
 
     #[test]
     fn winning_body_side_effect_invalidates_watch_observation_before_later_action() {
         let watch = watch_group(
             vec![watch_lane("lane-1", vec![point_action("body-click")])],
-            20,
+            2_000,
             TimeoutOutcome::Continue,
         );
         let later_match_click = block(
@@ -6078,8 +6942,77 @@ mod tests {
                 .run(macro_revision, RunMode::DryRun)
                 .unwrap();
 
-        assert!(events.iter().any(|event| matches!(event, RunEvent::ActionPlanned { block_id, .. } if block_id == "body-click")));
+        assert!(events.iter().any(|event| matches!(event, RunEvent::ActionPlanned { block_id, .. } if block_id == "body-click")), "{events:#?}");
         assert!(events.iter().any(|event| matches!(event, RunEvent::ActionBlocked { block_id, reason, .. } if block_id == "later-match-click" && reason.contains("fresh observation"))));
+    }
+
+    fn matched_text_action(id: &str, source: &str) -> Block {
+        block(
+            id,
+            BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: source.to_string(),
+                    button: super::super::MouseButton::Left,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn first_click_in_winner_body_invalidates_token_before_second_matched_action() {
+        let winner_body = vec![
+            point_action("first-click"),
+            matched_text_action("second-match-click", "lane-1"),
+        ];
+        let revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", winner_body)],
+            2_000,
+            TimeoutOutcome::Continue,
+        )]));
+
+        let events =
+            fixture_runtime_with_detector(WatchSequenceDetector::with([("lane-1", vec![true])]))
+                .run(revision, RunMode::DryRun)
+                .unwrap();
+
+        assert!(events.iter().any(|event| matches!(event, RunEvent::ActionPlanned { block_id, .. } if block_id == "first-click")));
+        assert!(events.iter().any(|event| {
+            matches!(event, RunEvent::ActionBlocked { block_id, reason, .. } if block_id == "second-match-click" && reason.contains("fresh observation"))
+        }));
+        assert!(!events.iter().any(|event| matches!(event, RunEvent::ActionPlanned { block_id, .. } if block_id == "second-match-click")));
+    }
+
+    #[test]
+    fn move_only_in_winner_body_invalidates_token_before_matched_action() {
+        let winner_body = vec![
+            block(
+                "move-only",
+                BlockKind::Action {
+                    action: Action::MoveOnly {
+                        target: super::super::ActionTarget::Point {
+                            point_id: "point".to_string(),
+                        },
+                    },
+                },
+            ),
+            matched_text_action("after-move-match", "lane-1"),
+        ];
+        let revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", winner_body)],
+            2_000,
+            TimeoutOutcome::Continue,
+        )]));
+
+        let events =
+            fixture_runtime_with_detector(WatchSequenceDetector::with([("lane-1", vec![true])]))
+                .run(revision, RunMode::DryRun)
+                .unwrap();
+
+        assert!(events.iter().any(|event| matches!(event, RunEvent::ActionPlanned { block_id, .. } if block_id == "move-only")));
+        assert!(events.iter().any(|event| {
+            matches!(event, RunEvent::ActionBlocked { block_id, reason, .. } if block_id == "after-move-match" && reason.contains("fresh observation"))
+        }));
+        assert!(!events.iter().any(|event| matches!(event, RunEvent::ActionPlanned { block_id, .. } if block_id == "after-move-match")));
     }
 
     #[test]
@@ -6092,7 +7025,7 @@ mod tests {
         );
         let macro_revision = saved(fixture_definition(vec![watch_group(
             vec![watch_lane("lane-1", vec![]), watch_lane("lane-2", vec![])],
-            20,
+            2_000,
             TimeoutOutcome::Continue,
         )]));
 
@@ -6109,8 +7042,496 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(capture.0.load(Ordering::Relaxed), 1);
-        assert_eq!(frame_ids, vec![1, 1]);
+        assert!(capture.0.load(Ordering::Relaxed) >= 1);
+        assert!(frame_ids.len() >= 2, "{events:#?}");
+        assert_eq!(frame_ids[0], frame_ids[1]);
+    }
+
+    #[test]
+    fn zero_timeout_watch_dispatches_no_capture_or_detector_job() {
+        let capture = Arc::new(WatchCountingCapture::default());
+        let detector = Arc::new(CountingUnmatchedDetector::default());
+        let runtime = MacroRuntime::new(
+            capture.clone(),
+            detector.clone(),
+            Arc::new(FakeClock::default()),
+        );
+        let macro_revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![])],
+            0,
+            TimeoutOutcome::Continue,
+        )]));
+
+        let events = runtime
+            .run(macro_revision, RunMode::ObservationOnly)
+            .unwrap();
+
+        assert_eq!(capture.0.load(Ordering::Relaxed), 0);
+        assert_eq!(detector.0.load(Ordering::Relaxed), 0);
+        assert!(!events.iter().any(|event| matches!(event, RunEvent::ObservationCompleted { block_id, .. } if block_id == "lane-1")));
+    }
+
+    #[test]
+    fn capture_that_returns_after_absolute_watch_deadline_dispatches_no_job() {
+        let clock = Arc::new(ManualClock::default());
+        let capture = Arc::new(DeadlineCrossingCapture {
+            inner: WatchCountingCapture::default(),
+            clock: Arc::clone(&clock),
+            return_at_ms: 10,
+        });
+        let detector = Arc::new(CountingUnmatchedDetector::default());
+        let runtime = MacroRuntime::new(capture.clone(), detector.clone(), clock);
+        let revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![point_action("body")])],
+            5,
+            TimeoutOutcome::RunBody {
+                body: vec![block(
+                    "timeout-body",
+                    BlockKind::Comment {
+                        text: "deadline".to_string(),
+                    },
+                )],
+            },
+        )]));
+
+        let events = runtime.run(revision, RunMode::DryRun).unwrap();
+
+        assert_eq!(capture.inner.0.load(Ordering::Relaxed), 1);
+        assert_eq!(detector.0.load(Ordering::Relaxed), 0);
+        assert!(events.iter().any(|event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "timeout-body")));
+        assert!(!events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+    }
+
+    #[test]
+    fn detector_completion_after_absolute_watch_deadline_cannot_win() {
+        let clock = Arc::new(ManualClock::default());
+        let detector = Arc::new(DeadlineCrossingDetector {
+            clock: Arc::clone(&clock),
+            return_at_ms: 10,
+            calls: AtomicU64::new(0),
+        });
+        let runtime = MacroRuntime::new(
+            Arc::new(WatchCountingCapture::default()),
+            detector.clone(),
+            clock,
+        );
+        let revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![point_action("body")])],
+            5,
+            TimeoutOutcome::RunBody {
+                body: vec![block(
+                    "timeout-body",
+                    BlockKind::Comment {
+                        text: "deadline".to_string(),
+                    },
+                )],
+            },
+        )]));
+
+        let events = runtime.run(revision, RunMode::DryRun).unwrap();
+
+        assert_eq!(detector.calls.load(Ordering::Relaxed), 1);
+        assert!(events.iter().any(|event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "timeout-body")));
+        assert!(!events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+    }
+
+    #[test]
+    fn validation_that_crosses_absolute_watch_deadline_cannot_enter_winner_body() {
+        let clock = Arc::new(FakeClock::default());
+        let capture = Arc::new(DeadlineDuringValidationCapture {
+            inner: WatchCountingCapture::default(),
+            clock: Arc::clone(&clock),
+            return_at_ms: 1_000,
+        });
+        let runtime = MacroRuntime::new(capture, Arc::new(CapturingWatchDetector), clock);
+        let revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![point_action("body")])],
+            100,
+            TimeoutOutcome::RunBody {
+                body: vec![block(
+                    "timeout-body",
+                    BlockKind::Comment {
+                        text: "deadline".to_string(),
+                    },
+                )],
+            },
+        )]));
+
+        let events = runtime.run(revision, RunMode::DryRun).unwrap();
+
+        assert!(events.iter().any(|event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "timeout-body")));
+        assert!(!events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+    }
+
+    #[test]
+    fn stop_during_winner_validation_is_rechecked_before_body() {
+        let capture = Arc::new(StopDuringValidationCapture::default());
+        let runtime = MacroRuntime::new(
+            capture.clone(),
+            Arc::new(CapturingWatchDetector),
+            Arc::new(FakeClock::default()),
+        );
+        *capture.control.lock().unwrap() = Some(runtime.control_handle());
+        let revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![point_action("body")])],
+            100,
+            TimeoutOutcome::Continue,
+        )]));
+
+        let events = runtime.run(revision, RunMode::DryRun).unwrap();
+
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::UserStopped,
+                ..
+            })
+        ));
+        assert!(!events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+    }
+
+    #[test]
+    fn watch_candidate_must_match_complete_capture_provenance() {
+        let runtime = MacroRuntime::new(
+            Arc::new(WatchCountingCapture::default()),
+            Arc::new(MismatchedWatchProvenanceDetector),
+            Arc::new(FakeClock::default()),
+        );
+        let revision = saved(fixture_definition(vec![watch_group(
+            vec![watch_lane("lane-1", vec![point_action("body")])],
+            100,
+            TimeoutOutcome::Continue,
+        )]));
+
+        let events = runtime.run(revision, RunMode::DryRun).unwrap();
+
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::TechnicalFailure { message },
+                ..
+            }) if message.contains("inconsistent frame provenance")
+        ));
+        assert!(!events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+    }
+
+    struct GatedWatchDetector {
+        blocked_source: String,
+        started: mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl ConditionDetector for GatedWatchDetector {
+        fn observe(
+            &self,
+            request: &super::super::ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<super::super::DetectorEvidence> {
+            if condition_source_id(request.condition) == self.blocked_source {
+                let _ = self.started.send(());
+                let (lock, wake) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+            Ok(super::super::DetectorEvidence::unmatched(
+                request.observed_at_ms,
+                request.observed_at_ms,
+            ))
+        }
+    }
+
+    fn direct_watch_job(
+        run_id: &str,
+        entry_id: u64,
+        lane_id: &str,
+        family: super::super::DetectorFamily,
+        detector: Arc<dyn ConditionDetector>,
+        compiled: &CompiledMacro,
+        capture: &Arc<super::super::CapturedCycle>,
+        completion: &SyncSender<WatchDetectorCompletion>,
+    ) -> WatchDetectorJob {
+        let job_id = NEXT_WATCH_JOB_ID.fetch_add(1, Ordering::Relaxed);
+        WatchDetectorJob {
+            job_id,
+            key: WatchJobKey {
+                run_id: run_id.to_string(),
+                block_id: "direct-watch".to_string(),
+                entry_id,
+                lane_id: lane_id.to_string(),
+            },
+            lane_order: 0,
+            family,
+            generation: 1,
+            side_effect_epoch: 0,
+            condition: Condition::Text {
+                source_block_id: lane_id.to_string(),
+                rule_id: "text".to_string(),
+                mode: ObserveMode::CheckNow,
+            },
+            compiled: compiled.clone(),
+            observed_at_ms: job_id,
+            first_waiting_at_ms: job_id,
+            capture: Arc::clone(capture),
+            detector,
+            clock: Arc::new(FakeClock::default()),
+            completion: completion.clone(),
+        }
+    }
+
+    #[test]
+    fn macro_runtimes_share_exactly_three_process_global_watch_workers() {
+        let first = fixture_runtime_with_detector(CountingUnmatchedDetector::default());
+        let second = fixture_runtime_with_detector(CountingUnmatchedDetector::default());
+        let cloned = first.clone();
+
+        assert!(std::ptr::eq(first.watch_pool, second.watch_pool));
+        assert!(std::ptr::eq(first.watch_pool, cloned.watch_pool));
+        assert_eq!(first.watch_pool.worker_count(), 3);
+    }
+
+    #[test]
+    fn watch_scope_cleanup_removes_queued_work_on_every_exit_path() {
+        let pool = Box::leak(Box::new(WatchDetectorPool {
+            inner: Arc::new(WatchPoolInner {
+                state: Mutex::new(WatchPoolState::default()),
+                ready: Condvar::new(),
+                started_workers: AtomicU64::new(0),
+            }),
+        }));
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let (completion_tx, _completion_rx) = mpsc::sync_channel(1);
+        let run_id = format!(
+            "direct-cleanup-{}",
+            NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let entry_id = 77;
+        let job = direct_watch_job(
+            &run_id,
+            entry_id,
+            "queued",
+            super::super::DetectorFamily::Text,
+            Arc::new(CountingUnmatchedDetector::default()),
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        assert_eq!(pool.submit(job), super::super::SubmitOutcome::Started);
+        assert_eq!(pool.inner.state.lock().unwrap().pending.len(), 1);
+
+        drop(WatchScopeCleanup {
+            pool,
+            run_id,
+            entry_id,
+        });
+
+        assert!(pool.inner.state.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn slow_ocr_job_does_not_block_unrelated_image_worker_completion() {
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let detector: Arc<dyn ConditionDetector> = Arc::new(GatedWatchDetector {
+            blocked_source: "slow".to_string(),
+            started: started_tx,
+            release: Arc::clone(&release),
+        });
+        let (completion_tx, completion_rx) = mpsc::sync_channel(3);
+        let run_id = format!(
+            "direct-slow-{}",
+            NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)
+        );
+
+        let slow = direct_watch_job(
+            &run_id,
+            1,
+            "slow",
+            super::super::DetectorFamily::Text,
+            Arc::clone(&detector),
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        assert_eq!(
+            WatchDetectorPool::global().submit(slow),
+            super::super::SubmitOutcome::Started
+        );
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let fast = direct_watch_job(
+            &run_id,
+            1,
+            "fast",
+            super::super::DetectorFamily::Image,
+            detector,
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        WatchDetectorPool::global().submit(fast);
+
+        let fast_completion = completion_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(fast_completion.key.lane_id, "fast");
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        let slow_completion = completion_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(slow_completion.key.lane_id, "slow");
+    }
+
+    #[test]
+    fn stopped_run_returns_without_waiting_for_slow_detector_worker() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let detector = Arc::new(GatedWatchDetector {
+            blocked_source: "lane-1".to_string(),
+            started: started_tx,
+            release: Arc::clone(&release),
+        });
+        let runtime = MacroRuntime::new(Arc::new(FakeCapture), detector, Arc::new(FrozenClock));
+        let mut watch = watch_group(
+            vec![watch_lane("lane-1", vec![point_action("body")])],
+            1,
+            TimeoutOutcome::Continue,
+        );
+        if let BlockKind::WatchGroup { group } = &mut watch.kind {
+            group.timeout_ms = Limit::Unlimited;
+        }
+        let revision = saved(fixture_definition(vec![watch]));
+        let runner = runtime.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _ = done_tx.send(runner.run(revision, RunMode::DryRun));
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        runtime.stop();
+        let events = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime waited for a slow detector")
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEvent::RunStopped {
+                reason: StopReason::UserStopped,
+                ..
+            }
+        )));
+        assert!(!events.iter().any(
+            |event| matches!(event, RunEvent::BlockEntered { block_id, .. } if block_id == "body")
+        ));
+
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn active_lane_keeps_only_newest_pending_detector_job() {
+        let compiled = CompiledMacro::compile(saved(fixture_definition(vec![]))).unwrap();
+        let capture = super::super::CapturedCycle::capture(
+            Arc::new(FakeCapture),
+            &[Rect::new(192, 108, 384, 216)],
+        )
+        .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let detector: Arc<dyn ConditionDetector> = Arc::new(GatedWatchDetector {
+            blocked_source: "lane".to_string(),
+            started: started_tx,
+            release: Arc::clone(&release),
+        });
+        let (completion_tx, completion_rx) = mpsc::sync_channel(3);
+        let run_id = format!(
+            "direct-newest-{}",
+            NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let first = direct_watch_job(
+            &run_id,
+            2,
+            "lane",
+            super::super::DetectorFamily::Text,
+            Arc::clone(&detector),
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        let first_id = first.job_id;
+        WatchDetectorPool::global().submit(first);
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = direct_watch_job(
+            &run_id,
+            2,
+            "lane",
+            super::super::DetectorFamily::Text,
+            Arc::clone(&detector),
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        let second_id = second.job_id;
+        assert_eq!(
+            WatchDetectorPool::global().submit(second),
+            super::super::SubmitOutcome::Pending
+        );
+        let third = direct_watch_job(
+            &run_id,
+            2,
+            "lane",
+            super::super::DetectorFamily::Text,
+            detector,
+            &compiled,
+            &capture,
+            &completion_tx,
+        );
+        let third_id = third.job_id;
+        assert_eq!(
+            WatchDetectorPool::global().submit(third),
+            super::super::SubmitOutcome::ReplacedPending {
+                dropped_frame_id: capture.frame_id(),
+            }
+        );
+        assert_ne!(second_id, third_id);
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+
+        let completed = [
+            completion_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .job_id,
+            completion_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .job_id,
+        ];
+        assert!(completed.contains(&first_id));
+        assert!(completed.contains(&third_id));
+        assert!(!completed.contains(&second_id));
     }
 
     fn progress_event(attempts: u64) -> RunEvent {

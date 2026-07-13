@@ -33,20 +33,13 @@ pub enum SafetyBypass {
     TargetInvalidated,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CandidateEvent {
-    pub run_id: String,
-    pub generation: u64,
     pub lane_id: String,
     pub lane_order: usize,
     pub ready_at_ms: u64,
-    pub frame_id: u64,
-    pub source_block_id: String,
-    pub detector: super::DetectorKind,
-    pub rule_id: String,
-    pub rule_revision: u64,
-    pub region_id: String,
-    pub region_revision: u64,
+    pub completed_at_ms: u64,
+    pub token: ObservationToken,
 }
 
 impl CandidateEvent {
@@ -60,18 +53,29 @@ impl CandidateEvent {
     ) -> Self {
         let lane_id = lane_id.into();
         Self {
-            run_id: run_id.into(),
-            generation,
-            source_block_id: lane_id.clone(),
+            token: ObservationToken {
+                run_id: run_id.into(),
+                generation,
+                side_effect_epoch: 0,
+                source_block_id: lane_id.clone(),
+                detector: super::DetectorKind::Text,
+                region_id: "test-region".to_string(),
+                region_revision: 0,
+                rule_id: "test-rule".to_string(),
+                rule_revision: 0,
+                frame_id,
+                captured_at_ms: ready_at_ms,
+                match_rect: None,
+                score: None,
+                match_count: 1,
+                stable_frames: 1,
+                frame_metadata: None,
+                evidence: serde_json::Value::Null,
+            },
             lane_id,
             lane_order,
             ready_at_ms,
-            frame_id,
-            detector: super::DetectorKind::Text,
-            rule_id: "test-rule".to_string(),
-            rule_revision: 0,
-            region_id: "test-region".to_string(),
-            region_revision: 0,
+            completed_at_ms: ready_at_ms,
         }
     }
 
@@ -82,31 +86,16 @@ impl CandidateEvent {
         token: &ObservationToken,
     ) -> Self {
         Self {
-            run_id: token.run_id.clone(),
-            generation: token.generation,
             lane_id: lane_id.into(),
             lane_order,
             ready_at_ms,
-            frame_id: token.frame_id,
-            source_block_id: token.source_block_id.clone(),
-            detector: token.detector,
-            rule_id: token.rule_id.clone(),
-            rule_revision: token.rule_revision,
-            region_id: token.region_id.clone(),
-            region_revision: token.region_revision,
+            completed_at_ms: ready_at_ms,
+            token: token.clone(),
         }
     }
 
     pub fn matches_observation(&self, token: &ObservationToken) -> bool {
-        token.run_id == self.run_id
-            && token.generation == self.generation
-            && token.source_block_id == self.source_block_id
-            && token.detector == self.detector
-            && token.rule_id == self.rule_id
-            && token.rule_revision == self.rule_revision
-            && token.region_id == self.region_id
-            && token.region_revision == self.region_revision
-            && token.frame_id == self.frame_id
+        token == &self.token
     }
 
     #[cfg(test)]
@@ -129,7 +118,7 @@ impl CandidateEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArbitrationResult {
     pub winner: Option<CandidateEvent>,
     pub discarded_lane_ids: Vec<String>,
@@ -266,7 +255,7 @@ impl WatchGroupRunner {
             .latches
             .entry(candidate.lane_id.clone())
             .or_default()
-            .observe(true, candidate.frame_id);
+            .observe(true, candidate.token.frame_id);
         if !matches!(decision, LatchDecision::Qualified) {
             return Err("lane is latched or candidate frame is stale");
         }
@@ -282,7 +271,7 @@ impl WatchGroupRunner {
         if !self
             .latches
             .get(&candidate.lane_id)
-            .is_some_and(|latch| latch.qualified_at(candidate.frame_id))
+            .is_some_and(|latch| latch.qualified_at(candidate.token.frame_id))
         {
             return Err("candidate was not qualified by the current frame");
         }
@@ -291,7 +280,7 @@ impl WatchGroupRunner {
     }
 
     fn validate_candidate(&self, candidate: &CandidateEvent) -> Result<(), &'static str> {
-        if candidate.run_id != self.run_id || candidate.generation != self.generation {
+        if candidate.token.run_id != self.run_id || candidate.token.generation != self.generation {
             return Err("candidate is stale for the current run generation");
         }
         if self.body_running {
@@ -427,6 +416,99 @@ struct SharedCapture {
     frame: CapturedScreenFrame,
 }
 
+/// One immutable capture batch shared by every asynchronous detector job from a poll.
+#[derive(Clone)]
+pub struct CapturedCycle {
+    source: Arc<dyn CaptureSource + Send + Sync>,
+    shared: Arc<SharedCapture>,
+}
+
+impl CapturedCycle {
+    pub fn capture(
+        source: Arc<dyn CaptureSource + Send + Sync>,
+        regions: &[Rect],
+    ) -> Result<Arc<Self>> {
+        ensure!(
+            !regions.is_empty(),
+            "capture cycle requires at least one region"
+        );
+        let rect = regions.iter().copied().try_fold(regions[0], union_rect)?;
+        let frame = source.capture_frame(rect)?;
+        ensure!(
+            frame.image.rgba.width() == rect.width && frame.image.rgba.height() == rect.height,
+            "capture source returned pixels with unexpected dimensions"
+        );
+        Ok(Arc::new(Self {
+            source,
+            shared: Arc::new(SharedCapture { rect, frame }),
+        }))
+    }
+
+    pub fn frame_id(&self) -> u64 {
+        self.shared.frame.metadata.frame_id
+    }
+
+    pub fn metadata(&self) -> crate::engine::automation::CaptureFrameMetadata {
+        self.shared.frame.metadata
+    }
+
+    pub fn validate_fresh(&self) -> Result<()> {
+        self.source
+            .validate_frame(self.shared.rect, &self.shared.frame.metadata)
+    }
+
+    fn crop(&self, rect: Rect) -> Result<Option<CapturedScreenFrame>> {
+        if !contains_rect(self.shared.rect, rect) {
+            return Ok(None);
+        }
+        let offset_x = u32::try_from(i64::from(rect.x) - i64::from(self.shared.rect.x))
+            .context("capture crop x offset is negative")?;
+        let offset_y = u32::try_from(i64::from(rect.y) - i64::from(self.shared.rect.y))
+            .context("capture crop y offset is negative")?;
+        let rgba = imageops::crop_imm(
+            &self.shared.frame.image.rgba,
+            offset_x,
+            offset_y,
+            rect.width,
+            rect.height,
+        )
+        .to_image();
+        Ok(Some(CapturedScreenFrame {
+            image: ScreenImage::new(rgba),
+            metadata: self.shared.frame.metadata,
+        }))
+    }
+}
+
+impl CaptureSource for CapturedCycle {
+    fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+        self.crop(rect)?
+            .map(|frame| frame.image)
+            .context("detector requested pixels outside the immutable capture cycle")
+    }
+
+    fn capture_frame(&self, rect: Rect) -> Result<CapturedScreenFrame> {
+        self.crop(rect)?
+            .context("detector requested a frame outside the immutable capture cycle")
+    }
+
+    fn validate_frame(
+        &self,
+        rect: Rect,
+        metadata: &crate::engine::automation::CaptureFrameMetadata,
+    ) -> Result<()> {
+        ensure!(
+            contains_rect(self.shared.rect, rect),
+            "validation region is outside capture cycle"
+        );
+        ensure!(
+            metadata == &self.shared.frame.metadata,
+            "capture metadata changed"
+        );
+        self.validate_fresh()
+    }
+}
+
 /// Run-owned capture cache. `begin_cycle` captures the union of compatible lane regions once;
 /// every detector receives an immutable crop carrying the same frame identity.
 pub struct CaptureCoordinator {
@@ -443,22 +525,13 @@ impl CaptureCoordinator {
     }
 
     pub fn begin_cycle(&self, regions: &[Rect]) -> Result<()> {
-        ensure!(
-            !regions.is_empty(),
-            "capture cycle requires at least one region"
-        );
-        let combined = regions.iter().copied().try_fold(regions[0], union_rect)?;
-        let frame = self.source.capture_frame(combined)?;
-        ensure!(
-            frame.image.rgba.width() == combined.width
-                && frame.image.rgba.height() == combined.height,
-            "capture source returned pixels with unexpected dimensions"
-        );
-        *self.shared.lock().expect("capture coordinator poisoned") = Some(SharedCapture {
-            rect: combined,
-            frame,
-        });
+        let cycle = CapturedCycle::capture(Arc::clone(&self.source), regions)?;
+        *self.shared.lock().expect("capture coordinator poisoned") = Some((*cycle.shared).clone());
         Ok(())
+    }
+
+    pub fn captured_cycle(&self, regions: &[Rect]) -> Result<Arc<CapturedCycle>> {
+        CapturedCycle::capture(Arc::clone(&self.source), regions)
     }
 
     pub fn invalidate(&self) {
@@ -637,13 +710,19 @@ mod tests {
                     captured_at_ms: 100,
                     window_id: 4,
                     window_revision: 2,
+                    process_id: 4,
+                    process_started_at_100ns: 6,
                     client_x: 0,
                     client_y: 0,
                     client_width: 100,
                     client_height: 100,
                     geometry_revision: 3,
+                    display_id: 5,
                     display_profile_revision: 4,
                     dpi: 96,
+                    is_visible: true,
+                    is_minimized: false,
+                    is_foreground: true,
                 },
             })
         }
@@ -906,10 +985,11 @@ mod tests {
     }
 
     #[test]
-    fn candidate_binding_rejects_different_source_rule_region_or_frame() {
+    fn candidate_binding_uses_the_complete_immutable_observation_token() {
         let token = ObservationToken {
             run_id: "run-1".to_string(),
             generation: 4,
+            side_effect_epoch: 0,
             source_block_id: "lane-1".to_string(),
             detector: crate::engine::macro_engine::DetectorKind::Text,
             region_id: "region".to_string(),
@@ -922,8 +1002,28 @@ mod tests {
             score: Some(1.0),
             match_count: 1,
             stable_frames: 1,
-            frame_metadata: None,
-            evidence: serde_json::Value::Null,
+            frame_metadata: Some(crate::engine::macro_engine::ImageFrameMetadata {
+                frame_id: 7,
+                captured_at_ms: 100,
+                window_id: 9,
+                window_revision: 10,
+                process_id: 11,
+                process_started_at_100ns: 12,
+                client_x: 13,
+                client_y: 14,
+                client_width: 800,
+                client_height: 600,
+                geometry_revision: 15,
+                display_id: 17,
+                display_profile_revision: 16,
+                dpi: 144,
+                is_visible: true,
+                is_minimized: false,
+                is_foreground: true,
+                region_revision: 2,
+                rule_revision: 3,
+            }),
+            evidence: serde_json::json!({"word": "ready"}),
         };
         let candidate = CandidateEvent::from_observation("lane-1", 0, 105, &token);
         assert!(candidate.matches_observation(&token));
@@ -932,6 +1032,25 @@ mod tests {
         assert!(!candidate.matches_observation(&stale));
         stale = token.clone();
         stale.rule_revision = 4;
+        assert!(!candidate.matches_observation(&stale));
+        stale = token.clone();
+        stale.side_effect_epoch = 1;
+        assert!(!candidate.matches_observation(&stale));
+        stale = token.clone();
+        stale.captured_at_ms = 101;
+        assert!(!candidate.matches_observation(&stale));
+        stale = token.clone();
+        stale.score = Some(0.99);
+        assert!(!candidate.matches_observation(&stale));
+        stale = token.clone();
+        stale
+            .frame_metadata
+            .as_mut()
+            .unwrap()
+            .process_started_at_100ns += 1;
+        assert!(!candidate.matches_observation(&stale));
+        stale = token.clone();
+        stale.evidence = serde_json::json!({"word": "changed"});
         assert!(!candidate.matches_observation(&stale));
     }
 }

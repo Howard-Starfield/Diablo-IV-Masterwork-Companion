@@ -1316,6 +1316,7 @@ mod tests {
             client_rect: Rect::new(1_208, -269, 1_008, 729),
             dpi: 144,
             display: DisplayProfileInputs {
+                display_id: 11,
                 monitor_rect: Rect::new(0, -1_080, 1_920, 1_080),
                 work_rect: Rect::new(0, -1_080, 1_920, 1_040),
                 flags: 1,
@@ -1422,6 +1423,7 @@ mod tests {
             client_rect: Rect::new(0, 0, 800, 600),
             dpi: 96,
             display: DisplayProfileInputs {
+                display_id: 11,
                 monitor_rect: Rect::new(0, 0, 1_920, 1_080),
                 work_rect: Rect::new(0, 0, 1_920, 1_040),
                 flags: 1,

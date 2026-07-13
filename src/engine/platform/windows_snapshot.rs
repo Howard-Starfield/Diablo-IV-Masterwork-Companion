@@ -78,6 +78,7 @@ impl CanonicalWindowIdentity {
 /// The complete, typed Win32 monitor profile used by both target and frame revisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DisplayProfileInputs {
+    pub(crate) display_id: u64,
     pub(crate) monitor_rect: Rect,
     pub(crate) work_rect: Rect,
     pub(crate) flags: u32,
@@ -86,7 +87,8 @@ pub(crate) struct DisplayProfileInputs {
 impl DisplayProfileInputs {
     fn label(self) -> String {
         format!(
-            "monitor=({},{}..{},{});work=({},{}..{},{});flags={}",
+            "id={};monitor=({},{}..{},{});work=({},{}..{},{});flags={}",
+            self.display_id,
             self.monitor_rect.x,
             self.monitor_rect.y,
             i64::from(self.monitor_rect.x) + i64::from(self.monitor_rect.width),
@@ -101,6 +103,7 @@ impl DisplayProfileInputs {
 
     fn revision(self) -> u64 {
         stable_revision(&(
+            self.display_id,
             self.monitor_rect.x,
             self.monitor_rect.y,
             self.monitor_rect.width,
@@ -175,9 +178,12 @@ impl CanonicalWindowsSnapshot {
             process_started_at_100ns: self.process_started_at_100ns,
             client_rect: self.client_rect,
             geometry_revision: self.geometry_revision(),
-            display_id: self.display.label(),
+            display_id: self.display.display_id,
             display_profile_revision: self.display.revision(),
             dpi: self.dpi,
+            is_visible: self.is_visible,
+            is_minimized: self.is_minimized,
+            is_foreground: self.is_foreground,
         }
     }
 }
@@ -302,6 +308,7 @@ fn display_profile_inputs(hwnd: HWND) -> Result<DisplayProfileInputs> {
         "failed to query target monitor profile"
     );
     Ok(DisplayProfileInputs {
+        display_id: monitor.0 as usize as u64,
         monitor_rect: rect_from_edges(info.rcMonitor)?,
         work_rect: rect_from_edges(info.rcWork)?,
         flags: info.dwFlags,
@@ -359,6 +366,7 @@ mod tests {
             client_rect: Rect::new(1_208, -269, 1_008, 729),
             dpi: 144,
             display: DisplayProfileInputs {
+                display_id: 11,
                 monitor_rect: Rect::new(0, -1_080, 1_920, 1_080),
                 work_rect: Rect::new(0, -1_080, 1_920, 1_040),
                 flags: 1,
@@ -402,7 +410,8 @@ mod tests {
         assert_eq!(atomic.client_rect, target.client_rect);
         assert_eq!(atomic.geometry_revision, target.geometry_revision);
         assert_eq!(atomic.dpi, target.dpi);
-        assert_eq!(atomic.display_id, target.display_profile);
+        assert_eq!(atomic.display_id, snapshot.display.display_id);
+        assert_eq!(target.display_profile, snapshot.display.label());
         assert_eq!(
             atomic.display_profile_revision,
             target.display_profile_revision

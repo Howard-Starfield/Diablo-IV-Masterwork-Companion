@@ -118,6 +118,8 @@ impl DetectorEvidence {
 pub struct ObservationToken {
     pub run_id: String,
     pub generation: u64,
+    #[serde(default)]
+    pub side_effect_epoch: u64,
     pub source_block_id: String,
     pub detector: DetectorKind,
     pub region_id: String,
@@ -144,6 +146,7 @@ impl ObservationToken {
 pub struct ObservationRequest<'a> {
     pub run_id: &'a str,
     pub generation: u64,
+    pub side_effect_epoch: u64,
     pub condition: &'a Condition,
     pub compiled: &'a CompiledMacro,
     pub observed_at_ms: u64,
@@ -159,6 +162,9 @@ pub trait ConditionDetector: Send + Sync {
     /// Releases detector state owned by every generation actually observed by one completed run.
     /// Implementations must not affect other runs or generations absent from this slice.
     fn run_finished(&self, _run_id: &str, _generations: &[u64]) {}
+
+    /// Invalidates detector-owned temporal evidence immediately after an action boundary.
+    fn side_effect_boundary(&self, _run_id: &str, _generation: u64, _next_epoch: u64) {}
 }
 
 #[derive(Debug, Default)]
@@ -211,13 +217,19 @@ mod tests {
             captured_at_ms: 120,
             window_id: 9,
             window_revision: 2,
+            process_id: 10,
+            process_started_at_100ns: 11,
             client_x: 0,
             client_y: 0,
             client_width: 64,
             client_height: 48,
             geometry_revision: 3,
+            display_id: 5,
             display_profile_revision: 4,
             dpi: 96,
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
             region_revision: 5,
             rule_revision: 6,
         };

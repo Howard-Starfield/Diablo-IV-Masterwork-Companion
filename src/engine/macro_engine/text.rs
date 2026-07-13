@@ -665,6 +665,7 @@ impl PositionedTextRecognizer for WindowsTextRecognizer {
 struct StabilityKey {
     run_id: String,
     generation: u64,
+    side_effect_epoch: u64,
     source_block_id: String,
     rule_id: String,
     rule_revision: u64,
@@ -731,13 +732,19 @@ impl TextDetector {
             captured_at_ms: captured.metadata.captured_at_ms,
             window_id: captured.metadata.window_id,
             window_revision: captured.metadata.window_revision,
+            process_id: captured.metadata.process_id,
+            process_started_at_100ns: captured.metadata.process_started_at_100ns,
             client_x: captured.metadata.client_x,
             client_y: captured.metadata.client_y,
             client_width: captured.metadata.client_width,
             client_height: captured.metadata.client_height,
             geometry_revision: captured.metadata.geometry_revision,
+            display_id: captured.metadata.display_id,
             display_profile_revision: captured.metadata.display_profile_revision,
             dpi: captured.metadata.dpi,
+            is_visible: captured.metadata.is_visible,
+            is_minimized: captured.metadata.is_minimized,
+            is_foreground: captured.metadata.is_foreground,
             region_revision: region.revision,
             rule_revision: rule.revision,
         };
@@ -787,6 +794,7 @@ impl TextDetector {
         let key = StabilityKey {
             run_id: request.run_id.to_string(),
             generation: request.generation,
+            side_effect_epoch: request.side_effect_epoch,
             source_block_id: source_block_id.to_string(),
             rule_id: rule.id.clone(),
             rule_revision: rule.revision,
@@ -860,6 +868,13 @@ impl ConditionDetector for TextDetector {
                 ..
             } => self.observe_text(request, capture, source_block_id, rule_id),
             Condition::Image { .. } => bail!("text detector cannot observe an image condition"),
+        }
+    }
+
+    fn run_finished(&self, run_id: &str, generations: &[u64]) {
+        if let Ok(mut stability) = self.stability.lock() {
+            stability
+                .retain(|key, _| key.run_id != run_id || !generations.contains(&key.generation));
         }
     }
 }
@@ -1483,13 +1498,19 @@ mod tests {
                     captured_at_ms: 42,
                     window_id: 1,
                     window_revision: 1,
+                    process_id: 4,
+                    process_started_at_100ns: 6,
                     client_x: 0,
                     client_y: 0,
                     client_width: 100,
                     client_height: 50,
                     geometry_revision: 1,
+                    display_id: 1,
                     display_profile_revision: 1,
                     dpi: 96,
+                    is_visible: true,
+                    is_minimized: false,
+                    is_foreground: true,
                 },
             })
         }
@@ -1628,6 +1649,7 @@ mod tests {
         let request = ObservationRequest {
             run_id: "run-1",
             generation: 3,
+            side_effect_epoch: 0,
             condition: &condition,
             compiled: &compiled,
             observed_at_ms: 42,
@@ -1669,13 +1691,19 @@ mod tests {
                 captured_at_ms: 900,
                 window_id: 77,
                 window_revision: 5,
+                process_id: 4,
+                process_started_at_100ns: 6,
                 client_x: -320,
                 client_y: 180,
                 client_width: 100,
                 client_height: 50,
                 geometry_revision: 6,
+                display_id: 8,
                 display_profile_revision: 7,
                 dpi: 96,
+                is_visible: true,
+                is_minimized: false,
+                is_foreground: true,
             },
         };
         let compiled = compiled_text_macro(PreprocessProfile::HighContrast, 1);
@@ -1683,6 +1711,7 @@ mod tests {
         let request = ObservationRequest {
             run_id: "run-1",
             generation: 3,
+            side_effect_epoch: 0,
             condition: &condition,
             compiled: &compiled,
             observed_at_ms: 42,
@@ -1723,6 +1752,7 @@ mod tests {
         let request = ObservationRequest {
             run_id: "run-1",
             generation: 3,
+            side_effect_epoch: 0,
             condition: &condition,
             compiled: &compiled,
             observed_at_ms: 42,
@@ -1751,6 +1781,7 @@ mod tests {
         let request = ObservationRequest {
             run_id: "run-1",
             generation: 3,
+            side_effect_epoch: 0,
             condition: &condition,
             compiled: &compiled,
             observed_at_ms: 42,
@@ -1857,5 +1888,36 @@ mod tests {
             .find(|profile| profile.profile == PreprocessProfile::Original)
             .unwrap();
         assert_eq!(original.median_elapsed_nanos, 1);
+    }
+
+    #[test]
+    fn new_side_effect_epoch_cannot_continue_text_stability() {
+        let detector = TextDetector::with_recognizer(Arc::new(FakeRecognizer {
+            calls: Mutex::default(),
+            words: vec![],
+        }));
+        let mut key = StabilityKey {
+            run_id: "run".to_string(),
+            generation: 2,
+            side_effect_epoch: 0,
+            source_block_id: "observe".to_string(),
+            rule_id: "rule".to_string(),
+            rule_revision: 1,
+            region_id: "region".to_string(),
+            region_revision: 1,
+        };
+        let text_match = TextMatch {
+            matched: true,
+            rect: Some(Rect::new(1, 2, 3, 4)),
+            score: Some(1.0),
+            match_count: 1,
+            source_word_indices: vec![0],
+        };
+        assert_eq!(detector.update_stability(&key, &text_match).unwrap(), 1);
+        assert_eq!(detector.update_stability(&key, &text_match).unwrap(), 2);
+
+        key.side_effect_epoch = 1;
+
+        assert_eq!(detector.update_stability(&key, &text_match).unwrap(), 1);
     }
 }

@@ -317,6 +317,10 @@ pub struct ImageFrameMetadata {
     pub window_id: u64,
     pub window_revision: u64,
     #[serde(default)]
+    pub process_id: u32,
+    #[serde(default)]
+    pub process_started_at_100ns: u64,
+    #[serde(default)]
     pub client_x: i32,
     #[serde(default)]
     pub client_y: i32,
@@ -325,8 +329,16 @@ pub struct ImageFrameMetadata {
     #[serde(default)]
     pub client_height: u32,
     pub geometry_revision: u64,
+    #[serde(default)]
+    pub display_id: u64,
     pub display_profile_revision: u64,
     pub dpi: u32,
+    #[serde(default)]
+    pub is_visible: bool,
+    #[serde(default)]
+    pub is_minimized: bool,
+    #[serde(default)]
+    pub is_foreground: bool,
     pub region_revision: u64,
     pub rule_revision: u64,
 }
@@ -377,6 +389,7 @@ impl StabilityOutcome {
 struct ImageStabilityKey {
     run_id: String,
     generation: u64,
+    side_effect_epoch: u64,
     source_block_id: String,
     rule_id: String,
     region_id: String,
@@ -447,13 +460,19 @@ impl ImageDetector {
             captured_at_ms: captured.metadata.captured_at_ms,
             window_id: captured.metadata.window_id,
             window_revision: captured.metadata.window_revision,
+            process_id: captured.metadata.process_id,
+            process_started_at_100ns: captured.metadata.process_started_at_100ns,
             client_x: captured.metadata.client_x,
             client_y: captured.metadata.client_y,
             client_width: captured.metadata.client_width,
             client_height: captured.metadata.client_height,
             geometry_revision: captured.metadata.geometry_revision,
+            display_id: captured.metadata.display_id,
             display_profile_revision: captured.metadata.display_profile_revision,
             dpi: captured.metadata.dpi,
+            is_visible: captured.metadata.is_visible,
+            is_minimized: captured.metadata.is_minimized,
+            is_foreground: captured.metadata.is_foreground,
             region_revision: region.revision,
             rule_revision: rule.revision,
         };
@@ -506,6 +525,7 @@ impl ImageDetector {
         let key = ImageStabilityKey {
             run_id: request.run_id.to_string(),
             generation: request.generation,
+            side_effect_epoch: request.side_effect_epoch,
             source_block_id: source_block_id.to_string(),
             rule_id: rule.id.clone(),
             region_id: region.id.clone(),
@@ -587,6 +607,10 @@ impl ConditionDetector for ImageDetector {
 
     fn run_finished(&self, run_id: &str, generations: &[u64]) {
         let _ = self.clear_run_generations(run_id, generations);
+    }
+
+    fn side_effect_boundary(&self, run_id: &str, generation: u64, _next_epoch: u64) {
+        let _ = self.clear_run_generations(run_id, &[generation]);
     }
 }
 
@@ -704,6 +728,7 @@ fn same_frame_identity(left: ImageFrameMetadata, right: ImageFrameMetadata) -> b
         && left.client_width == right.client_width
         && left.client_height == right.client_height
         && left.geometry_revision == right.geometry_revision
+        && left.display_id == right.display_id
         && left.display_profile_revision == right.display_profile_revision
         && left.dpi == right.dpi
         && left.region_revision == right.region_revision
@@ -1772,13 +1797,19 @@ mod tests {
                 captured_at_ms,
                 window_id: 11,
                 window_revision: 3,
+                process_id: 4,
+                process_started_at_100ns: 6,
                 client_x: 0,
                 client_y: 0,
                 client_width: 64,
                 client_height: 48,
                 geometry_revision: 5,
+                display_id: 6,
                 display_profile_revision: 7,
                 dpi: 96,
+                is_visible: true,
+                is_minimized: false,
+                is_foreground: true,
                 region_revision: 13,
                 rule_revision: 17,
             },
@@ -1792,13 +1823,19 @@ mod tests {
             captured_at_ms: frame.captured_at_ms,
             window_id: frame.window_id,
             window_revision: frame.window_revision,
+            process_id: frame.process_id,
+            process_started_at_100ns: frame.process_started_at_100ns,
             client_x: frame.client_x,
             client_y: frame.client_y,
             client_width: frame.client_width,
             client_height: frame.client_height,
             geometry_revision: frame.geometry_revision,
+            display_id: frame.display_id,
             display_profile_revision: frame.display_profile_revision,
             dpi: frame.dpi,
+            is_visible: frame.is_visible,
+            is_minimized: frame.is_minimized,
+            is_foreground: frame.is_foreground,
         }
     }
 
@@ -3005,6 +3042,7 @@ mod tests {
                 &ObservationRequest {
                     run_id: "run",
                     generation: 1,
+                    side_effect_epoch: 0,
                     condition,
                     compiled: &compiled,
                     observed_at_ms: 100,
@@ -3017,6 +3055,7 @@ mod tests {
                 &ObservationRequest {
                     run_id: "run",
                     generation: 1,
+                    side_effect_epoch: 0,
                     condition,
                     compiled: &compiled,
                     observed_at_ms: 200,
@@ -3053,6 +3092,7 @@ mod tests {
                 &ObservationRequest {
                     run_id: "run",
                     generation: 1,
+                    side_effect_epoch: 0,
                     condition,
                     compiled: &compiled,
                     observed_at_ms: 100,
@@ -3097,6 +3137,7 @@ mod tests {
                     &ObservationRequest {
                         run_id,
                         generation: 1,
+                        side_effect_epoch: 0,
                         condition,
                         compiled: &compiled,
                         observed_at_ms,
@@ -3146,6 +3187,7 @@ mod tests {
                     &ObservationRequest {
                         run_id: "run",
                         generation: 1,
+                        side_effect_epoch: 0,
                         condition,
                         compiled: &compiled,
                         observed_at_ms,
@@ -3196,6 +3238,7 @@ mod tests {
                 &ObservationRequest {
                     run_id,
                     generation: 1,
+                    side_effect_epoch: 0,
                     condition,
                     compiled: &compiled,
                     observed_at_ms,
@@ -3237,6 +3280,7 @@ mod tests {
                     &ObservationRequest {
                         run_id: &run_id,
                         generation: 1,
+                        side_effect_epoch: 0,
                         condition,
                         compiled: &compiled,
                         observed_at_ms: index,
@@ -3277,6 +3321,7 @@ mod tests {
                     &ObservationRequest {
                         run_id: "same-run",
                         generation,
+                        side_effect_epoch: 0,
                         condition,
                         compiled: &compiled,
                         observed_at_ms,
@@ -3290,5 +3335,25 @@ mod tests {
         assert!(!observe(2, 110).matched);
         detector.run_finished("same-run", &[1]);
         assert!(observe(2, 210).matched);
+    }
+
+    #[test]
+    fn side_effect_boundary_clears_image_stability_for_current_generation() {
+        let detector = ImageDetector::new();
+        detector.stability.lock().unwrap().insert(
+            ImageStabilityKey {
+                run_id: "run".to_string(),
+                generation: 3,
+                side_effect_epoch: 0,
+                source_block_id: "observe".to_string(),
+                rule_id: "rule".to_string(),
+                region_id: "region".to_string(),
+            },
+            StabilityTracker::new(2, 10, 2),
+        );
+
+        detector.side_effect_boundary("run", 3, 1);
+
+        assert!(detector.stability.lock().unwrap().is_empty());
     }
 }

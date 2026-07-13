@@ -159,6 +159,7 @@ struct PackageManifestAsset {
 }
 
 const ASSET_IDENTITY_SCHEMA_VERSION: u32 = 1;
+const STAGED_ASSET_REVISION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AssetIdentityIndex {
@@ -175,6 +176,27 @@ impl Default for AssetIdentityIndex {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StagedAssetRevisionJournal {
+    schema_version: u32,
+    entries: Vec<StagedAssetRevision>,
+}
+
+impl Default for StagedAssetRevisionJournal {
+    fn default() -> Self {
+        Self {
+            schema_version: STAGED_ASSET_REVISION_SCHEMA_VERSION,
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StagedAssetRevision {
+    previous: AssetRef,
+    successor: AssetRef,
+}
+
 #[derive(Debug)]
 struct InstalledAsset {
     asset: AssetRef,
@@ -186,6 +208,7 @@ struct InstalledAsset {
 pub struct AssetStore {
     root: PathBuf,
     identity_index: PathBuf,
+    staged_revision_journal: PathBuf,
     lock: Arc<Mutex<()>>,
 }
 
@@ -244,6 +267,138 @@ impl AssetStore {
         };
         self.install_locked(asset.clone(), bytes)?;
         Ok(asset)
+    }
+
+    /// Publishes immutable successor bytes provisionally. The successor remains reserved until a
+    /// durable macro definition references it; rejected authoring must discard it explicitly, and
+    /// interrupted authoring is recovered when the store is reopened.
+    pub fn stage_next_png_revision(&self, previous: &AssetRef, bytes: &[u8]) -> Result<AssetRef> {
+        let _guard = lock_store(&self.lock)?;
+        self.stage_next_png_revision_locked(previous, bytes)
+    }
+
+    /// Replaces provisional descendants before staging a successor from `previous`. This is only
+    /// for the UI-serialized authoring owner after undo/abandon restores an older draft revision;
+    /// concurrent capture callers must use [`Self::stage_next_png_revision`] instead.
+    pub fn replace_staged_png_revision(
+        &self,
+        previous: &AssetRef,
+        bytes: &[u8],
+    ) -> Result<AssetRef> {
+        let _guard = lock_store(&self.lock)?;
+        let mut journal = self.load_staged_revision_journal_locked()?;
+        let mut descendants = journal
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.successor.id == previous.id && entry.successor.revision > previous.revision
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if descendants.is_empty() {
+            return self.stage_next_png_revision_locked(previous, bytes);
+        }
+        let staged_identities = descendants
+            .iter()
+            .map(|entry| (entry.successor.id.clone(), entry.successor.revision))
+            .collect::<HashSet<_>>();
+        let index = self.load_index_locked()?;
+        if index.bindings.iter().any(|binding| {
+            binding.id == previous.id
+                && binding.revision > previous.revision
+                && !staged_identities.contains(&(binding.id.clone(), binding.revision))
+        }) {
+            bail!(
+                "stale template revision {} revision {}; a durable successor exists",
+                previous.id,
+                previous.revision
+            );
+        }
+        descendants.sort_by_key(|entry| std::cmp::Reverse(entry.successor.revision));
+        for staged in &descendants {
+            self.rollback_staged_revision_locked(staged)?;
+        }
+        journal.entries.retain(|entry| {
+            !staged_identities.contains(&(entry.successor.id.clone(), entry.successor.revision))
+        });
+        self.write_staged_revision_journal_locked(&journal)?;
+        self.stage_next_png_revision_locked(previous, bytes)
+    }
+
+    fn stage_next_png_revision_locked(
+        &self,
+        previous: &AssetRef,
+        bytes: &[u8],
+    ) -> Result<AssetRef> {
+        let index = self.load_index_locked()?;
+        validate_identity_binding(&index.bindings, previous)
+            .context("previous template binding is unavailable or stale")?;
+        self.verify_hash_file_locked(&previous.content_hash)
+            .context("previous template bytes are unavailable or corrupt")?;
+        let latest = index
+            .bindings
+            .iter()
+            .filter(|binding| binding.id == previous.id)
+            .map(|binding| binding.revision)
+            .max()
+            .context("previous template identity has no revisions")?;
+        if latest != previous.revision {
+            bail!(
+                "stale template revision {} revision {}; latest is {}",
+                previous.id,
+                previous.revision,
+                latest
+            );
+        }
+        let revision = previous
+            .revision
+            .checked_add(1)
+            .context("template asset revision overflow")?;
+        let successor = AssetRef {
+            id: previous.id.clone(),
+            revision,
+            content_hash: sha256_hex(bytes),
+        };
+        let mut journal = self.load_staged_revision_journal_locked()?;
+        if journal.entries.iter().any(|entry| {
+            entry.successor.id == successor.id && entry.successor.revision == successor.revision
+        }) {
+            bail!(
+                "staged template revision {} revision {} already exists",
+                successor.id,
+                successor.revision
+            );
+        }
+        journal.entries.push(StagedAssetRevision {
+            previous: previous.clone(),
+            successor: successor.clone(),
+        });
+        self.write_staged_revision_journal_locked(&journal)?;
+        if let Err(error) = self.install_locked(successor.clone(), bytes) {
+            journal.entries.pop();
+            let _ = self.write_staged_revision_journal_locked(&journal);
+            return Err(error);
+        }
+        Ok(successor)
+    }
+
+    pub fn discard_staged_png_revision(&self, successor: &AssetRef) -> Result<()> {
+        let _guard = lock_store(&self.lock)?;
+        let mut journal = self.load_staged_revision_journal_locked()?;
+        let Some(index) = journal
+            .entries
+            .iter()
+            .position(|entry| entry.successor == *successor)
+        else {
+            bail!(
+                "asset {} revision {} is not a staged template revision",
+                successor.id,
+                successor.revision
+            );
+        };
+        self.rollback_staged_revision_locked(&journal.entries[index])?;
+        journal.entries.remove(index);
+        self.write_staged_revision_journal_locked(&journal)
     }
 
     pub fn read(&self, asset: &AssetRef) -> Result<Vec<u8>> {
@@ -360,6 +515,84 @@ impl AssetStore {
         atomic_write(&self.identity_index, &serde_json::to_vec_pretty(index)?)
     }
 
+    fn load_staged_revision_journal_locked(&self) -> Result<StagedAssetRevisionJournal> {
+        if !self.staged_revision_journal.exists() {
+            return Ok(StagedAssetRevisionJournal::default());
+        }
+        let journal: StagedAssetRevisionJournal =
+            serde_json::from_slice(&fs::read(&self.staged_revision_journal)?)
+                .context("corrupt staged asset revision journal")?;
+        if journal.schema_version != STAGED_ASSET_REVISION_SCHEMA_VERSION {
+            bail!(
+                "unsupported staged asset revision schema {}",
+                journal.schema_version
+            );
+        }
+        let mut identities = HashSet::new();
+        for entry in &journal.entries {
+            validate_asset_ref(&entry.previous)?;
+            validate_asset_ref(&entry.successor)?;
+            if entry.previous.id != entry.successor.id
+                || entry.previous.revision.checked_add(1) != Some(entry.successor.revision)
+            {
+                bail!("invalid staged asset revision relationship");
+            }
+            if !identities.insert((entry.successor.id.clone(), entry.successor.revision)) {
+                bail!("duplicate staged asset revision identity");
+            }
+        }
+        Ok(journal)
+    }
+
+    fn write_staged_revision_journal_locked(
+        &self,
+        journal: &StagedAssetRevisionJournal,
+    ) -> Result<()> {
+        if journal.entries.is_empty() {
+            if self.staged_revision_journal.exists() {
+                fs::remove_file(&self.staged_revision_journal)?;
+                sync_directory(
+                    self.staged_revision_journal
+                        .parent()
+                        .context("staged revision journal has no parent")?,
+                )?;
+            }
+            return Ok(());
+        }
+        atomic_write(
+            &self.staged_revision_journal,
+            &serde_json::to_vec_pretty(journal)?,
+        )
+    }
+
+    fn rollback_staged_revision_locked(&self, staged: &StagedAssetRevision) -> Result<()> {
+        let mut index = self.load_index_locked()?;
+        if let Some(binding_index) = index.bindings.iter().position(|binding| {
+            binding.id == staged.successor.id && binding.revision == staged.successor.revision
+        }) {
+            if index.bindings[binding_index] != staged.successor {
+                bail!("staged asset identity conflicts with durable identity binding");
+            }
+            self.verify_hash_file_locked(&staged.successor.content_hash)
+                .context("staged template bytes are unavailable or corrupt")?;
+            index.bindings.remove(binding_index);
+            self.write_index_locked(&index)?;
+        }
+        let path = self.path_for_hash(&staged.successor.content_hash)?;
+        if path.exists()
+            && !index
+                .bindings
+                .iter()
+                .any(|binding| binding.content_hash == staged.successor.content_hash)
+        {
+            self.verify_hash_file_locked(&staged.successor.content_hash)
+                .context("staged template bytes are unavailable or corrupt")?;
+            fs::remove_file(path)?;
+            sync_directory(&self.root)?;
+        }
+        Ok(())
+    }
+
     fn verify_hash_file_locked(&self, hash: &str) -> Result<Vec<u8>> {
         let path = self.path_for_hash(hash)?;
         let bytes = fs::read(&path).with_context(|| format!("missing asset {hash}"))?;
@@ -404,10 +637,11 @@ impl MacroStore {
         let root = root.join("macro_data");
         fs::create_dir_all(&root)?;
         let root = root.canonicalize()?;
-        let lock = shared_store_lock(&root)?;
+        let (lock, first_live_owner) = shared_store_lock(&root)?;
         let assets = AssetStore {
             root: root.join("assets"),
             identity_index: root.join("asset_identities.json"),
+            staged_revision_journal: root.join("staged_asset_revisions.json"),
             lock: Arc::clone(&lock),
         };
         fs::create_dir_all(root.join("definitions"))?;
@@ -428,6 +662,9 @@ impl MacroStore {
                     .write_index_locked(&AssetIdentityIndex::default())?;
             } else {
                 store.assets.load_index_locked()?;
+            }
+            if first_live_owner {
+                store.recover_staged_asset_revisions_locked()?;
             }
         }
         Ok(store)
@@ -495,7 +732,135 @@ impl MacroStore {
             }
             return Err(error.context("current revision publication failed"));
         }
+        self.finalize_staged_asset_revisions_locked(&saved.definition)?;
         Ok(saved)
+    }
+
+    fn recover_staged_asset_revisions_locked(&self) -> Result<()> {
+        let mut journal = self.assets.load_staged_revision_journal_locked()?;
+        if journal.entries.is_empty() {
+            return Ok(());
+        }
+        let index = self.assets.load_index_locked()?;
+        let durable = self.durable_definition_asset_refs_locked(&index)?;
+        let durable_latest = latest_asset_revisions(durable.iter());
+        journal.entries.sort_by(|left, right| {
+            right
+                .successor
+                .revision
+                .cmp(&left.successor.revision)
+                .then_with(|| left.successor.id.cmp(&right.successor.id))
+        });
+        for staged in &journal.entries {
+            let is_durable = durable_latest
+                .get(staged.successor.id.as_str())
+                .is_some_and(|revision| *revision >= staged.successor.revision);
+            if is_durable {
+                validate_identity_binding(&index.bindings, &staged.successor).context(
+                    "durable definition references an unavailable staged template revision",
+                )?;
+                self.assets
+                    .verify_hash_file_locked(&staged.successor.content_hash)
+                    .context("durable staged template bytes are unavailable or corrupt")?;
+            } else {
+                self.assets.rollback_staged_revision_locked(staged)?;
+            }
+        }
+        journal.entries.clear();
+        self.assets.write_staged_revision_journal_locked(&journal)
+    }
+
+    fn finalize_staged_asset_revisions_locked(&self, definition: &MacroDefinition) -> Result<()> {
+        let mut journal = self.assets.load_staged_revision_journal_locked()?;
+        if journal.entries.is_empty() {
+            return Ok(());
+        }
+        let referenced_latest = latest_asset_revisions(referenced_assets(definition));
+        let index = self.assets.load_index_locked()?;
+        for staged in &journal.entries {
+            let is_referenced = referenced_latest
+                .get(staged.successor.id.as_str())
+                .is_some_and(|revision| *revision >= staged.successor.revision);
+            if is_referenced {
+                validate_identity_binding(&index.bindings, &staged.successor)
+                    .context("saved definition references an unavailable staged revision")?;
+                self.assets
+                    .verify_hash_file_locked(&staged.successor.content_hash)
+                    .context("saved staged template bytes are unavailable or corrupt")?;
+            }
+        }
+        journal.entries.retain(|staged| {
+            !referenced_latest
+                .get(staged.successor.id.as_str())
+                .is_some_and(|revision| *revision >= staged.successor.revision)
+        });
+        self.assets.write_staged_revision_journal_locked(&journal)
+    }
+
+    fn durable_definition_asset_refs_locked(
+        &self,
+        index: &AssetIdentityIndex,
+    ) -> Result<HashSet<AssetRef>> {
+        let mut durable = HashSet::new();
+        let definitions_root = self.root.join("definitions");
+        for macro_directory in fs::read_dir(definitions_root)? {
+            let macro_directory = macro_directory?;
+            if !macro_directory.file_type()?.is_dir() {
+                continue;
+            }
+            let macro_id = macro_directory.file_name().to_string_lossy().into_owned();
+            validate_component("saved macro directory", &macro_id)?;
+            validate_revision_sidecars(&macro_directory.path())?;
+            for revision_file in fs::read_dir(macro_directory.path())? {
+                let revision_file = revision_file?;
+                if !revision_file.file_type()?.is_file()
+                    || revision_file
+                        .path()
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        != Some("json")
+                {
+                    continue;
+                }
+                let file_name = revision_file.file_name().to_string_lossy().into_owned();
+                let bytes = fs::read(revision_file.path())?;
+                let definition: MacroDefinition = serde_json::from_slice(&bytes)
+                    .context("corrupt saved macro definition blocks staged asset recovery")?;
+                if definition.schema_version != MACRO_SCHEMA_VERSION {
+                    bail!(
+                        "unsupported macro schema {} blocks staged asset recovery",
+                        definition.schema_version
+                    );
+                }
+                if definition.id != macro_id {
+                    bail!("saved macro ID does not match definition directory");
+                }
+                if file_name == "current.json" {
+                    let immutable = macro_directory
+                        .path()
+                        .join(format!("{}.json", definition.revision));
+                    if fs::read(&immutable).context("current revision file is missing")? != bytes {
+                        bail!("current definition does not match immutable revision");
+                    }
+                } else {
+                    verify_revision_checksum(&revision_file.path(), &bytes)?;
+                    let file_revision = file_name
+                        .strip_suffix(".json")
+                        .and_then(|stem| stem.parse::<u64>().ok())
+                        .context("saved revision filename is invalid")?;
+                    if definition.revision != file_revision {
+                        bail!("saved revision does not match revision filename");
+                    }
+                }
+                validate_identity_set(referenced_assets(&definition))?;
+                for asset in referenced_assets(&definition) {
+                    validate_identity_binding(&index.bindings, asset)?;
+                    self.assets.verify_hash_file_locked(&asset.content_hash)?;
+                    durable.insert(asset.clone());
+                }
+            }
+        }
+        Ok(durable)
     }
 
     pub fn validate_package(package_root: &Path) -> Result<MacroPackage> {
@@ -776,6 +1141,14 @@ impl MacroStore {
         }
 
         let mut protected = running_assets.clone();
+        let staged = self.assets.load_staged_revision_journal_locked()?;
+        for entry in staged.entries {
+            for asset in [&entry.previous, &entry.successor] {
+                validate_identity_binding(&index.bindings, asset)?;
+                self.assets.verify_hash_file_locked(&asset.content_hash)?;
+                protected.insert(asset.clone());
+            }
+        }
         let definitions_root = self.root.join("definitions");
         for macro_directory in fs::read_dir(definitions_root)? {
             let macro_directory = macro_directory?;
@@ -936,6 +1309,19 @@ fn referenced_assets(definition: &MacroDefinition) -> impl Iterator<Item = &Asse
         .flat_map(|rule| std::iter::once(&rule.template).chain(rule.transparent_mask.as_ref()))
 }
 
+fn latest_asset_revisions<'a>(
+    assets: impl IntoIterator<Item = &'a AssetRef>,
+) -> HashMap<&'a str, u64> {
+    let mut latest: HashMap<&str, u64> = HashMap::new();
+    for asset in assets {
+        latest
+            .entry(asset.id.as_str())
+            .and_modify(|revision| *revision = (*revision).max(asset.revision))
+            .or_insert(asset.revision);
+    }
+    latest
+}
+
 fn validate_asset_ref(asset: &AssetRef) -> Result<()> {
     validate_component("asset ID", &asset.id)?;
     if asset.content_hash.len() != 64
@@ -1059,18 +1445,18 @@ fn lock_store(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>> {
         .map_err(|_| anyhow::anyhow!("macro store lock poisoned"))
 }
 
-fn shared_store_lock(root: &Path) -> Result<Arc<Mutex<()>>> {
+fn shared_store_lock(root: &Path) -> Result<(Arc<Mutex<()>>, bool)> {
     let registry = STORE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut registry = registry
         .lock()
         .map_err(|_| anyhow::anyhow!("macro store lock registry poisoned"))?;
     registry.retain(|_, lock| lock.strong_count() > 0);
     if let Some(lock) = registry.get(root).and_then(Weak::upgrade) {
-        return Ok(lock);
+        return Ok((lock, false));
     }
     let lock = Arc::new(Mutex::new(()));
     registry.insert(root.to_path_buf(), Arc::downgrade(&lock));
-    Ok(lock)
+    Ok((lock, true))
 }
 
 fn package_file(root: &Path, relative: &Path) -> Result<PathBuf> {
@@ -2093,6 +2479,190 @@ mod tests {
                 .iter()
                 .filter_map(|result| result.as_ref().err())
                 .any(|error| error.to_string().contains("stale template revision"))
+        );
+    }
+
+    #[test]
+    fn rejected_staged_recapture_rolls_back_and_allows_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let original = store.assets().put_png(b"original").unwrap();
+        let rejected = store
+            .assets()
+            .stage_next_png_revision(&original, b"rejected successor")
+            .unwrap();
+
+        store
+            .assets()
+            .discard_staged_png_revision(&rejected)
+            .unwrap();
+
+        assert!(store.assets().read(&rejected).is_err());
+        let retry = store
+            .assets()
+            .stage_next_png_revision(&original, b"retry successor")
+            .unwrap();
+        assert_eq!(retry.revision, original.revision + 1);
+        assert_eq!(store.assets().read(&retry).unwrap(), b"retry successor");
+    }
+
+    #[test]
+    fn serialized_recapture_replaces_staged_successor_after_draft_undo() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let original = store.assets().put_png(b"original").unwrap();
+        let undone = store
+            .assets()
+            .stage_next_png_revision(&original, b"successor later undone")
+            .unwrap();
+
+        let replacement = store
+            .assets()
+            .replace_staged_png_revision(&original, b"replacement after undo")
+            .unwrap();
+
+        assert_eq!(replacement.id, original.id);
+        assert_eq!(replacement.revision, undone.revision);
+        assert_ne!(replacement.content_hash, undone.content_hash);
+        assert!(store.assets().read(&undone).is_err());
+        assert_eq!(
+            store.assets().read(&replacement).unwrap(),
+            b"replacement after undo"
+        );
+    }
+
+    #[test]
+    fn orphan_cleanup_preserves_active_staged_recapture_and_predecessor() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let original = store.assets().put_png(b"original").unwrap();
+        let staged = store
+            .assets()
+            .stage_next_png_revision(&original, b"active successor")
+            .unwrap();
+
+        assert_eq!(store.cleanup_orphan_assets(&HashSet::new()).unwrap(), 0);
+        assert_eq!(store.assets().read(&original).unwrap(), b"original");
+        assert_eq!(store.assets().read(&staged).unwrap(), b"active successor");
+    }
+
+    #[test]
+    fn reopening_recovers_unreferenced_staged_recapture_after_crash() {
+        let temp = tempfile::tempdir().unwrap();
+        let original;
+        let abandoned;
+        {
+            let store = MacroStore::open(temp.path()).unwrap();
+            original = store.assets().put_png(b"original").unwrap();
+            abandoned = store
+                .assets()
+                .stage_next_png_revision(&original, b"published before crash")
+                .unwrap();
+            assert_eq!(
+                store.assets().read(&abandoned).unwrap(),
+                b"published before crash"
+            );
+        }
+
+        let reopened = MacroStore::open(temp.path()).unwrap();
+        assert!(reopened.assets().read(&abandoned).is_err());
+        let retry = reopened
+            .assets()
+            .stage_next_png_revision(&original, b"retry after restart")
+            .unwrap();
+        assert_eq!(retry.revision, abandoned.revision);
+        assert_eq!(
+            reopened.assets().read(&retry).unwrap(),
+            b"retry after restart"
+        );
+    }
+
+    #[test]
+    fn additional_live_store_open_does_not_recover_an_active_staged_recapture() {
+        let temp = tempfile::tempdir().unwrap();
+        let staged;
+        {
+            let first = MacroStore::open(temp.path()).unwrap();
+            let original = first.assets().put_png(b"original").unwrap();
+            staged = first
+                .assets()
+                .stage_next_png_revision(&original, b"active staged successor")
+                .unwrap();
+
+            let second = MacroStore::open(temp.path()).unwrap();
+            assert_eq!(
+                second.assets().read(&staged).unwrap(),
+                b"active staged successor"
+            );
+        }
+
+        let restarted = MacroStore::open(temp.path()).unwrap();
+        assert!(restarted.assets().read(&staged).is_err());
+    }
+
+    #[test]
+    fn durable_definition_reference_finalizes_staged_recapture_on_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let original;
+        let staged;
+        {
+            let store = MacroStore::open(temp.path()).unwrap();
+            original = store.assets().put_png(b"original").unwrap();
+            staged = store
+                .assets()
+                .stage_next_png_revision(&original, b"durably accepted")
+                .unwrap();
+            store.save(fixture_definition(staged.clone())).unwrap();
+        }
+
+        let reopened = MacroStore::open(temp.path()).unwrap();
+        assert_eq!(
+            reopened.assets().read(&staged).unwrap(),
+            b"durably accepted"
+        );
+        let stale = reopened
+            .assets()
+            .replace_staged_png_revision(&original, b"must remain stale")
+            .unwrap_err();
+        assert!(
+            stale.to_string().contains("stale template revision")
+                || stale.to_string().contains("durable successor")
+        );
+    }
+
+    #[test]
+    fn concurrent_staged_recaptures_from_same_revision_reserve_exactly_one_successor() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let original = store.assets().put_png(b"original").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for bytes in [b"winner one".as_slice(), b"winner two".as_slice()] {
+            let store = store.clone();
+            let original = original.clone();
+            let barrier = Arc::clone(&barrier);
+            let bytes = bytes.to_vec();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.assets().stage_next_png_revision(&original, &bytes)
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .any(
+                    |error| error.to_string().contains("stale template revision")
+                        || error.to_string().contains("staged template revision")
+                )
         );
     }
 

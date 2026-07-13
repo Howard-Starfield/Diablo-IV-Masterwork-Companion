@@ -25,6 +25,7 @@ pub enum DraftEditability {
 struct UndoEntry {
     definition: MacroDefinition,
     invalidated_source_ids: BTreeSet<String>,
+    detector_test_failures: BTreeMap<String, DetectorTestFailure>,
 }
 
 /// Editor-only state. The canonical definition never stores removed conversion data or undo data.
@@ -313,6 +314,9 @@ pub enum EditorCommand {
         replacement: Block,
         children: ChildDisposition,
     },
+    ReplaceTarget {
+        target: crate::engine::macro_engine::TargetProfile,
+    },
     ReplaceTextRule {
         rule: TextRule,
     },
@@ -457,6 +461,7 @@ pub fn apply_editor_command(
         draft.definition = previous.definition;
         draft.definition.revision = revision;
         draft.invalidated_source_ids = previous.invalidated_source_ids;
+        draft.detector_test_failures = previous.detector_test_failures;
         draft.prune_superseded_detector_test_failures();
         draft.status = DraftStatus::NeedsValidation;
         return Ok(EditOutcome::Changed);
@@ -465,6 +470,7 @@ pub fn apply_editor_command(
     let before = UndoEntry {
         definition: draft.definition.clone(),
         invalidated_source_ids: draft.invalidated_source_ids.clone(),
+        detector_test_failures: draft.detector_test_failures.clone(),
     };
     let existing_action_dependency_problems = action_dependency_problems(&before.definition);
     let mut candidate = before.definition.clone();
@@ -834,6 +840,23 @@ fn apply_to_definition(
                 container.splice(index + 1..index + 1, owned_contents(old));
             }
             invalidated.insert(path.block_id);
+        }
+        EditorCommand::ReplaceTarget { target } => {
+            if definition.target != target {
+                definition.target = target;
+                for rule in &mut definition.image_rules {
+                    rule.verification = None;
+                }
+                let rule_ids = definition
+                    .text_rules
+                    .iter()
+                    .map(|rule| rule.id.as_str())
+                    .chain(definition.image_rules.iter().map(|rule| rule.id.as_str()))
+                    .collect::<Vec<_>>();
+                for rule_id in rule_ids {
+                    invalidated.extend(source_ids_for_rule(&definition.blocks, rule_id));
+                }
+            }
         }
         EditorCommand::ReplaceTextRule { mut rule } => {
             let old = definition
@@ -2350,6 +2373,132 @@ mod tests {
         .unwrap();
         assert_eq!(draft.definition.regions[0].revision, 2);
         assert_eq!(draft.definition.text_rules[0].expected, "Retry");
+    }
+
+    #[test]
+    fn undo_restores_known_detector_failure_for_restored_fingerprint() {
+        let mut definition = def(vec![Block {
+            id: "source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "source".into(),
+                    rule_id: "rule".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        }]);
+        definition.regions.push(RegionDefinition {
+            id: "region".into(),
+            revision: 1,
+            rect: RectRatio {
+                x: 0.1,
+                y: 0.1,
+                width: 0.2,
+                height: 0.2,
+            },
+        });
+        definition.text_rules.push(TextRule {
+            id: "rule".into(),
+            revision: 1,
+            region_id: "region".into(),
+            language: "en-US".into(),
+            preprocess: PreprocessProfile::Grayscale,
+            expected: "fingerprint F".into(),
+            match_mode: TextMatchMode::Contains,
+            threshold: 0.9,
+            case_sensitive: false,
+            allow_cross_line: false,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 250,
+            timeout_ms: Limit::Finite(1_000),
+            stable_frames: 1,
+        });
+        let mut draft = EditorDraft::new(definition);
+        let failed_fingerprint = detector_fingerprint_for_block(&draft.definition, "source")
+            .expect("text observation has a detector fingerprint");
+        draft.record_detector_test_failure(
+            "source",
+            failed_fingerprint,
+            "fingerprint F did not match",
+        );
+
+        let mut rule_g = draft.definition.text_rules[0].clone();
+        rule_g.expected = "fingerprint G".into();
+        apply_editor_command(&mut draft, EditorCommand::ReplaceTextRule { rule: rule_g }).unwrap();
+        assert!(
+            !editor_validation_problems(&draft)
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
+
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        assert_eq!(draft.definition.text_rules[0].expected, "fingerprint F");
+        assert!(
+            editor_validation_problems(&draft)
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
+        assert_eq!(
+            apply_editor_command(&mut draft, EditorCommand::MarkValidated),
+            Err(EditorError::ValidationFailed)
+        );
+
+        let mut rule_g_again = draft.definition.text_rules[0].clone();
+        rule_g_again.expected = "fingerprint G".into();
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::ReplaceTextRule { rule: rule_g_again },
+        )
+        .unwrap();
+        assert!(
+            !editor_validation_problems(&draft)
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
+    }
+
+    #[test]
+    fn replacing_target_invalidates_detector_proofs_and_is_undoable() {
+        let (mut definition, verification) = image_definition_and_verification();
+        definition.image_rules[0].verification = Some(verification.clone());
+        let mut draft = EditorDraft::new(definition);
+        let original = draft.definition.target.clone();
+
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::ReplaceTarget {
+                    target: original.clone(),
+                },
+            ),
+            Ok(EditOutcome::NoChange)
+        );
+        assert_eq!(draft.definition.revision, 4);
+        assert_eq!(draft.undo_len(), 0);
+
+        let mut replacement = original.clone();
+        replacement.captured_dpi = 144;
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::ReplaceTarget {
+                    target: replacement.clone(),
+                },
+            ),
+            Ok(EditOutcome::Changed)
+        );
+        assert_eq!(draft.definition.target, replacement);
+        assert!(draft.definition.image_rules[0].verification.is_none());
+        assert!(draft.invalidated_source_ids().contains("image-source"));
+
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        assert_eq!(draft.definition.target, original);
+        assert_eq!(
+            draft.definition.image_rules[0].verification,
+            Some(verification)
+        );
+        assert!(!draft.invalidated_source_ids().contains("image-source"));
     }
 
     #[test]

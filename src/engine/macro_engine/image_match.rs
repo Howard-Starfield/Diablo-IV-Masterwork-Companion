@@ -27,6 +27,18 @@ pub const DEFAULT_MAX_SCORE_CELLS: u64 = 750_000;
 pub const DEFAULT_MAX_PIXEL_OPERATIONS: u64 = 50_000_000;
 /// Caps retained local maxima before deterministic spatial clustering.
 pub const DEFAULT_MAX_CANDIDATES: usize = 4_096;
+pub const DEFAULT_MAX_SCALES: usize = 32;
+pub const DEFAULT_MAX_NEGATIVE_SAMPLES: usize = 4_096;
+/// V1 decoded/preprocess caps. A 4096x4096 BGRA capture fits exactly in the search budget.
+pub const DEFAULT_MAX_SEARCH_PIXELS: u64 = 16_777_216;
+pub const DEFAULT_MAX_SEARCH_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_TEMPLATE_PIXELS: u64 = 4_194_304;
+pub const DEFAULT_MAX_TEMPLATE_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_MASK_PIXELS: u64 = 4_194_304;
+pub const DEFAULT_MAX_MASK_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_SCALED_TEMPLATE_PIXELS: u64 = 4_194_304;
+pub const DEFAULT_MAX_TOTAL_SCALED_PIXELS: u64 = 8_388_608;
+pub const DEFAULT_MAX_TOTAL_SCALED_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_CLUSTER_COMPARISONS: u64 = 100_000;
 /// Grayscale intensity variance below this value is too flat for safe correlation.
 pub(super) const MIN_TEMPLATE_VARIANCE: f32 = 16.0;
@@ -68,6 +80,8 @@ pub enum ImageMatchError {
     ZeroScale,
     #[error("image match scale {scale_percent}% is duplicated")]
     DuplicateScale { scale_percent: u16 },
+    #[error("image match scale count exceeds maximum {maximum}")]
+    ScaleCountLimit { maximum: usize },
     #[error("image match scale {scale_percent}% overflows supported dimensions")]
     ScaleDimensionOverflow { scale_percent: u16 },
     #[error("image match scale {scale_percent}% does not fit the search region")]
@@ -82,21 +96,62 @@ pub enum ImageMatchError {
     CandidateLimit { maximum: usize },
     #[error("image spatial clustering comparisons exceed maximum {maximum}")]
     ClusterComparisonLimit { maximum: u64 },
+    #[error("{resource:?} image dimensions overflow resource accounting")]
+    ResourceDimensionOverflow { resource: ImageResourceKind },
+    #[error("{resource:?} image pixels {actual} exceed maximum {maximum}")]
+    ResourcePixelLimit {
+        resource: ImageResourceKind,
+        actual: u64,
+        maximum: u64,
+    },
+    #[error("{resource:?} image bytes {actual} exceed maximum {maximum}")]
+    ResourceByteLimit {
+        resource: ImageResourceKind,
+        actual: u64,
+        maximum: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ImageWorkLimits {
+pub enum ImageResourceKind {
+    Template,
+    Mask,
+    Search,
+    ScaledTemplate,
+    TotalScaledTemplates,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ImageWorkPolicy {
     maximum_score_cells: u64,
     maximum_pixel_operations: u64,
     maximum_candidates: usize,
+    maximum_search_pixels: u64,
+    maximum_search_bytes: u64,
+    maximum_template_pixels: u64,
+    maximum_template_bytes: u64,
+    maximum_mask_pixels: u64,
+    maximum_mask_bytes: u64,
+    maximum_scaled_template_pixels: u64,
+    maximum_total_scaled_pixels: u64,
+    maximum_total_scaled_bytes: u64,
 }
 
-impl ImageWorkLimits {
+impl ImageWorkPolicy {
     pub(super) const fn production() -> Self {
         Self {
             maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
             maximum_pixel_operations: DEFAULT_MAX_PIXEL_OPERATIONS,
             maximum_candidates: DEFAULT_MAX_CANDIDATES,
+            maximum_search_pixels: DEFAULT_MAX_SEARCH_PIXELS,
+            maximum_search_bytes: DEFAULT_MAX_SEARCH_BYTES,
+            maximum_template_pixels: DEFAULT_MAX_TEMPLATE_PIXELS,
+            maximum_template_bytes: DEFAULT_MAX_TEMPLATE_BYTES,
+            maximum_mask_pixels: DEFAULT_MAX_MASK_PIXELS,
+            maximum_mask_bytes: DEFAULT_MAX_MASK_BYTES,
+            maximum_scaled_template_pixels: DEFAULT_MAX_SCALED_TEMPLATE_PIXELS,
+            maximum_total_scaled_pixels: DEFAULT_MAX_TOTAL_SCALED_PIXELS,
+            maximum_total_scaled_bytes: DEFAULT_MAX_TOTAL_SCALED_BYTES,
         }
     }
 
@@ -104,6 +159,39 @@ impl ImageWorkLimits {
         Self {
             maximum_score_cells,
             ..Self::production()
+        }
+    }
+
+    pub(super) fn validate_asset_dimensions(
+        self,
+        dimensions: (u32, u32),
+        decoded_bytes_per_pixel: u64,
+        resource: ImageResourceKind,
+    ) -> std::result::Result<(), ImageMatchError> {
+        let (maximum_pixels, maximum_bytes) = match resource {
+            ImageResourceKind::Template => {
+                (self.maximum_template_pixels, self.maximum_template_bytes)
+            }
+            ImageResourceKind::Mask => (self.maximum_mask_pixels, self.maximum_mask_bytes),
+            _ => {
+                return Err(ImageMatchError::ResourceDimensionOverflow { resource });
+            }
+        };
+        validate_resource_dimensions(
+            dimensions,
+            decoded_bytes_per_pixel,
+            resource,
+            maximum_pixels,
+            maximum_bytes,
+        )?;
+        Ok(())
+    }
+
+    pub(super) const fn maximum_asset_bytes(self, resource: ImageResourceKind) -> Option<u64> {
+        match resource {
+            ImageResourceKind::Template => Some(self.maximum_template_bytes),
+            ImageResourceKind::Mask => Some(self.maximum_mask_bytes),
+            _ => None,
         }
     }
 }
@@ -121,6 +209,8 @@ pub(super) struct ValidatedScalePlan {
     scales: Vec<ValidatedScale>,
     pub(super) score_cells: u64,
     pixel_operations: u64,
+    scaled_template_pixels: u64,
+    scaled_template_bytes: u64,
     maximum_candidates: usize,
 }
 
@@ -343,6 +433,10 @@ impl ImageDetector {
             definition.target.captured_client_height,
         );
         let capture_rect = client.rect_from_ratio(region.rect);
+        validate_search_dimensions(
+            (capture_rect.width, capture_rect.height),
+            ImageWorkPolicy::production(),
+        )?;
         let captured = capture.capture_frame(capture_rect)?;
         let frame = ImageFrameMetadata {
             frame_id: captured.metadata.frame_id,
@@ -521,7 +615,7 @@ fn validate_runtime_image_rule(
         template,
         mask,
         &rule.scales_percent,
-        ImageWorkLimits::production(),
+        ImageWorkPolicy::production(),
     )?;
     Ok(())
 }
@@ -673,7 +767,7 @@ pub struct NegativeCorpusSample {
 #[derive(Serialize)]
 struct CanonicalNegativeCorpus<'a> {
     version: u32,
-    samples: &'a [NegativeCorpusSample],
+    samples: &'a [&'a NegativeCorpusSample],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -741,6 +835,8 @@ pub enum ImageRuleVerificationError {
     InvalidNegativeScore,
     #[error("negative corpus must have a canonical lowercase SHA-256 and at least one sample")]
     InvalidNegativeCorpus,
+    #[error("negative corpus sample count exceeds maximum {maximum}")]
+    NegativeCorpusLimit { maximum: usize },
     #[error("negative sample stable ID is invalid: {stable_id}")]
     InvalidNegativeSampleId { stable_id: String },
     #[error("negative sample {stable_id} has an invalid content SHA-256")]
@@ -779,12 +875,12 @@ impl ImageRuleVerification {
         if !verification::normalized_score(input.rule.minimum_runner_up_margin) {
             return Err(ImageRuleVerificationError::InvalidRunnerUpMargin);
         }
-        let negative_corpus = verify_negative_corpus(
-            input.rule,
-            input.captured_dpi,
-            input.region_revision,
+        let plan = validated_scale_plan(
             input.search_dimensions,
-            input.negative_samples,
+            input.template,
+            input.mask,
+            &input.rule.scales_percent,
+            ImageWorkPolicy::with_maximum_score_cells(input.maximum_score_cells),
         )?;
         let mask = validate_mask_reference(input.rule, input.template, input.mask)?;
         let variance = template_variance(input.template, mask);
@@ -800,13 +896,6 @@ impl ImageRuleVerification {
                 current: input.current_dpi,
             });
         }
-        let plan = validated_scale_plan(
-            input.search_dimensions,
-            input.template,
-            mask,
-            &input.rule.scales_percent,
-            ImageWorkLimits::with_maximum_score_cells(input.maximum_score_cells),
-        )?;
         let score_cells = plan.score_cells;
         let observed_candidates =
             input
@@ -832,6 +921,13 @@ impl ImageRuleVerification {
             }
             .into());
         }
+        let negative_corpus = verify_negative_corpus(
+            input.rule,
+            input.captured_dpi,
+            input.region_revision,
+            input.search_dimensions,
+            input.negative_samples,
+        )?;
         let negative_margin = input.rule.threshold - negative_corpus.best_score;
         if negative_margin < input.rule.minimum_runner_up_margin {
             return Err(ImageRuleVerificationError::InsufficientNegativeMargin {
@@ -882,22 +978,27 @@ fn verify_negative_corpus(
     if samples.is_empty() {
         return Err(ImageRuleVerificationError::InvalidNegativeCorpus);
     }
+    if samples.len() > DEFAULT_MAX_NEGATIVE_SAMPLES {
+        return Err(ImageRuleVerificationError::NegativeCorpusLimit {
+            maximum: DEFAULT_MAX_NEGATIVE_SAMPLES,
+        });
+    }
     let expected = NegativeSampleEvaluationInputs::for_rule(
         rule,
         captured_dpi,
         region_revision,
         search_dimensions,
     );
-    let mut canonical = samples.to_vec();
+    let mut canonical = samples.iter().collect::<Vec<_>>();
     canonical.sort_by(|left, right| {
         left.stable_id
             .cmp(&right.stable_id)
             .then_with(|| left.content_sha256.cmp(&right.content_sha256))
             .then_with(|| left.measured_score.total_cmp(&right.measured_score))
     });
-    let mut previous_id: Option<&str> = None;
-    let mut content_hashes = std::collections::HashSet::new();
-    for sample in &canonical {
+    let mut stable_ids = std::collections::HashSet::with_capacity(samples.len());
+    let mut content_hashes = std::collections::HashSet::with_capacity(samples.len());
+    for sample in samples {
         if sample.stable_id.is_empty()
             || sample.stable_id.len() > 256
             || sample.stable_id.trim() != sample.stable_id
@@ -907,18 +1008,17 @@ fn verify_negative_corpus(
                 stable_id: sample.stable_id.clone(),
             });
         }
-        if previous_id == Some(sample.stable_id.as_str()) {
+        if !stable_ids.insert(sample.stable_id.as_str()) {
             return Err(ImageRuleVerificationError::DuplicateNegativeSample {
                 stable_id: sample.stable_id.clone(),
             });
         }
-        previous_id = Some(&sample.stable_id);
         if !verification::valid_sha256(&sample.content_sha256) {
             return Err(ImageRuleVerificationError::InvalidNegativeSampleHash {
                 stable_id: sample.stable_id.clone(),
             });
         }
-        if !content_hashes.insert(sample.content_sha256.clone()) {
+        if !content_hashes.insert(sample.content_sha256.as_str()) {
             return Err(ImageRuleVerificationError::DuplicateNegativeSampleContent {
                 content_sha256: sample.content_sha256.clone(),
             });
@@ -976,20 +1076,88 @@ fn scaled_dimension(
     u32::try_from(rounded).map_err(|_| ImageMatchError::ScaleDimensionOverflow { scale_percent })
 }
 
+pub(super) fn validate_resource_dimensions(
+    dimensions: (u32, u32),
+    decoded_bytes_per_pixel: u64,
+    resource: ImageResourceKind,
+    maximum_pixels: u64,
+    maximum_bytes: u64,
+) -> std::result::Result<(u64, u64), ImageMatchError> {
+    let pixels = u64::from(dimensions.0)
+        .checked_mul(u64::from(dimensions.1))
+        .ok_or(ImageMatchError::ResourceDimensionOverflow { resource })?;
+    if pixels > maximum_pixels {
+        return Err(ImageMatchError::ResourcePixelLimit {
+            resource,
+            actual: pixels,
+            maximum: maximum_pixels,
+        });
+    }
+    let bytes = pixels
+        .checked_mul(decoded_bytes_per_pixel)
+        .ok_or(ImageMatchError::ResourceDimensionOverflow { resource })?;
+    if bytes > maximum_bytes {
+        return Err(ImageMatchError::ResourceByteLimit {
+            resource,
+            actual: bytes,
+            maximum: maximum_bytes,
+        });
+    }
+    Ok((pixels, bytes))
+}
+
+pub(super) fn validate_search_dimensions(
+    dimensions: (u32, u32),
+    policy: ImageWorkPolicy,
+) -> std::result::Result<(), ImageMatchError> {
+    validate_resource_dimensions(
+        dimensions,
+        4,
+        ImageResourceKind::Search,
+        policy.maximum_search_pixels,
+        policy.maximum_search_bytes,
+    )?;
+    Ok(())
+}
+
 pub(super) fn validated_scale_plan(
     search_dimensions: (u32, u32),
     template: &GrayImage,
     mask: Option<&GrayImage>,
     scales_percent: &[u16],
-    limits: ImageWorkLimits,
+    policy: ImageWorkPolicy,
 ) -> std::result::Result<ValidatedScalePlan, ImageMatchError> {
+    validate_search_dimensions(search_dimensions, policy)?;
+    validate_resource_dimensions(
+        template.dimensions(),
+        4,
+        ImageResourceKind::Template,
+        policy.maximum_template_pixels,
+        policy.maximum_template_bytes,
+    )?;
+    if let Some(mask) = mask {
+        validate_resource_dimensions(
+            mask.dimensions(),
+            4,
+            ImageResourceKind::Mask,
+            policy.maximum_mask_pixels,
+            policy.maximum_mask_bytes,
+        )?;
+    }
     if scales_percent.is_empty() {
         return Err(ImageMatchError::NoFittingScale);
+    }
+    if scales_percent.len() > DEFAULT_MAX_SCALES {
+        return Err(ImageMatchError::ScaleCountLimit {
+            maximum: DEFAULT_MAX_SCALES,
+        });
     }
     let mut seen = BTreeSet::new();
     let mut scales = Vec::with_capacity(scales_percent.len());
     let mut total_cells = 0_u64;
     let mut total_pixel_operations = 0_u64;
+    let mut total_scaled_pixels = 0_u64;
+    let mut total_scaled_bytes = 0_u64;
     for &percent in scales_percent {
         if percent == 0 {
             return Err(ImageMatchError::ZeroScale);
@@ -1011,49 +1179,97 @@ pub(super) fn validated_scale_plan(
             .checked_mul(u64::from(search_dimensions.1 - height + 1))
             .ok_or(ImageMatchError::ScoreCellLimit {
                 actual: u64::MAX,
-                maximum: limits.maximum_score_cells,
+                maximum: policy.maximum_score_cells,
             })?;
         total_cells =
             total_cells
                 .checked_add(score_cells)
                 .ok_or(ImageMatchError::ScoreCellLimit {
                     actual: u64::MAX,
-                    maximum: limits.maximum_score_cells,
+                    maximum: policy.maximum_score_cells,
                 })?;
-        if total_cells > limits.maximum_score_cells {
+        if total_cells > policy.maximum_score_cells {
             return Err(ImageMatchError::ScoreCellLimit {
                 actual: total_cells,
-                maximum: limits.maximum_score_cells,
+                maximum: policy.maximum_score_cells,
+            });
+        }
+        let scaled_pixels = u64::from(width).checked_mul(u64::from(height)).ok_or(
+            ImageMatchError::ResourceDimensionOverflow {
+                resource: ImageResourceKind::ScaledTemplate,
+            },
+        )?;
+        if scaled_pixels > policy.maximum_scaled_template_pixels {
+            return Err(ImageMatchError::ResourcePixelLimit {
+                resource: ImageResourceKind::ScaledTemplate,
+                actual: scaled_pixels,
+                maximum: policy.maximum_scaled_template_pixels,
+            });
+        }
+        total_scaled_pixels = total_scaled_pixels.checked_add(scaled_pixels).ok_or(
+            ImageMatchError::ResourceDimensionOverflow {
+                resource: ImageResourceKind::TotalScaledTemplates,
+            },
+        )?;
+        if total_scaled_pixels > policy.maximum_total_scaled_pixels {
+            return Err(ImageMatchError::ResourcePixelLimit {
+                resource: ImageResourceKind::TotalScaledTemplates,
+                actual: total_scaled_pixels,
+                maximum: policy.maximum_total_scaled_pixels,
+            });
+        }
+        let scaled_bytes_per_pixel = if mask.is_some() { 2 } else { 1 };
+        let scaled_bytes = scaled_pixels.checked_mul(scaled_bytes_per_pixel).ok_or(
+            ImageMatchError::ResourceDimensionOverflow {
+                resource: ImageResourceKind::TotalScaledTemplates,
+            },
+        )?;
+        total_scaled_bytes = total_scaled_bytes.checked_add(scaled_bytes).ok_or(
+            ImageMatchError::ResourceDimensionOverflow {
+                resource: ImageResourceKind::TotalScaledTemplates,
+            },
+        )?;
+        if total_scaled_bytes > policy.maximum_total_scaled_bytes {
+            return Err(ImageMatchError::ResourceByteLimit {
+                resource: ImageResourceKind::TotalScaledTemplates,
+                actual: total_scaled_bytes,
+                maximum: policy.maximum_total_scaled_bytes,
             });
         }
         let active_pixels = if let Some(mask) = mask {
-            let base_active = mask.pixels().filter(|pixel| pixel[0] != 0).count() as u64;
+            let base_active = u64::try_from(mask.pixels().filter(|pixel| pixel[0] != 0).count())
+                .map_err(|_| ImageMatchError::ResourceDimensionOverflow {
+                    resource: ImageResourceKind::Mask,
+                })?;
             let horizontal_replication = width.div_ceil(template.width());
             let vertical_replication = height.div_ceil(template.height());
             base_active
-                .saturating_mul(u64::from(horizontal_replication))
-                .saturating_mul(u64::from(vertical_replication))
-                .min(u64::from(width) * u64::from(height))
+                .checked_mul(u64::from(horizontal_replication))
+                .and_then(|pixels| pixels.checked_mul(u64::from(vertical_replication)))
+                .ok_or(ImageMatchError::ResourceDimensionOverflow {
+                    resource: ImageResourceKind::ScaledTemplate,
+                })?
+                .min(scaled_pixels)
         } else {
-            u64::from(width) * u64::from(height)
+            scaled_pixels
         };
         let pixel_operations =
             score_cells
                 .checked_mul(active_pixels)
                 .ok_or(ImageMatchError::PixelOperationLimit {
                     actual: u64::MAX,
-                    maximum: limits.maximum_pixel_operations,
+                    maximum: policy.maximum_pixel_operations,
                 })?;
         total_pixel_operations = total_pixel_operations.checked_add(pixel_operations).ok_or(
             ImageMatchError::PixelOperationLimit {
                 actual: u64::MAX,
-                maximum: limits.maximum_pixel_operations,
+                maximum: policy.maximum_pixel_operations,
             },
         )?;
-        if total_pixel_operations > limits.maximum_pixel_operations {
+        if total_pixel_operations > policy.maximum_pixel_operations {
             return Err(ImageMatchError::PixelOperationLimit {
                 actual: total_pixel_operations,
-                maximum: limits.maximum_pixel_operations,
+                maximum: policy.maximum_pixel_operations,
             });
         }
         scales.push(ValidatedScale {
@@ -1070,7 +1286,9 @@ pub(super) fn validated_scale_plan(
         scales,
         score_cells: total_cells,
         pixel_operations: total_pixel_operations,
-        maximum_candidates: limits.maximum_candidates,
+        scaled_template_pixels: total_scaled_pixels,
+        scaled_template_bytes: total_scaled_bytes,
+        maximum_candidates: policy.maximum_candidates,
     })
 }
 
@@ -1318,17 +1536,23 @@ pub(super) fn validate_mask_reference<'a>(
 }
 
 pub(super) fn template_variance(template: &GrayImage, mask: Option<&GrayImage>) -> f32 {
-    let values = template
-        .enumerate_pixels()
-        .filter(|(x, y, _)| mask.is_none_or(|mask| mask.get_pixel(*x, *y)[0] != 0))
-        .map(|(_, _, pixel)| f64::from(pixel[0]))
-        .collect::<Vec<_>>();
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    (values
-        .iter()
-        .map(|value| (value - mean).powi(2))
-        .sum::<f64>()
-        / values.len() as f64) as f32
+    let mut count = 0_u64;
+    let mut mean = 0.0_f64;
+    let mut sum_squared_delta = 0.0_f64;
+    for (x, y, pixel) in template.enumerate_pixels() {
+        if mask.is_some_and(|mask| mask.get_pixel(x, y)[0] == 0) {
+            continue;
+        }
+        count += 1;
+        let value = f64::from(pixel[0]);
+        let delta = value - mean;
+        mean += delta / count as f64;
+        sum_squared_delta += delta * (value - mean);
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    (sum_squared_delta / count as f64) as f32
 }
 
 impl ImageMatcher {
@@ -1353,6 +1577,7 @@ impl ImageMatcher {
         if search.rgba.dimensions() != (capture_bounds.width, capture_bounds.height) {
             bail!("capture bounds dimensions do not match screen image");
         }
+        validate_search_dimensions(search.rgba.dimensions(), ImageWorkPolicy::production())?;
         let gray = image::DynamicImage::ImageRgba8(search.rgba.clone()).into_luma8();
         let mut result = self.match_template_masked(&gray, template, mask, config)?;
         for candidate in &mut result.candidates {
@@ -1381,6 +1606,13 @@ impl ImageMatcher {
         if !(0.0..=1.0).contains(&config.threshold) {
             bail!("image match threshold must be between 0 and 1");
         }
+        let plan = validated_scale_plan(
+            search.dimensions(),
+            template,
+            mask,
+            &config.scales_percent,
+            ImageWorkPolicy::production(),
+        )?;
         if let Some(mask) = mask {
             if mask.dimensions() != template.dimensions() {
                 bail!("image match mask dimensions must match the template");
@@ -1389,14 +1621,6 @@ impl ImageMatcher {
                 bail!("image match mask must retain at least one template pixel");
             }
         }
-
-        let plan = validated_scale_plan(
-            search.dimensions(),
-            template,
-            mask,
-            &config.scales_percent,
-            ImageWorkLimits::production(),
-        )?;
         let mut candidates = Vec::new();
         let mut best: Option<ImageMatchCandidate> = None;
         for scale in plan.scales {
@@ -1765,7 +1989,7 @@ mod tests {
     #[test]
     fn validated_scale_plan_rejects_zero_duplicate_and_non_fitting_scales() {
         let template = fixture_icon();
-        let limits = ImageWorkLimits::production();
+        let limits = ImageWorkPolicy::production();
 
         assert_eq!(
             validated_scale_plan((64, 48), &template, None, &[0], limits).unwrap_err(),
@@ -1784,16 +2008,155 @@ mod tests {
     #[test]
     fn validated_scale_plan_bounds_pixel_operations_independently_of_score_cells() {
         let template = fixture_icon();
-        let limits = ImageWorkLimits {
+        let limits = ImageWorkPolicy {
             maximum_score_cells: u64::MAX,
             maximum_pixel_operations: 10,
             maximum_candidates: DEFAULT_MAX_CANDIDATES,
+            ..ImageWorkPolicy::production()
         };
 
         assert!(matches!(
             validated_scale_plan((64, 48), &template, None, &[100], limits).unwrap_err(),
             ImageMatchError::PixelOperationLimit { .. }
         ));
+    }
+
+    #[test]
+    fn resource_policy_supports_4k_and_rejects_oversized_search_before_preprocess() {
+        let policy = ImageWorkPolicy::production();
+
+        validate_search_dimensions((4096, 4096), policy).unwrap();
+        assert_eq!(
+            validate_search_dimensions((4097, 4096), policy).unwrap_err(),
+            ImageMatchError::ResourcePixelLimit {
+                resource: ImageResourceKind::Search,
+                actual: 16_781_312,
+                maximum: DEFAULT_MAX_SEARCH_PIXELS,
+            }
+        );
+    }
+
+    #[test]
+    fn scale_count_is_bounded_before_plan_reservation() {
+        let template = fixture_icon();
+        let scales = vec![100; DEFAULT_MAX_SCALES + 1];
+
+        assert_eq!(
+            validated_scale_plan(
+                (64, 48),
+                &template,
+                None,
+                &scales,
+                ImageWorkPolicy::production(),
+            )
+            .unwrap_err(),
+            ImageMatchError::ScaleCountLimit {
+                maximum: DEFAULT_MAX_SCALES,
+            }
+        );
+    }
+
+    #[test]
+    fn authoring_resource_preflight_precedes_corpus_and_variance_work() {
+        let mut rule = fixture_rule(0.91);
+        rule.scales_percent = vec![100];
+        let template = fixture_icon();
+
+        let error = ImageRuleVerification::verify(ImageRuleVerificationInput {
+            rule: &rule,
+            template: &template,
+            mask: None,
+            captured_dpi: 96,
+            current_dpi: 96,
+            region_revision: 13,
+            search_dimensions: (4097, 4096),
+            negative_samples: &[],
+            observed_clusters: &[],
+            maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            ImageRuleVerificationError::InvalidWorkPlan(ImageMatchError::ResourcePixelLimit {
+                resource: ImageResourceKind::Search,
+                actual: 16_781_312,
+                maximum: DEFAULT_MAX_SEARCH_PIXELS,
+            })
+        );
+    }
+
+    #[test]
+    fn sparse_mask_cannot_bypass_scaled_template_total() {
+        let template = fixture_icon();
+        let mut mask = GrayImage::from_pixel(template.width(), template.height(), Luma([0]));
+        mask.put_pixel(0, 0, Luma([255]));
+        let policy = ImageWorkPolicy {
+            maximum_score_cells: u64::MAX,
+            maximum_pixel_operations: u64::MAX,
+            maximum_total_scaled_pixels: 34,
+            ..ImageWorkPolicy::production()
+        };
+
+        assert_eq!(
+            validated_scale_plan((64, 48), &template, Some(&mask), &[100], policy).unwrap_err(),
+            ImageMatchError::ResourcePixelLimit {
+                resource: ImageResourceKind::TotalScaledTemplates,
+                actual: 35,
+                maximum: 34,
+            }
+        );
+    }
+
+    #[test]
+    fn per_scaled_template_cap_is_independent_of_sparse_mask_activity() {
+        let template = fixture_icon();
+        let mut mask = GrayImage::from_pixel(template.width(), template.height(), Luma([0]));
+        mask.put_pixel(0, 0, Luma([255]));
+        let policy = ImageWorkPolicy {
+            maximum_score_cells: u64::MAX,
+            maximum_pixel_operations: u64::MAX,
+            maximum_scaled_template_pixels: 34,
+            ..ImageWorkPolicy::production()
+        };
+
+        assert_eq!(
+            validated_scale_plan((64, 48), &template, Some(&mask), &[100], policy).unwrap_err(),
+            ImageMatchError::ResourcePixelLimit {
+                resource: ImageResourceKind::ScaledTemplate,
+                actual: 35,
+                maximum: 34,
+            }
+        );
+    }
+
+    #[test]
+    fn decoded_byte_cap_is_checked_independently_of_pixel_cap() {
+        assert_eq!(
+            validate_resource_dimensions((2, 2), 4, ImageResourceKind::Mask, 10, 15).unwrap_err(),
+            ImageMatchError::ResourceByteLimit {
+                resource: ImageResourceKind::Mask,
+                actual: 16,
+                maximum: 15,
+            }
+        );
+    }
+
+    #[test]
+    fn resource_byte_accounting_rejects_arithmetic_overflow() {
+        assert_eq!(
+            validate_resource_dimensions(
+                (u32::MAX, u32::MAX),
+                4,
+                ImageResourceKind::Template,
+                u64::MAX,
+                u64::MAX,
+            )
+            .unwrap_err(),
+            ImageMatchError::ResourceDimensionOverflow {
+                resource: ImageResourceKind::Template,
+            }
+        );
     }
 
     #[test]
@@ -2058,6 +2421,26 @@ mod tests {
     }
 
     #[test]
+    fn process_restart_revision_cannot_continue_prior_process_stability() {
+        let mut tracker = StabilityTracker::new(2, 40, 3);
+        assert!(matches!(
+            tracker.observe(frame(1, 100, 20, 100)),
+            StabilityOutcome::Accepted {
+                qualified: false,
+                ..
+            }
+        ));
+        let mut restarted_process = frame(2, 160, 20, 100);
+        // Production derives this revision from HWND + PID + process creation FILETIME.
+        restarted_process.frame.window_revision += 1;
+
+        assert_eq!(
+            tracker.observe(restarted_process),
+            StabilityOutcome::Reset { stable_frames: 1 }
+        );
+    }
+
+    #[test]
     fn masked_matching_ignores_transparent_template_pixels() {
         let mut template = fixture_icon();
         let mut search = fixture_search_with_icon_at(23, 17);
@@ -2223,6 +2606,20 @@ mod tests {
             verify_negative_corpus_for_test(&rule, &[changed_input]).unwrap_err(),
             ImageRuleVerificationError::NegativeSampleEvaluationMismatch {
                 stable_id: "negative/a".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn negative_corpus_count_is_bounded_before_canonicalization() {
+        let rule = fixture_rule(0.91);
+        let sample = corpus_sample(&rule, "negative/a", NEGATIVE_CORPUS_SHA256, 0.80);
+        let samples = vec![sample; DEFAULT_MAX_NEGATIVE_SAMPLES + 1];
+
+        assert_eq!(
+            verify_negative_corpus_for_test(&rule, &samples).unwrap_err(),
+            ImageRuleVerificationError::NegativeCorpusLimit {
+                maximum: DEFAULT_MAX_NEGATIVE_SAMPLES,
             }
         );
     }

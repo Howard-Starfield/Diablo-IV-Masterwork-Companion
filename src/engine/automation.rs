@@ -43,6 +43,9 @@ pub struct AtomicCaptureSnapshot {
     pub window_id: u64,
     pub window_revision: u64,
     pub process_id: u32,
+    /// Raw Win32 process creation `FILETIME`, in 100-nanosecond ticks.
+    /// Together with PID this distinguishes a restarted process after PID/HWND reuse.
+    pub process_started_at_100ns: u64,
     /// Screen-space Win32 client area, excluding the non-client frame and title bar.
     pub client_rect: Rect,
     pub geometry_revision: u64,
@@ -281,6 +284,7 @@ mod tests {
             window_id: 91,
             window_revision: 7,
             process_id: 4,
+            process_started_at_100ns: 6,
             client_rect: Rect::new(10, 20, 800, 600),
             geometry_revision: 8,
             display_id: "display-a".to_string(),
@@ -318,6 +322,23 @@ mod tests {
         let before = atomic_snapshot(region);
         let mut after = before.clone();
         after.client_rect.width -= 1;
+        let capture = AtomicFrameCapture::new(
+            FakeSnapshots(Mutex::new(VecDeque::from([before, after]))),
+            FakeRawCapture,
+            FakeClock(123),
+        );
+
+        let error = capture.capture_frame(region).unwrap_err();
+
+        assert!(error.downcast_ref::<StaleCapturedFrameError>().is_some());
+    }
+
+    #[test]
+    fn bracketed_capture_rejects_process_identity_reuse_during_capture() {
+        let region = Rect::new(50, 60, 20, 10);
+        let before = atomic_snapshot(region);
+        let mut after = before.clone();
+        after.process_started_at_100ns += 1;
         let capture = AtomicFrameCapture::new(
             FakeSnapshots(Mutex::new(VecDeque::from([before, after]))),
             FakeRawCapture,

@@ -20,13 +20,18 @@ use windows::{
     Media::Ocr::OcrEngine,
     Storage::{FileAccessMode, StorageFile},
     Win32::{
-        Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{
+            COLORREF, CloseHandle, FILETIME, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+        },
         Graphics::Gdi::{
             BLACK_BRUSH, BeginPaint, ClientToScreen, CreatePen, DeleteObject, EndPaint, FillRect,
             GetStockObject, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, Rectangle, SelectObject, SetBkMode,
             SetTextColor, TRANSPARENT, TextOutW,
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        },
         UI::{
             HiDpi::{
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -221,6 +226,7 @@ impl<G: WindowClientGeometrySource> AtomicFrameSnapshotSource
         let window = self.target_window()?;
         let window_id = window.id()?;
         let process_id = window.pid()?;
+        let process_started_at_100ns = process_started_at_100ns(process_id)?;
         let client_rect = self.client_rect()?;
         window_local_to_screen(client_rect, requested_region).with_context(|| {
             format!("requested macro capture region is outside xcap window {window_id}")
@@ -244,8 +250,9 @@ impl<G: WindowClientGeometrySource> AtomicFrameSnapshotSource
         Ok(AtomicCaptureSnapshot {
             requested_region,
             window_id: u64::from(window_id),
-            window_revision: stable_revision(&(window_id, process_id)),
+            window_revision: window_revision(window_id, process_id, process_started_at_100ns),
             process_id,
+            process_started_at_100ns,
             client_rect,
             geometry_revision: stable_revision(&(
                 client_rect.x,
@@ -287,6 +294,28 @@ fn stable_revision(value: &impl Hash) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+fn window_revision(window_id: u32, process_id: u32, process_started_at_100ns: u64) -> u64 {
+    stable_revision(&(window_id, process_id, process_started_at_100ns))
+}
+
+fn process_started_at_100ns(process_id: u32) -> Result<u64> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+        .with_context(|| format!("failed to open process {process_id} for identity query"))?;
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let query_result =
+        unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
+    let close_result = unsafe { CloseHandle(process) };
+    query_result
+        .with_context(|| format!("failed to query creation time for process {process_id}"))?;
+    close_result
+        .with_context(|| format!("failed to close process {process_id} identity handle"))?;
+
+    Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
 fn rect_contains(container: Rect, nested: Rect) -> bool {
@@ -1400,5 +1429,13 @@ mod tests {
             hwnd_from_xcap_window_id(0x8000_0001).0 as isize,
             i32::MIN as isize + 1
         );
+    }
+
+    #[test]
+    fn window_revision_changes_when_same_hwnd_and_pid_belong_to_restarted_process() {
+        let before = window_revision(42, 7, 100);
+        let after = window_revision(42, 7, 101);
+
+        assert_ne!(before, after);
     }
 }

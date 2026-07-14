@@ -2148,7 +2148,7 @@ impl NativeApp {
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.config.targets_text)
                             .desired_width(ui.available_width())
-                            .font(egui::TextStyle::Heading),
+                            .font(egui::TextStyle::Body),
                     );
                     if response.changed() {
                         self.handle_live_match_setting_changed(ui.ctx());

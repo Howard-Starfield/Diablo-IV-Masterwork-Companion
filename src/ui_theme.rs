@@ -106,7 +106,6 @@ pub fn apply(ctx: &Context) {
 
 fn app_visuals() -> egui::Visuals {
     let mut visuals = egui::Visuals::dark();
-    visuals.override_text_color = Some(colors::PRIMARY_TEXT);
     visuals.panel_fill = colors::CANVAS;
     visuals.window_fill = colors::SURFACE;
     visuals.faint_bg_color = colors::SURFACE;
@@ -147,5 +146,10 @@ mod tests {
             assert!(!style.label.is_empty());
             assert!(!style.icon.is_empty());
         }
+    }
+
+    #[test]
+    fn visuals_preserve_explicit_semantic_text_colors() {
+        assert_eq!(app_visuals().override_text_color, None);
     }
 }

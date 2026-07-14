@@ -3429,10 +3429,29 @@ impl MacroController {
                         let _ = startup_sender.send(false);
                     }
                     first_cycle = false;
+                    let emergency_stopped = matches!(
+                        &result,
+                        Ok(Some(events))
+                            if events.iter().any(|event| matches!(
+                                event,
+                                RunEvent::RunStopped {
+                                    reason: StopReason::EmergencyStopped,
+                                    ..
+                                }
+                            ))
+                    );
                     let mut state = shared_state
                         .lock()
                         .expect("macro controller state poisoned");
                     state.completed_cycles = state.completed_cycles.saturating_add(1);
+                    if emergency_stopped {
+                        // Runtime-owned emergency sources (including the native ESC watcher)
+                        // terminate one runtime cycle directly. Promote that terminal outcome to
+                        // controller lifecycle state before deciding whether a continuous run may
+                        // begin another cycle.
+                        state.stop_requested = true;
+                        state.status = MacroControllerStatus::Stopping;
+                    }
                     let stop = state.stop_requested
                         || matches!(request.extent, ControllerRunExtent::Once)
                         || result.is_err();
@@ -12177,6 +12196,54 @@ mod tests {
         controller.stop();
         controller.wait_until_idle(Duration::from_secs(2)).unwrap();
         assert!(controller.completed_cycles() > 0);
+    }
+
+    #[test]
+    fn continuous_controller_does_not_restart_after_runtime_emergency_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MacroStore::open(temp.path()).unwrap());
+        let runtime = fixture_runtime();
+        let definition = fixture_definition(vec![block(
+            "wait",
+            BlockKind::Wait {
+                duration_ms: 60_000,
+            },
+        )]);
+        store.save_validated(definition).unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let gate = Arc::new(ControllerCycleTestGate {
+            target_cycle: 2,
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let controller =
+            MacroController::new(runtime.clone(), Arc::clone(&store), 128).with_cycle_gate(gate);
+
+        controller
+            .start_saved("macro", ControllerRunRequest::continuous(RunMode::DryRun))
+            .unwrap();
+        wait_for_controller_event(&controller, |event| {
+            matches!(event, RunEvent::RunStarted { .. })
+        });
+
+        runtime.emergency_stop();
+        let stopped = wait_for_controller_event(&controller, |event| {
+            matches!(event, RunEvent::RunStopped { .. })
+        });
+        assert!(matches!(
+            stopped,
+            RunEvent::RunStopped {
+                reason: StopReason::EmergencyStopped,
+                ..
+            }
+        ));
+        if entered_rx.recv_timeout(Duration::from_millis(100)).is_ok() {
+            release_tx.send(()).unwrap();
+            panic!("continuous controller started another cycle after emergency stop");
+        }
+        controller.wait_until_idle(Duration::from_secs(2)).unwrap();
+        assert_eq!(controller.completed_cycles(), 1);
     }
 
     #[test]

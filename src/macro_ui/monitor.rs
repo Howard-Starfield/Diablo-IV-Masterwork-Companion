@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use eframe::egui::{self, Color32, Frame, Grid, RichText, Stroke, Ui};
 
 use crate::engine::macro_engine::{
-    ActionAttemptId, ActionState, Block, BlockKind, MacroDefinition, RunEvent, RunMode, RunStatus,
-    SavedRevision, StopReason,
+    ActionAttemptId, ActionState, Block, BlockKind, ControllerLifecycleProjection,
+    ControllerSemanticProjection, MacroDefinition, RunEvent, RunMode, RunStatus, SavedRevision,
+    StopReason,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -263,6 +264,20 @@ pub fn project_monitor(
     projection
 }
 
+/// Builds a monitor from the bounded replay buffer plus the controller's durable lifecycle and
+/// latest semantic projections. The projections retain run ownership and terminal state after the
+/// raw replay buffer evicts a `RunStarted` event.
+pub fn project_monitor_with_controller_projections(
+    selected_macro_id: Option<&str>,
+    run_snapshot: Option<&RunDefinitionSnapshot>,
+    replay_events: &[RunEvent],
+    lifecycle: &ControllerLifecycleProjection,
+    semantic: &ControllerSemanticProjection,
+) -> MonitorProjection {
+    let events = controller_projection_events(replay_events, lifecycle, semantic);
+    project_monitor(selected_macro_id, run_snapshot, &events)
+}
+
 pub fn project_last_completion(events: &[RunEvent], macro_id: &str) -> Option<StopOutcome> {
     let mut run_owners = HashMap::new();
     let mut latest = None;
@@ -284,6 +299,49 @@ pub fn project_last_completion(events: &[RunEvent], macro_id: &str) -> Option<St
         }
     }
     latest
+}
+
+pub fn project_last_completion_with_controller_projections(
+    replay_events: &[RunEvent],
+    macro_id: &str,
+    lifecycle: &ControllerLifecycleProjection,
+    semantic: &ControllerSemanticProjection,
+) -> Option<StopOutcome> {
+    let events = controller_projection_events(replay_events, lifecycle, semantic);
+    project_last_completion(&events, macro_id)
+}
+
+fn controller_projection_events(
+    replay_events: &[RunEvent],
+    lifecycle: &ControllerLifecycleProjection,
+    semantic: &ControllerSemanticProjection,
+) -> Vec<RunEvent> {
+    let mut events = replay_events.to_vec();
+    for event in [
+        lifecycle.run_started.as_ref(),
+        lifecycle.run_stopped.as_ref(),
+        semantic.run_started.as_ref(),
+        semantic.status.as_ref(),
+        semantic.active_block.as_ref(),
+        semantic.latest_observation.as_ref(),
+        semantic.latest_condition.as_ref(),
+        semantic.latest_progress.as_ref(),
+        semantic.latest_action.as_ref(),
+        semantic.latest_loop.as_ref(),
+        semantic.latest_arbitration.as_ref(),
+        semantic.latest_polling_delay.as_ref(),
+        semantic.latest_error.as_ref(),
+        semantic.run_stopped.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !events.contains(event) {
+            events.push(event.clone());
+        }
+    }
+    events.sort_by_key(RunEvent::sequence);
+    events
 }
 
 fn latest_selected_run<'a>(events: &'a [RunEvent], macro_id: &str) -> Option<SelectedRun<'a>> {
@@ -606,6 +664,10 @@ fn format_elapsed(elapsed_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::engine::macro_engine::{
+        ControllerLifecycleProjection, ControllerSemanticProjection,
+    };
+
     use serde_json::json;
 
     use crate::engine::macro_engine::{
@@ -1015,6 +1077,49 @@ mod tests {
         ];
 
         assert_eq!(project_last_completion(&events, "alpha"), None);
+    }
+
+    #[test]
+    fn controller_projections_preserve_terminal_outcome_after_started_event_eviction() {
+        let stopped = RunEvent::RunStopped {
+            sequence: 3,
+            elapsed_ms: 40,
+            run_id: "evicted-run".to_string(),
+            status: RunStatus::Stopped,
+            reason: StopReason::EmergencyStopped,
+        };
+        let lifecycle = ControllerLifecycleProjection {
+            run_started: Some(started(1, "evicted-run", "alpha", 1, "hash")),
+            run_stopped: Some(stopped.clone()),
+        };
+        let semantic = ControllerSemanticProjection {
+            run_started: lifecycle.run_started.clone(),
+            run_stopped: Some(stopped.clone()),
+            status: Some(stopped.clone()),
+            ..ControllerSemanticProjection::default()
+        };
+
+        let monitor = project_monitor_with_controller_projections(
+            Some("alpha"),
+            None,
+            &[stopped],
+            &lifecycle,
+            &semantic,
+        );
+        let completion = project_last_completion_with_controller_projections(
+            &[],
+            "alpha",
+            &lifecycle,
+            &semantic,
+        )
+        .unwrap();
+
+        assert_eq!(monitor.status, RunStatus::Stopped);
+        assert_eq!(
+            monitor.stop_outcome.as_ref().map(|outcome| &outcome.reason),
+            Some(&StopReason::EmergencyStopped)
+        );
+        assert_eq!(completion.reason, StopReason::EmergencyStopped);
     }
 
     #[test]

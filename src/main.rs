@@ -9,9 +9,9 @@ use std::{
     io::Cursor,
     path::PathBuf,
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -21,23 +21,23 @@ mod engine;
 mod macro_ui;
 
 use crate::engine::{
-    config::{default_mouse_movement_profile, EnchantConfig, MouseMovementProfile},
+    config::{EnchantConfig, MouseMovementProfile, default_mouse_movement_profile},
     enchant_loop::{EnchantEvent, EnchantRunner, OcrReader, RegionCapture},
     macro_engine::{
-        authoring_test_text_rule, cluster_peaks, AssetRef, AssetStore, ClusterPolicy,
-        ControllerRunRequest, ImageMatchCandidate, ImageMatchConfig, ImageMatchResult,
-        ImageMatcher, ImageRule, ImageRuleVerification, ImageRuleVerificationInput,
-        MacroController, MacroStore, NegativeCorpusSample, NegativeSampleEvaluationInputs,
-        PreparedPackageImport, RunEvent, RunMode, SavedRevision, TargetProfile,
-        DEFAULT_MAX_SCORE_CELLS,
+        AssetRef, AssetStore, ClusterPolicy, ControllerRunRequest, DEFAULT_MAX_SCORE_CELLS,
+        ImageMatchCandidate, ImageMatchConfig, ImageMatchResult, ImageMatcher, ImageRule,
+        ImageRuleVerification, ImageRuleVerificationInput, MacroController, MacroStore,
+        NegativeCorpusSample, NegativeSampleEvaluationInputs, PreparedPackageImport, RunEvent,
+        RunMode, SavedRevision, TargetProfile, authoring_test_text_rule, cluster_peaks,
     },
-    matcher::{match_affix, MatchResult},
+    matcher::{MatchResult, match_affix},
     platform::{
+        CaptureRequestId, CapturedTargetBinding, CapturedTargetProfile, EscStopSignal,
+        MacroCaptureKind, MacroCaptureRequest, MacroCaptureSelection, SendInputController,
+        WindowsMacroRuntimeBundle, WindowsOcrReader, XcapRegionCapture,
         build_windows_macro_runtime, enable_per_monitor_dpi_awareness,
         record_mouse_movement_profile, resolve_target_from_selection, select_macro_capture,
-        select_screen_rect, CaptureRequestId, CapturedTargetBinding, CapturedTargetProfile,
-        EscStopSignal, MacroCaptureKind, MacroCaptureRequest, MacroCaptureSelection,
-        SendInputController, WindowsMacroRuntimeBundle, WindowsOcrReader, XcapRegionCapture,
+        select_screen_rect,
     },
     types::{PointRatio, Rect, RectRatio},
 };
@@ -48,24 +48,24 @@ use crate::macro_ui::{
     WizardAuthoringRequest, WizardAuthoringResult, WizardDetector,
 };
 use eframe::{
+    App, CreationContext,
     egui::{
         self, Align, Button, CentralPanel, Color32, Context, Frame, Grid, Layout, RichText, Sense,
         Slider, Stroke, TopBottomPanel, Ui, Vec2, ViewportCommand, Widget,
     },
-    App, CreationContext,
 };
 use image::{DynamicImage, ImageFormat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use windows::{
-    core::{w, HSTRING},
     Win32::{
         Foundation::{
-            CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, HANDLE, WIN32_ERROR,
+            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, SetLastError, WIN32_ERROR,
         },
         System::Threading::CreateMutexW,
-        UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK},
+        UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW},
     },
+    core::{HSTRING, w},
 };
 
 const APP_WIDTH: f32 = 600.0;
@@ -163,21 +163,22 @@ fn main() -> eframe::Result<()> {
 
     // Keep this guard alive for the entire UI process so staged macro revisions cannot be
     // concurrently recovered or replaced by another application instance.
-    let _single_instance =
-        match SingleInstanceGuard::acquire_with(Win32NamedMutexBackend, SINGLE_INSTANCE_MUTEX_NAME)
-        {
-            Ok(Some(guard)) => guard,
-            Ok(None) => {
-                show_startup_notice("BoBo Companion is already running.");
-                return Ok(());
-            }
-            Err(error) => {
-                show_startup_notice(&format!(
+    let _single_instance = match SingleInstanceGuard::acquire_with(
+        Win32NamedMutexBackend,
+        SINGLE_INSTANCE_MUTEX_NAME,
+    ) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            show_startup_notice("BoBo Companion is already running.");
+            return Ok(());
+        }
+        Err(error) => {
+            show_startup_notice(&format!(
                 "BoBo Companion could not establish its single-instance safety boundary:\n\n{error}"
             ));
-                return Ok(());
-            }
-        };
+            return Ok(());
+        }
+    };
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("BoBo Companion")
@@ -707,6 +708,8 @@ impl NativeApp {
         }
         self.macro_controller = Some(controller);
         self.active_macro_bundle = Some(bundle);
+        self.macro_state.controller_lifecycle = None;
+        self.macro_state.controller_semantic = None;
     }
 
     fn sync_macro_runtime(&mut self) {
@@ -714,6 +717,18 @@ impl NativeApp {
             return;
         };
         let saved = controller.active_revision();
+        let lifecycle = controller.lifecycle_projection();
+        let semantic = controller.semantic_projection();
+        if let (Some(saved), Some(RunEvent::RunStarted { run_id, .. })) =
+            (saved.as_ref(), lifecycle.run_started.as_ref())
+        {
+            self.macro_state.running_snapshot = Some(RunDefinitionSnapshot::from_saved(
+                run_id.clone(),
+                saved.clone(),
+            ));
+        }
+        self.macro_state.controller_lifecycle = Some(lifecycle);
+        self.macro_state.controller_semantic = Some(semantic);
         while let Some(event) = controller.try_next_event() {
             if self.macro_state.runtime_events.len() >= 256 {
                 self.macro_state.runtime_events.remove(0);
@@ -2994,15 +3009,17 @@ mod routing_tests {
         assert_eq!(primary_closes.load(Ordering::SeqCst), 1);
 
         let duplicate_closes = Arc::new(AtomicUsize::new(0));
-        assert!(SingleInstanceGuard::acquire_with(
-            FakeNamedMutexBackend {
-                already_exists: true,
-                closes: Arc::clone(&duplicate_closes),
-            },
-            "test-duplicate",
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            SingleInstanceGuard::acquire_with(
+                FakeNamedMutexBackend {
+                    already_exists: true,
+                    closes: Arc::clone(&duplicate_closes),
+                },
+                "test-duplicate",
+            )
+            .unwrap()
+            .is_none()
+        );
         assert_eq!(duplicate_closes.load(Ordering::SeqCst), 1);
     }
 
@@ -3071,29 +3088,33 @@ mod routing_tests {
         let store = MacroStore::open(temp.path()).unwrap();
         let assets = store.assets();
 
-        assert!(publish_pending_template_if_current(
-            false,
-            Some(assets),
-            PendingTemplateCapture {
-                bytes: b"initial".to_vec(),
-                previous: None,
-            },
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            publish_pending_template_if_current(
+                false,
+                Some(assets),
+                PendingTemplateCapture {
+                    bytes: b"initial".to_vec(),
+                    previous: None,
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
         let initial = assets.put_png(b"initial").unwrap();
         assert!(initial.id.ends_with("-1"));
 
-        assert!(publish_pending_template_if_current(
-            false,
-            Some(assets),
-            PendingTemplateCapture {
-                bytes: b"stale successor".to_vec(),
-                previous: Some(initial.clone()),
-            },
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            publish_pending_template_if_current(
+                false,
+                Some(assets),
+                PendingTemplateCapture {
+                    bytes: b"stale successor".to_vec(),
+                    previous: Some(initial.clone()),
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
         let successor = assets
             .put_next_png_revision(&initial, b"accepted successor")
             .unwrap();

@@ -6,7 +6,7 @@ mod timeline;
 mod wizard;
 
 pub use editor::*;
-pub use library::{project_definition, MacroLibraryRow};
+pub use library::{MacroLibraryRow, project_definition};
 pub use monitor::RunDefinitionSnapshot;
 pub use wizard::*;
 
@@ -14,10 +14,17 @@ use std::collections::VecDeque;
 
 use eframe::egui::{self, Align, Button, Color32, Frame, Layout, RichText, Stroke, Ui};
 
-use crate::engine::macro_engine::{RunEvent, RunStatus, ValidationProblem};
+use crate::engine::macro_engine::{
+    ControllerLifecycleProjection, ControllerSemanticProjection, RunEvent, RunStatus,
+    ValidationProblem,
+};
 
-use monitor::{project_last_completion, project_monitor, MonitorProjection};
-use timeline::{project_timeline, TimelineRow, TimelineSelection};
+use monitor::{
+    MonitorProjection, project_last_completion,
+    project_last_completion_with_controller_projections, project_monitor,
+    project_monitor_with_controller_projections,
+};
+use timeline::{TimelineRow, TimelineSelection, project_timeline};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EditorAuthoringRequestId(pub u64);
@@ -134,7 +141,7 @@ pub struct MacroIntentQueue {
 }
 
 impl MacroIntentQueue {
-    pub const DEFAULT_CAPACITY: usize = 32;
+    pub const DEFAULT_CAPACITY: usize = 64;
 
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "macro intent capacity must be positive");
@@ -161,8 +168,16 @@ impl MacroIntentQueue {
         self.values.pop_front()
     }
 
-    pub fn len(&self) -> usize {
+    pub fn drain(&mut self) -> std::collections::vec_deque::Drain<'_, MacroIntent> {
+        self.values.drain(..)
+    }
+
+    pub fn pending(&self) -> usize {
         self.values.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending()
     }
 }
 
@@ -176,6 +191,8 @@ pub struct MacroPageState {
     pub enabled: bool,
     pub running_snapshot: Option<RunDefinitionSnapshot>,
     pub runtime_events: Vec<RunEvent>,
+    pub controller_lifecycle: Option<ControllerLifecycleProjection>,
+    pub controller_semantic: Option<ControllerSemanticProjection>,
     pub library_rows: Vec<MacroLibraryRow>,
     intents: MacroIntentQueue,
     pub selected_block_id: Option<String>,
@@ -207,6 +224,8 @@ impl Default for MacroPageState {
             enabled: true,
             running_snapshot: None,
             runtime_events: Vec::new(),
+            controller_lifecycle: None,
+            controller_semantic: None,
             library_rows: Vec::new(),
             intents: MacroIntentQueue::with_capacity(MacroIntentQueue::DEFAULT_CAPACITY),
             selected_block_id: None,
@@ -846,13 +865,8 @@ impl MacroPage {
             };
         }
         let selected_macro_id = state.selected_saved_macro_id();
-        let monitor = project_monitor(
-            selected_macro_id,
-            state.running_snapshot.as_ref(),
-            &state.runtime_events,
-        );
-        let last_completion = selected_macro_id
-            .and_then(|macro_id| project_last_completion(&state.runtime_events, macro_id));
+        let monitor = monitor_from_runtime_state(state, selected_macro_id);
+        let last_completion = last_completion_from_runtime_state(state, selected_macro_id);
         let problems = state
             .draft
             .as_ref()
@@ -916,12 +930,44 @@ impl MacroPage {
 
     pub fn show_monitor(ui: &mut Ui, state: &MacroPageState) {
         let selected_macro_id = state.selected_saved_macro_id();
-        let monitor = project_monitor(
+        let monitor = monitor_from_runtime_state(state, selected_macro_id);
+        monitor::show(ui, &monitor);
+    }
+}
+
+fn monitor_from_runtime_state(
+    state: &MacroPageState,
+    selected_macro_id: Option<&str>,
+) -> MonitorProjection {
+    match (&state.controller_lifecycle, &state.controller_semantic) {
+        (Some(lifecycle), Some(semantic)) => project_monitor_with_controller_projections(
             selected_macro_id,
             state.running_snapshot.as_ref(),
             &state.runtime_events,
-        );
-        monitor::show(ui, &monitor);
+            lifecycle,
+            semantic,
+        ),
+        _ => project_monitor(
+            selected_macro_id,
+            state.running_snapshot.as_ref(),
+            &state.runtime_events,
+        ),
+    }
+}
+
+fn last_completion_from_runtime_state(
+    state: &MacroPageState,
+    selected_macro_id: Option<&str>,
+) -> Option<monitor::StopOutcome> {
+    let macro_id = selected_macro_id?;
+    match (&state.controller_lifecycle, &state.controller_semantic) {
+        (Some(lifecycle), Some(semantic)) => project_last_completion_with_controller_projections(
+            &state.runtime_events,
+            macro_id,
+            lifecycle,
+            semantic,
+        ),
+        _ => project_last_completion(&state.runtime_events, macro_id),
     }
 }
 
@@ -3071,6 +3117,29 @@ mod tests {
     }
 
     #[test]
+    fn intent_queue_exposes_its_64_item_default_capacity_and_drains_in_order() {
+        let mut intents = MacroIntentQueue::with_capacity(MacroIntentQueue::DEFAULT_CAPACITY);
+        for index in 0..MacroIntentQueue::DEFAULT_CAPACITY {
+            intents.push(MacroIntent::Select {
+                macro_id: format!("macro-{index}"),
+            });
+        }
+        intents.push(MacroIntent::Run);
+
+        assert_eq!(MacroIntentQueue::DEFAULT_CAPACITY, 64);
+        assert_eq!(intents.pending(), 64);
+        assert_eq!(
+            intents.drain().collect::<Vec<_>>(),
+            (0..64)
+                .map(|index| MacroIntent::Select {
+                    macro_id: format!("macro-{index}"),
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(intents.pending(), 0);
+    }
+
+    #[test]
     fn revision_summary_distinguishes_draft_saved_and_running() {
         let mut monitor = MonitorProjection::default();
         monitor.running_revision = Some(3);
@@ -3215,11 +3284,13 @@ mod tests {
             },
         );
         assert_eq!(result, Err(EditorError::RunInProgress));
-        assert!(state
-            .editor_feedback
-            .as_deref()
-            .unwrap()
-            .contains("RunInProgress"));
+        assert!(
+            state
+                .editor_feedback
+                .as_deref()
+                .unwrap()
+                .contains("RunInProgress")
+        );
     }
 
     #[test]
@@ -4090,9 +4161,11 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(editor_validation_problems(state.draft.as_ref().unwrap())
-            .iter()
-            .any(|problem| problem.code == "editor.detector_test_failed"));
+        assert!(
+            editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
         assert_eq!(
             apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,),
             Err(EditorError::ValidationFailed)
@@ -4115,9 +4188,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(editor_validation_problems(state.draft.as_ref().unwrap())
-            .iter()
-            .any(|problem| problem.code == "editor.detector_test_failed"));
+        assert!(
+            editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
         assert_eq!(
             apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,),
             Err(EditorError::ValidationFailed)
@@ -4144,9 +4219,11 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(!editor_validation_problems(state.draft.as_ref().unwrap())
-            .iter()
-            .any(|problem| problem.code == "editor.detector_test_failed"));
+        assert!(
+            !editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
         assert!(
             apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,)
                 .is_ok()
@@ -4180,9 +4257,11 @@ mod tests {
             EditorCommand::ReplaceTextRule { rule: edited_rule },
         )
         .unwrap();
-        assert!(!editor_validation_problems(state.draft.as_ref().unwrap())
-            .iter()
-            .any(|problem| problem.code == "editor.detector_test_failed"));
+        assert!(
+            !editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
         assert!(
             apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,)
                 .is_ok()
@@ -4257,9 +4336,11 @@ mod tests {
                 }),
             })
             .unwrap();
-        assert!(state.draft.as_ref().unwrap().image_rules[0]
-            .verification
-            .is_none());
+        assert!(
+            state.draft.as_ref().unwrap().image_rules[0]
+                .verification
+                .is_none()
+        );
 
         let rule = state.draft.as_ref().unwrap().image_rules[0].clone();
         let region_revision = state.draft.as_ref().unwrap().regions[0].revision;
@@ -4342,9 +4423,11 @@ mod tests {
             }),
             Err(EditorAuthoringError::OutcomeMismatch)
         );
-        assert!(state.draft.as_ref().unwrap().image_rules[0]
-            .verification
-            .is_none());
+        assert!(
+            state.draft.as_ref().unwrap().image_rules[0]
+                .verification
+                .is_none()
+        );
 
         handle_inspector_intent(
             &mut state,
@@ -4368,9 +4451,11 @@ mod tests {
             })
             .unwrap();
 
-        assert!(state.draft.as_ref().unwrap().image_rules[0]
-            .verification
-            .is_some());
+        assert!(
+            state.draft.as_ref().unwrap().image_rules[0]
+                .verification
+                .is_some()
+        );
         assert!(validate_macro(state.draft.as_ref().unwrap()).is_empty());
 
         handle_inspector_intent(
@@ -4394,12 +4479,16 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(state.draft.as_ref().unwrap().image_rules[0]
-            .verification
-            .is_none());
-        assert!(editor_validation_problems(state.draft.as_ref().unwrap())
-            .iter()
-            .any(|problem| problem.code == "editor.detector_test_failed"));
+        assert!(
+            state.draft.as_ref().unwrap().image_rules[0]
+                .verification
+                .is_none()
+        );
+        assert!(
+            editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
 
         handle_inspector_intent(
             &mut state,
@@ -4422,12 +4511,16 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(state.draft.as_ref().unwrap().image_rules[0]
-            .verification
-            .is_some());
-        assert!(!editor_validation_problems(state.draft.as_ref().unwrap())
-            .iter()
-            .any(|problem| problem.code == "editor.detector_test_failed"));
+        assert!(
+            state.draft.as_ref().unwrap().image_rules[0]
+                .verification
+                .is_some()
+        );
+        assert!(
+            !editor_validation_problems(state.draft.as_ref().unwrap())
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
 
         let mut edited = state.draft.as_ref().unwrap().image_rules[0].clone();
         edited.threshold = 0.92;
@@ -4439,11 +4532,13 @@ mod tests {
                 block_id: "observe-1".into(),
             },
         );
-        assert!(state
-            .take_editor_authoring_request()
-            .unwrap()
-            .image_negative_samples
-            .is_empty());
+        assert!(
+            state
+                .take_editor_authoring_request()
+                .unwrap()
+                .image_negative_samples
+                .is_empty()
+        );
     }
 
     #[test]

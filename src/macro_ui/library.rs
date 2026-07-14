@@ -21,9 +21,21 @@ impl MacroLibraryStatus {
         match self {
             Self::Draft => "Draft",
             Self::Ready => "Ready",
-            Self::NeedsRevalidation | Self::StoppedWithError => "Needs Attention",
+            Self::NeedsRevalidation => "Needs revalidation",
             Self::Running => "Running",
+            Self::StoppedWithError => "Last run failed",
             Self::Disabled => "Disabled",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Draft => "This definition has unsaved edits or has not been saved yet.",
+            Self::Ready => "The saved revision is valid and enabled.",
+            Self::NeedsRevalidation => "Changes require validation before this draft can be saved.",
+            Self::Running => "This saved macro currently owns the active run.",
+            Self::StoppedWithError => "The most recent completed run stopped with an error.",
+            Self::Disabled => "This macro is saved but cannot be started until it is enabled.",
         }
     }
 }
@@ -151,23 +163,24 @@ pub fn show(
                             .monospace()
                             .size(text::META)
                             .color(status_color(row.status)),
-                    );
+                    )
+                    .on_hover_text(row.status.description());
                     ui.label(
                         RichText::new(format!("REV {}", row.revision))
                             .monospace()
                             .size(text::META)
-                            .color(Color32::from_gray(108)),
+                            .color(Color32::from_gray(165)),
                     );
                 });
                 ui.label(
                     RichText::new(format!("{} · {} DPI", row.target, row.dpi))
                         .size(text::META)
-                        .color(Color32::from_gray(135)),
+                        .color(Color32::from_gray(174)),
                 );
                 ui.label(
                     RichText::new(format!("{} · {}", row.last_validation, row.last_run))
                         .size(text::META)
-                        .color(Color32::from_gray(105)),
+                        .color(Color32::from_gray(164)),
                 );
             });
         ui.add_space(6.0);
@@ -268,5 +281,14 @@ mod tests {
 
         assert_eq!(row.status, MacroLibraryStatus::StoppedWithError);
         assert_eq!(row.last_run, "Unsupported block: future");
+    }
+
+    #[test]
+    fn lifecycle_badges_keep_revalidation_and_prior_failure_distinct() {
+        assert_ne!(
+            MacroLibraryStatus::NeedsRevalidation.label(),
+            MacroLibraryStatus::StoppedWithError.label()
+        );
+        assert!(!MacroLibraryStatus::Disabled.description().is_empty());
     }
 }

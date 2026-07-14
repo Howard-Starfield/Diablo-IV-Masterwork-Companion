@@ -565,56 +565,22 @@ pub fn show(ui: &mut Ui, monitor: &MonitorProjection) {
                 );
             });
             ui.add_space(8.0);
+            let columns = monitor_grid_columns(ui.available_width());
             Grid::new("macro_monitor_grid")
-                .num_columns(4)
-                .min_col_width(105.0)
+                .num_columns(columns)
+                .min_col_width(if columns == 4 { 96.0 } else { 120.0 })
                 .spacing([12.0, 5.0])
                 .show(ui, |ui| {
-                    monitor_cell(ui, "Active block", monitor.active_block.as_deref());
-                    monitor_cell(ui, "Branch", monitor.active_branch.as_deref());
-                    monitor_cell(ui, "Loop", monitor.active_loop.as_deref());
-                    monitor_cell(
-                        ui,
-                        "Iteration",
-                        monitor
-                            .loop_iterations
-                            .map(|value| value.to_string())
-                            .as_deref(),
-                    );
-                    ui.end_row();
-                    monitor_cell(
-                        ui,
-                        "Candidates",
-                        monitor
-                            .candidate_count
-                            .map(|value| value.to_string())
-                            .as_deref(),
-                    );
-                    monitor_cell(ui, "Best / runner-up", score_pair(monitor).as_deref());
-                    monitor_cell(ui, "Scale / stability", scale_stability(monitor).as_deref());
-                    monitor_cell(ui, "Action state", action_state(monitor).as_deref());
-                    ui.end_row();
-                    monitor_cell(
-                        ui,
-                        "Latest observation",
-                        observation_summary(monitor).as_deref(),
-                    );
-                    monitor_cell(ui, "Last action", monitor.action_block_id.as_deref());
-                    monitor_cell(
-                        ui,
-                        "Run mode",
-                        monitor.mode.map(|mode| format!("{mode:?}")).as_deref(),
-                    );
-                    monitor_cell(
-                        ui,
-                        "Stop reason",
-                        monitor
-                            .stop_outcome
-                            .as_ref()
-                            .map(StopOutcome::label)
-                            .as_deref(),
-                    );
-                    ui.end_row();
+                    let fields = monitor_fields(monitor);
+                    for (index, (label, value)) in fields.iter().enumerate() {
+                        monitor_cell(ui, label, Some(value));
+                        if (index + 1) % columns == 0 {
+                            ui.end_row();
+                        }
+                    }
+                    if fields.len() % columns != 0 {
+                        ui.end_row();
+                    }
                 });
             ui.add_space(7.0);
             ui.separator();
@@ -640,6 +606,79 @@ pub fn show(ui: &mut Ui, monitor: &MonitorProjection) {
         });
 }
 
+pub fn monitor_grid_columns(width: f32) -> usize {
+    if width >= 500.0 { 4 } else { 2 }
+}
+
+fn monitor_fields(monitor: &MonitorProjection) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "Active block",
+            monitor.active_block.clone().unwrap_or_else(|| "--".into()),
+        ),
+        (
+            "Branch",
+            monitor.active_branch.clone().unwrap_or_else(|| "--".into()),
+        ),
+        (
+            "Loop",
+            monitor.active_loop.clone().unwrap_or_else(|| "--".into()),
+        ),
+        (
+            "Iteration",
+            monitor
+                .loop_iterations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "--".into()),
+        ),
+        (
+            "Candidates",
+            monitor
+                .candidate_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "--".into()),
+        ),
+        (
+            "Best / runner-up",
+            score_pair(monitor).unwrap_or_else(|| "--".into()),
+        ),
+        (
+            "Scale / stability",
+            scale_stability(monitor).unwrap_or_else(|| "--".into()),
+        ),
+        (
+            "Action state",
+            action_state(monitor).unwrap_or_else(|| "--".into()),
+        ),
+        (
+            "Latest observation",
+            observation_summary(monitor).unwrap_or_else(|| "--".into()),
+        ),
+        (
+            "Last action",
+            monitor
+                .action_block_id
+                .clone()
+                .unwrap_or_else(|| "--".into()),
+        ),
+        (
+            "Run mode",
+            monitor
+                .mode
+                .map(|mode| format!("{mode:?}"))
+                .unwrap_or_else(|| "--".into()),
+        ),
+        (
+            "Stop reason",
+            monitor
+                .stop_outcome
+                .as_ref()
+                .map(StopOutcome::label)
+                .unwrap_or_else(|| "--".into()),
+        ),
+    ]
+}
+
 fn observation_summary(monitor: &MonitorProjection) -> Option<String> {
     monitor.observation_matched.map(|matched| {
         if matched {
@@ -655,7 +694,7 @@ fn monitor_cell(ui: &mut Ui, label: &str, value: Option<&str>) {
         ui.label(
             RichText::new(label)
                 .size(text::META)
-                .color(Color32::from_gray(112)),
+                .color(Color32::from_gray(160)),
         );
         ui.label(
             RichText::new(value.unwrap_or("--"))
@@ -692,6 +731,17 @@ fn action_state(monitor: &MonitorProjection) -> Option<String> {
         }
         summary
     })
+}
+
+#[cfg(test)]
+mod responsive_tests {
+    use super::*;
+
+    #[test]
+    fn compact_monitor_uses_two_columns_before_four_columns_overflow() {
+        assert_eq!(monitor_grid_columns(360.0), 2);
+        assert_eq!(monitor_grid_columns(520.0), 4);
+    }
 }
 
 fn status_color(status: RunStatus) -> Color32 {

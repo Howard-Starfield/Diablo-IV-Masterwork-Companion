@@ -356,6 +356,10 @@ impl MacroPageState {
         self.selected_saved = Some(saved);
     }
 
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
     pub fn clear_selected_saved(&mut self) {
         self.selected_saved = None;
         self.saved_revision = None;
@@ -1140,6 +1144,7 @@ pub struct RunControlAvailability {
     pub can_validate: bool,
     pub can_dry_run: bool,
     pub can_run_once: bool,
+    pub can_run_continuous: bool,
     pub can_run_live: bool,
     pub can_pause: bool,
     pub can_resume: bool,
@@ -1151,10 +1156,13 @@ pub struct RunControlAvailability {
 
 pub fn run_control_availability(state: &MacroPageState) -> RunControlAvailability {
     let monitor = monitor_from_runtime_state(state, state.selected_saved_macro_id());
-    let can_start = state.selected_saved.is_some() && monitor.status == RunStatus::Idle;
+    let can_start =
+        state.selected_saved.is_some() && state.enabled && monitor.status == RunStatus::Idle;
     let disabled_reason = (!can_start).then(|| {
         if state.selected_saved.is_none() {
             "Save and select a validated macro before running.".to_string()
+        } else if !state.enabled {
+            "Enable this saved macro before running it.".to_string()
         } else {
             "A macro run is already active or has not returned to idle.".to_string()
         }
@@ -1170,6 +1178,7 @@ pub fn run_control_availability(state: &MacroPageState) -> RunControlAvailabilit
         can_validate: state.draft.is_some() && state.editor_mutations_allowed(),
         can_dry_run: can_start,
         can_run_once: can_start,
+        can_run_continuous: can_start,
         can_run_live: can_start,
         can_pause: monitor.status == RunStatus::Running,
         can_resume: monitor.status == RunStatus::Paused,
@@ -1187,7 +1196,9 @@ pub fn run_control_availability(state: &MacroPageState) -> RunControlAvailabilit
 pub struct MacroPage;
 
 impl MacroPage {
-    pub const MONITOR_HEIGHT: f32 = 176.0;
+    pub const BOTTOM_MIN_HEIGHT: f32 = 184.0;
+    pub const BOTTOM_DEFAULT_HEIGHT: f32 = 276.0;
+    pub const BOTTOM_MAX_HEIGHT: f32 = 520.0;
 
     pub fn show(ui: &mut Ui, state: &mut MacroPageState) {
         if let Some(draft) = &mut state.draft {
@@ -1266,16 +1277,21 @@ impl MacroPage {
         let selected_macro_id = state.selected_saved_macro_id();
         let monitor = monitor_from_runtime_state(state, selected_macro_id);
         let controls = run_control_availability(state);
-        if ui.available_width() < 720.0 {
-            run_controls(ui, state, &controls);
-            ui.add_space(6.0);
-            monitor::show(ui, &monitor);
-        } else {
-            ui.columns(2, |columns| {
-                run_controls(&mut columns[0], state, &controls);
-                monitor::show(&mut columns[1], &monitor);
+        egui::ScrollArea::vertical()
+            .id_source("macro-bottom-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if ui.available_width() < 720.0 {
+                    run_controls(ui, state, &controls);
+                    ui.add_space(6.0);
+                    monitor::show(ui, &monitor);
+                } else {
+                    ui.columns(2, |columns| {
+                        run_controls(&mut columns[0], state, &controls);
+                        monitor::show(&mut columns[1], &monitor);
+                    });
+                }
             });
-        }
     }
 }
 
@@ -1592,7 +1608,14 @@ fn run_controls(ui: &mut Ui, state: &mut MacroPageState, controls: &RunControlAv
         );
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            if disabled_action(ui, controls.can_validate, Button::new("Validate"), controls) {
+            if disabled_action(
+                ui,
+                controls.can_validate,
+                Button::new("Validate"),
+                controls,
+                "Create or select a draft before validating.",
+                false,
+            ) {
                 state.enqueue_intent(MacroIntent::Validate);
             }
             if disabled_action(
@@ -1600,11 +1623,30 @@ fn run_controls(ui: &mut Ui, state: &mut MacroPageState, controls: &RunControlAv
                 controls.can_dry_run,
                 Button::new("Dry Run\nObserve only"),
                 controls,
+                "Save and select a validated macro before running.",
+                true,
             ) {
                 state.enqueue_intent(MacroIntent::DryRun);
             }
-            if disabled_action(ui, controls.can_run_once, Button::new("Run Once"), controls) {
+            if disabled_action(
+                ui,
+                controls.can_run_once,
+                Button::new("Run Once"),
+                controls,
+                "Save and select a validated macro before running.",
+                true,
+            ) {
                 state.enqueue_intent(MacroIntent::RunOnce);
+            }
+            if disabled_action(
+                ui,
+                controls.can_run_continuous,
+                Button::new("Run\nObserve only"),
+                controls,
+                "Save and select a validated macro before running.",
+                true,
+            ) {
+                state.enqueue_intent(MacroIntent::Run);
             }
             if disabled_action(
                 ui,
@@ -1615,13 +1657,29 @@ fn run_controls(ui: &mut Ui, state: &mut MacroPageState, controls: &RunControlAv
                         .color(Color32::from_rgb(242, 174, 109)),
                 ),
                 controls,
+                "Save and select a validated macro before running.",
+                true,
             ) {
                 state.enqueue_intent(MacroIntent::RunLive);
             }
-            if disabled_action(ui, controls.can_pause, Button::new("Pause"), controls) {
+            if disabled_action(
+                ui,
+                controls.can_pause,
+                Button::new("Pause"),
+                controls,
+                "Pause is available only while a macro is running.",
+                false,
+            ) {
                 state.enqueue_intent(MacroIntent::Pause);
             }
-            if disabled_action(ui, controls.can_resume, Button::new("Resume"), controls) {
+            if disabled_action(
+                ui,
+                controls.can_resume,
+                Button::new("Resume"),
+                controls,
+                "Resume is available only while a macro is paused.",
+                false,
+            ) {
                 state.enqueue_intent(MacroIntent::Resume);
             }
             let stop = Button::new(
@@ -1629,7 +1687,14 @@ fn run_controls(ui: &mut Ui, state: &mut MacroPageState, controls: &RunControlAv
                     .strong()
                     .color(Color32::from_rgb(245, 125, 112)),
             );
-            if disabled_action(ui, controls.can_stop, stop, controls) {
+            if disabled_action(
+                ui,
+                controls.can_stop,
+                stop,
+                controls,
+                "Stop is available only while a macro is active.",
+                false,
+            ) {
                 state.enqueue_intent(MacroIntent::Stop);
             }
         });
@@ -1641,12 +1706,20 @@ fn disabled_action(
     enabled: bool,
     button: Button,
     controls: &RunControlAvailability,
+    fallback_reason: &str,
+    use_run_reason: bool,
 ) -> bool {
     let response = ui.add_enabled(enabled, button);
     if !enabled {
-        if let Some(reason) = &controls.disabled_reason {
-            response.clone().on_hover_text(reason);
-        }
+        let reason = if use_run_reason {
+            controls
+                .disabled_reason
+                .as_deref()
+                .unwrap_or(fallback_reason)
+        } else {
+            fallback_reason
+        };
+        response.clone().on_hover_text(reason);
     }
     response.clicked()
 }
@@ -1882,6 +1955,17 @@ fn library_pane(ui: &mut Ui, state: &mut MacroPageState, rows: &[MacroLibraryRow
         .default_open(false)
         .show(ui, |ui| {
             ui.label(RichText::new("Secondary actions").size(text::SUPPORTING));
+            if state.selected_saved.is_some() {
+                let mut enabled = state.enabled;
+                if ui
+                    .checkbox(&mut enabled, "Enabled")
+                    .on_hover_text("Disabled macros remain saved but cannot be started.")
+                    .changed()
+                {
+                    state.set_enabled(enabled);
+                    state.enqueue_intent(MacroIntent::SetEnabled { enabled });
+                }
+            }
             ui.text_edit_singleline(&mut state.library_rename)
                 .on_hover_text("New name for Rename or Duplicate.");
             ui.horizontal_wrapped(|ui| {
@@ -3804,6 +3888,49 @@ mod tests {
 
         assert_eq!(controls.primary_label, "Dry Run");
         assert_eq!(controls.primary_detail, "Observe only");
+    }
+
+    #[test]
+    fn ready_saved_macro_keeps_the_continuous_observation_run_available() {
+        let mut state = MacroPageState::default();
+        state.set_selected_saved(SavedMacroIdentity {
+            macro_id: "macro".into(),
+            revision: 1,
+            definition_hash: "hash".into(),
+        });
+
+        assert!(run_control_availability(&state).can_run_continuous);
+    }
+
+    #[test]
+    fn bottom_panel_has_a_resizable_height_range_for_compact_layouts() {
+        assert!(MacroPage::BOTTOM_MIN_HEIGHT < MacroPage::BOTTOM_DEFAULT_HEIGHT);
+        assert!(MacroPage::BOTTOM_DEFAULT_HEIGHT < MacroPage::BOTTOM_MAX_HEIGHT);
+    }
+
+    #[test]
+    fn selected_macro_enablement_is_ui_state_not_a_default_assumption() {
+        let mut state = MacroPageState::default();
+        state.set_enabled(false);
+        assert!(!state.enabled);
+    }
+
+    #[test]
+    fn disabled_saved_macro_cannot_start_until_reenabled() {
+        let mut state = MacroPageState::default();
+        state.set_selected_saved(SavedMacroIdentity {
+            macro_id: "macro".into(),
+            revision: 1,
+            definition_hash: "hash".into(),
+        });
+        state.set_enabled(false);
+
+        let controls = run_control_availability(&state);
+        assert!(!controls.can_run_continuous);
+        assert_eq!(
+            controls.disabled_reason.as_deref(),
+            Some("Enable this saved macro before running it.")
+        );
     }
 
     #[test]

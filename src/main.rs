@@ -678,10 +678,13 @@ impl NativeApp {
         let Some(store) = self.macro_store.as_ref() else {
             return;
         };
-        let rows = store
-            .list_macros()
-            .ok()
-            .unwrap_or_default()
+        let summaries = store.list_macros().ok().unwrap_or_default();
+        if let Some(selected_id) = self.macro_state.selected_saved_macro_id() {
+            if let Some(summary) = summaries.iter().find(|summary| summary.id == selected_id) {
+                self.macro_state.set_enabled(summary.enabled);
+            }
+        }
+        let rows = summaries
             .into_iter()
             .filter_map(|summary| {
                 store.load_current(&summary.id).ok().map(|saved| {
@@ -711,6 +714,16 @@ impl NativeApp {
         };
         match store.load_current(&macro_id) {
             Ok(saved) => {
+                let enabled = store
+                    .list_macros()
+                    .ok()
+                    .and_then(|summaries| {
+                        summaries
+                            .into_iter()
+                            .find(|summary| summary.id == macro_id)
+                            .map(|summary| summary.enabled)
+                    })
+                    .unwrap_or(true);
                 let revision = saved.definition.revision;
                 self.selected_saved_revision = Some(saved.clone());
                 self.macro_state.load_saved_draft(
@@ -720,7 +733,8 @@ impl NativeApp {
                         revision,
                         definition_hash: saved.definition_hash,
                     },
-                )
+                );
+                self.macro_state.set_enabled(enabled);
             }
             Err(error) => {
                 self.macro_state.editor_feedback = Some(format!("Could not load macro: {error}"))
@@ -1176,6 +1190,7 @@ impl NativeApp {
                             self.macro_state.editor_feedback =
                                 Some(format!("Enablement failed: {error}"));
                         } else {
+                            self.macro_state.set_enabled(enabled);
                             self.refresh_macro_library();
                         }
                     }
@@ -1976,12 +1991,11 @@ impl App for NativeApp {
                             status_pill(ui, self.status, self.status.label());
                         } else {
                             let target = self
-                                .macro_state
-                                .draft
+                                .selected_saved_revision
                                 .as_ref()
-                                .map(|draft| draft.target.title_contains.as_str())
+                                .map(|saved| saved.definition.target.title_contains.as_str())
                                 .filter(|title| !title.is_empty())
-                                .unwrap_or("No target selected");
+                                .unwrap_or("No saved target");
                             let saved = self
                                 .macro_state
                                 .selected_saved
@@ -1989,7 +2003,7 @@ impl App for NativeApp {
                                 .map(|saved| format!("Saved r{}", saved.revision))
                                 .unwrap_or_else(|| "Draft only".into());
                             ui.label(
-                                RichText::new(format!("Target: {target}"))
+                                RichText::new(format!("Saved target: {target}"))
                                     .size(ui_theme::text::SUPPORTING)
                                     .color(Color32::from_rgb(194, 143, 94)),
                             );
@@ -2013,7 +2027,10 @@ impl App for NativeApp {
             }
             BottomSurface::MacroMonitor => {
                 TopBottomPanel::bottom("macro_run_monitor")
-                    .exact_height(MacroPage::MONITOR_HEIGHT)
+                    .resizable(true)
+                    .default_height(MacroPage::BOTTOM_DEFAULT_HEIGHT)
+                    .min_height(MacroPage::BOTTOM_MIN_HEIGHT)
+                    .max_height(MacroPage::BOTTOM_MAX_HEIGHT)
                     .show(ctx, |ui| {
                         MacroPage::show_bottom(ui, &mut self.macro_state);
                     });
@@ -3599,13 +3616,13 @@ mod routing_tests {
     }
 
     #[test]
-    fn each_page_owns_one_distinct_fixed_bottom_surface() {
+    fn each_page_owns_a_distinct_bottom_surface_with_a_bounded_macro_height() {
         assert_eq!(
             bottom_surface(AppPage::Enchant),
             BottomSurface::EnchantActions
         );
         assert_eq!(bottom_surface(AppPage::Macro), BottomSurface::MacroMonitor);
-        assert!(MacroPage::MONITOR_HEIGHT < APP_HEIGHT / 3.0);
+        assert!(MacroPage::BOTTOM_MAX_HEIGHT < APP_HEIGHT);
     }
 
     #[derive(Debug, Clone)]

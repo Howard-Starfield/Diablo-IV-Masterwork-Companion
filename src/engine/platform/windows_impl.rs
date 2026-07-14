@@ -317,28 +317,20 @@ pub(crate) fn build_windows_macro_runtime(
         "saved macro target does not match the captured target binding"
     );
 
-    let capture = Arc::new(xcap_atomic_window_capture(binding_xcap_window_id(binding)?));
     let detector = windows_condition_detector_router(
         Arc::new(TextDetector::default()),
         Arc::new(ImageDetector::new()),
     );
     let input = Arc::new(WindowsInputSink::new().context("failed to initialize live input")?);
-    let runtime = compose_windows_macro_runtime(
-        capture,
-        binding.guard.clone(),
+    compose_windows_macro_runtime_bundle(
+        binding,
+        saved_target,
+        |window_id| Arc::new(xcap_atomic_window_capture(window_id)),
         detector,
         input,
         Arc::new(SystemClock::default()),
-    );
-    let control = runtime.control_handle();
-    let escape_watcher =
-        EscRuntimeEmergencyWatcher::spawn(Arc::new(EscStopSignal::default()), control.clone());
-
-    Ok(WindowsMacroRuntimeBundle {
-        runtime,
-        control,
-        escape_watcher,
-    })
+        Arc::new(EscStopSignal::default()),
+    )
 }
 
 fn saved_target_matches_captured_binding(
@@ -378,6 +370,34 @@ fn compose_windows_macro_runtime(
     MacroRuntime::new(capture, detector, clock).with_live_input(Arc::new(guard), input)
 }
 
+fn compose_windows_macro_runtime_bundle<S>(
+    binding: &CapturedTargetBinding,
+    saved_target: &TargetProfile,
+    capture_from_binding: impl FnOnce(u32) -> Arc<dyn CaptureSource + Send + Sync>,
+    detector: Arc<dyn ConditionDetector>,
+    input: Arc<dyn LiveActionInput>,
+    clock: Arc<dyn Clock + Send + Sync>,
+    escape: Arc<S>,
+) -> Result<WindowsMacroRuntimeBundle>
+where
+    S: EscapeStopSource,
+{
+    anyhow::ensure!(
+        saved_target_matches_captured_binding(saved_target, &binding.profile),
+        "saved macro target does not match the captured target binding"
+    );
+    let capture = capture_from_binding(binding_xcap_window_id(binding)?);
+    let runtime =
+        compose_windows_macro_runtime(capture, binding.guard.clone(), detector, input, clock);
+    let control = runtime.control_handle();
+    let escape_watcher = EscRuntimeEmergencyWatcher::spawn(escape, control.clone());
+    Ok(WindowsMacroRuntimeBundle {
+        runtime,
+        control,
+        escape_watcher,
+    })
+}
+
 trait EscapeStopSource: Send + Sync + 'static {
     fn is_stop_requested(&self) -> bool;
 }
@@ -391,6 +411,7 @@ impl EscapeStopSource for EscStopSignal {
 #[derive(Debug)]
 struct EscRuntimeEmergencyWatcher {
     shutdown: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -401,17 +422,21 @@ impl EscRuntimeEmergencyWatcher {
     {
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
         let worker = thread::spawn(move || {
             while !worker_shutdown.load(Ordering::SeqCst) {
                 if escape.is_stop_requested() {
                     control.emergency_stop();
-                    return;
+                    break;
                 }
                 thread::sleep(Duration::from_millis(8));
             }
+            worker_finished.store(true, Ordering::SeqCst);
         });
         Self {
             shutdown,
+            finished,
             worker: Some(worker),
         }
     }
@@ -1719,8 +1744,9 @@ mod tests {
         sync::{
             Mutex,
             atomic::{AtomicUsize, Ordering},
+            mpsc::{SyncSender, sync_channel},
         },
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     use image::RgbaImage;
@@ -1851,6 +1877,35 @@ mod tests {
         }
     }
 
+    fn saved_revision(target: TargetProfile, blocks: Vec<Block>) -> SavedRevision {
+        let definition = MacroDefinition {
+            schema_version: MACRO_SCHEMA_VERSION,
+            id: "factory".to_string(),
+            name: "factory".to_string(),
+            revision: 1,
+            target,
+            regions: vec![],
+            points: vec![],
+            text_rules: vec![],
+            image_rules: vec![],
+            blocks,
+            safety: SafetyPolicy {
+                max_runtime_ms: Limit::Finite(5_000),
+                max_clicks: Limit::Finite(1),
+                max_observation_retries: Limit::Finite(1),
+                max_observations_per_second: 1,
+                minimum_click_interval_ms: 1,
+                focus_loss: FocusLossPolicy::Stop,
+            },
+        };
+        let bytes = serde_json::to_vec_pretty(&definition).unwrap();
+        SavedRevision {
+            definition,
+            definition_hash: format!("{:x}", Sha256::digest(bytes)),
+            pinned_assets: vec![],
+        }
+    }
+
     #[test]
     fn factory_rejects_saved_target_that_does_not_match_captured_binding() {
         let profile = CapturedTargetProfile {
@@ -1910,15 +1965,56 @@ mod tests {
         let mut snapshot = actionable_authoring_snapshot();
         snapshot.identity = CanonicalWindowIdentity::from_xcap_window_id(high_bit_window_id);
         let binding = authoring_binding(snapshot.clone(), snapshot, Arc::new(AtomicUsize::new(0)));
+        let saved_target = saved_target_for(binding.profile());
+        let captured_window_id = Arc::new(AtomicUsize::new(0));
+        let bundle = compose_windows_macro_runtime_bundle(
+            &binding,
+            &saved_target,
+            {
+                let captured_window_id = Arc::clone(&captured_window_id);
+                move |window_id| {
+                    captured_window_id.store(window_id as usize, Ordering::SeqCst);
+                    Arc::new(FakeRawCapture) as Arc<dyn CaptureSource + Send + Sync>
+                }
+            },
+            Arc::new(UnavailableDetector),
+            Arc::new(TestLiveInput::default()),
+            Arc::new(SystemClock::default()),
+            Arc::new(TestEscapeStop::default()),
+        )
+        .unwrap();
 
         assert_eq!(
-            binding_xcap_window_id(&binding).unwrap(),
-            high_bit_window_id
+            captured_window_id.load(Ordering::SeqCst),
+            high_bit_window_id as usize
         );
         assert_eq!(
             binding.guard.snapshot().unwrap().window_id,
             u64::from(high_bit_window_id)
         );
+        assert!(matches!(
+            bundle
+                .runtime
+                .run(
+                    saved_revision(
+                        saved_target,
+                        vec![Block {
+                            id: "comment".to_string(),
+                            enabled: true,
+                            kind: BlockKind::Comment {
+                                text: "guard must authorize this live run".to_string(),
+                            },
+                        }],
+                    ),
+                    RunMode::Live,
+                )
+                .unwrap()
+                .last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::Completed,
+                ..
+            })
+        ));
     }
 
     #[derive(Default)]
@@ -2037,25 +2133,127 @@ mod tests {
         }
     }
 
-    #[test]
-    fn factory_escape_watcher_stops_the_runtime_control_directly() {
-        let runtime = MacroRuntime::new(
-            Arc::new(FakeRawCapture),
-            Arc::new(UnavailableDetector),
-            Arc::new(FixedClock),
-        );
-        let control = runtime.control_handle();
-        let escape = Arc::new(TestEscapeStop::default());
-        let watcher = EscRuntimeEmergencyWatcher::spawn(Arc::clone(&escape), control.clone());
+    #[derive(Debug, Default)]
+    struct TestLiveInput {
+        resumed: Option<SyncSender<()>>,
+        watcher_finished: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+        dropped_after_watcher: Arc<AtomicBool>,
+    }
 
-        escape.0.store(true, Ordering::SeqCst);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !control.is_stopped() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
+    impl Drop for TestLiveInput {
+        fn drop(&mut self) {
+            let watcher_finished = self
+                .watcher_finished
+                .lock()
+                .expect("factory watcher state poisoned")
+                .as_ref()
+                .is_some_and(|finished| finished.load(Ordering::SeqCst));
+            self.dropped_after_watcher
+                .store(watcher_finished, Ordering::SeqCst);
+        }
+    }
+
+    impl LiveActionInput for TestLiveInput {
+        fn reset_manual_baseline(&self) -> Result<()> {
+            if let Some(resumed) = &self.resumed {
+                let _ = resumed.send(());
+            }
+            Ok(())
         }
 
-        assert!(control.is_stopped());
-        drop(watcher);
+        fn manual_takeover_detected(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn dispatch_action(
+            &self,
+            _point: Point,
+            _button: MouseButton,
+            _movement: Option<&MouseMovementProfile>,
+            _stop: &dyn StopSource,
+            _input_gate: &dyn LiveInputGate,
+            _commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+            _validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+        ) -> InputDispatchOutcome {
+            unreachable!("factory test runtime contains no actions")
+        }
+    }
+
+    #[test]
+    fn factory_escape_signal_stops_an_active_live_run_with_emergency_reason() {
+        let snapshot = actionable_authoring_snapshot();
+        let binding = authoring_binding(snapshot.clone(), snapshot, Arc::new(AtomicUsize::new(0)));
+        let saved_target = saved_target_for(binding.profile());
+        let (resumed, wait_for_resume) = sync_channel(1);
+        let escape = Arc::new(TestEscapeStop::default());
+        let mut input = TestLiveInput::default();
+        input.resumed = Some(resumed);
+        let bundle = compose_windows_macro_runtime_bundle(
+            &binding,
+            &saved_target,
+            |_| Arc::new(FakeRawCapture) as Arc<dyn CaptureSource + Send + Sync>,
+            Arc::new(UnavailableDetector),
+            Arc::new(input),
+            Arc::new(SystemClock::default()),
+            Arc::clone(&escape),
+        )
+        .unwrap();
+        let runtime = bundle.runtime.clone();
+        let saved = saved_revision(
+            saved_target,
+            vec![Block {
+                id: "wait".to_string(),
+                enabled: true,
+                kind: BlockKind::Wait { duration_ms: 4_000 },
+            }],
+        );
+        let run = thread::spawn(move || runtime.run(saved, RunMode::Live).unwrap());
+
+        wait_for_resume
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        escape.0.store(true, Ordering::SeqCst);
+        let events = run.join().unwrap();
+
+        assert!(bundle.control.is_stopped());
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::EmergencyStopped,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn factory_bundle_drop_joins_nontriggered_escape_watcher_before_input_releases() {
+        let snapshot = actionable_authoring_snapshot();
+        let binding = authoring_binding(snapshot.clone(), snapshot, Arc::new(AtomicUsize::new(0)));
+        let saved_target = saved_target_for(binding.profile());
+        let watcher_finished = Arc::new(Mutex::new(None));
+        let input_dropped_after_watcher = Arc::new(AtomicBool::new(false));
+        let input = Arc::new(TestLiveInput {
+            resumed: None,
+            watcher_finished: Arc::clone(&watcher_finished),
+            dropped_after_watcher: Arc::clone(&input_dropped_after_watcher),
+        });
+        let bundle = compose_windows_macro_runtime_bundle(
+            &binding,
+            &saved_target,
+            |_| Arc::new(FakeRawCapture) as Arc<dyn CaptureSource + Send + Sync>,
+            Arc::new(UnavailableDetector),
+            input,
+            Arc::new(SystemClock::default()),
+            Arc::new(TestEscapeStop::default()),
+        )
+        .unwrap();
+        *watcher_finished
+            .lock()
+            .expect("factory watcher state poisoned") =
+            Some(Arc::clone(&bundle.escape_watcher.finished));
+        drop(bundle);
+
+        assert!(input_dropped_after_watcher.load(Ordering::SeqCst));
     }
 
     #[test]

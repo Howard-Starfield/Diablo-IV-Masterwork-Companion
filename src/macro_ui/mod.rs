@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod acceptance_tests;
 mod canvas;
 mod canvas_layout;
 mod canvas_model;

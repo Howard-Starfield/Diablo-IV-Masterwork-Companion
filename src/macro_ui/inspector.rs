@@ -1,4 +1,6 @@
-use eframe::egui::{Button, Checkbox, Color32, DragValue, RichText, Slider, TextEdit, Ui};
+use eframe::egui::{
+    Button, Checkbox, CollapsingHeader, Color32, DragValue, RichText, Slider, TextEdit, Ui,
+};
 
 use crate::engine::macro_engine::{
     AssetRef, Block, BlockKind, Condition, ImageRule, Limit, MacroDefinition, MatchSelectionPolicy,
@@ -535,15 +537,6 @@ pub fn show(
             {
                 rule.match_mode = next_text_match_mode(rule.match_mode);
             }
-            editable_number(ui, "Threshold", &mut rule.threshold, 0.0..=1.0, editable);
-            ui.add_enabled(
-                editable,
-                Checkbox::new(&mut rule.case_sensitive, "Case sensitive"),
-            );
-            ui.add_enabled(
-                editable,
-                Checkbox::new(&mut rule.allow_cross_line, "Allow cross-line"),
-            );
             if ui
                 .add_enabled(
                     editable,
@@ -553,18 +546,31 @@ pub fn show(
             {
                 rule.preprocess = next_preprocess(rule.preprocess);
             }
-            if ui
-                .add_enabled(
-                    editable,
-                    Button::new(format!("Policy: {:?}", rule.match_policy)),
-                )
-                .clicked()
-            {
-                rule.match_policy = next_policy(rule.match_policy);
-            }
             editable_u64(ui, "Polling ms", &mut rule.poll_interval_ms, editable);
-            editable_u8(ui, "Stable frames", &mut rule.stable_frames, editable);
             limit_editor(ui, "Rule timeout ms", &mut rule.timeout_ms, editable);
+            CollapsingHeader::new("Advanced settings")
+                .default_open(false)
+                .show(ui, |ui| {
+                    editable_number(ui, "Threshold", &mut rule.threshold, 0.0..=1.0, editable);
+                    ui.add_enabled(
+                        editable,
+                        Checkbox::new(&mut rule.case_sensitive, "Case sensitive"),
+                    );
+                    ui.add_enabled(
+                        editable,
+                        Checkbox::new(&mut rule.allow_cross_line, "Allow cross-line"),
+                    );
+                    if ui
+                        .add_enabled(
+                            editable,
+                            Button::new(format!("Multiple matches: {:?}", rule.match_policy)),
+                        )
+                        .clicked()
+                    {
+                        rule.match_policy = next_policy(rule.match_policy);
+                    }
+                    editable_u8(ui, "Stable frames", &mut rule.stable_frames, editable);
+                });
             if rule != original_rule {
                 intent = Some(InspectorIntent::ReplaceTextRule { rule });
             }
@@ -596,25 +602,29 @@ pub fn show(
             template_editor(ui, &mut rule.template, &p.available_templates, editable);
             let scales_changed = image_scales_editor(ui, &mut rule.scales_percent, editable);
             editable_f32(ui, "Threshold", &mut rule.threshold, 0.0..=1.0, editable);
-            editable_u8(ui, "Stable frames", &mut rule.stable_frames, editable);
-            editable_f32(
-                ui,
-                "Runner-up",
-                &mut rule.minimum_runner_up_margin,
-                0.0..=1.0,
-                editable,
-            );
             editable_u64(ui, "Polling ms", &mut rule.poll_interval_ms, editable);
             limit_editor(ui, "Rule timeout ms", &mut rule.timeout_ms, editable);
-            if ui
-                .add_enabled(
-                    editable,
-                    Button::new(format!("Policy: {:?}", rule.match_policy)),
-                )
-                .clicked()
-            {
-                rule.match_policy = next_policy(rule.match_policy);
-            }
+            CollapsingHeader::new("Advanced settings")
+                .default_open(false)
+                .show(ui, |ui| {
+                    editable_u8(ui, "Stable frames", &mut rule.stable_frames, editable);
+                    editable_f32(
+                        ui,
+                        "Runner-up margin",
+                        &mut rule.minimum_runner_up_margin,
+                        0.0..=1.0,
+                        editable,
+                    );
+                    if ui
+                        .add_enabled(
+                            editable,
+                            Button::new(format!("Multiple matches: {:?}", rule.match_policy)),
+                        )
+                        .clicked()
+                    {
+                        rule.match_policy = next_policy(rule.match_policy);
+                    }
+                });
             if rule != original_rule {
                 intent = if scales_changed {
                     match validate_image_scales(&rule.scales_percent) {

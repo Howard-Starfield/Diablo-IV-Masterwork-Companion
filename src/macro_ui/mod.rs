@@ -17,10 +17,10 @@ pub use wizard::*;
 
 use std::collections::VecDeque;
 
-use eframe::egui::{self, Align, Button, Color32, Frame, Layout, RichText, Stroke, Ui};
+use eframe::egui::{self, Button, Color32, Frame, RichText, Stroke, Ui};
 
 use crate::engine::macro_engine::{
-    ControllerLifecycleProjection, ControllerSemanticProjection, RunEvent, RunStatus,
+    ControllerLifecycleProjection, ControllerSemanticProjection, RunEvent, RunMode, RunStatus,
     ValidationProblem,
 };
 use crate::ui_theme::text;
@@ -141,6 +141,10 @@ pub enum MacroIntent {
     CancelImagePackageReverification,
     CleanupOrphans,
 }
+
+/// Public composition vocabulary. The native shell translates these bounded UI-only values into
+/// the accepted controller and store calls; widgets never receive those owners directly.
+pub type MacroUiIntent = MacroIntent;
 
 impl MacroIntent {
     fn is_stop(&self) -> bool {
@@ -270,6 +274,10 @@ pub struct MacroPageState {
     pub controller_lifecycle: Option<ControllerLifecycleProjection>,
     pub controller_semantic: Option<ControllerSemanticProjection>,
     pub library_rows: Vec<MacroLibraryRow>,
+    pub library_search: String,
+    pub library_rename: String,
+    pub library_package_path: String,
+    pub confirm_library_delete: bool,
     pub image_package_reverification: Option<ImagePackageReverificationProgress>,
     /// Rebuildable presentation state only; it is never part of the executable draft.
     pub canvas_layout: MacroCanvasLayout,
@@ -310,6 +318,10 @@ impl Default for MacroPageState {
             controller_lifecycle: None,
             controller_semantic: None,
             library_rows: Vec::new(),
+            library_search: String::new(),
+            library_rename: String::new(),
+            library_package_path: String::new(),
+            confirm_library_delete: false,
             image_package_reverification: None,
             canvas_layout: MacroCanvasLayout::default(),
             ui_edit_history: UiEditHistory::default(),
@@ -357,6 +369,18 @@ impl MacroPageState {
 
     pub fn enqueue_intent(&mut self, intent: MacroIntent) {
         self.intents.push(intent);
+    }
+
+    pub fn push_intent(&mut self, intent: MacroUiIntent) {
+        self.enqueue_intent(intent);
+    }
+
+    pub fn pending_intent_count(&self) -> usize {
+        self.intents.pending()
+    }
+
+    pub fn drain_intents(&mut self) -> std::collections::vec_deque::Drain<'_, MacroUiIntent> {
+        self.intents.drain()
     }
 
     pub fn begin_image_package_reverification(&mut self, rule_ids: Vec<String>) {
@@ -1093,6 +1117,72 @@ struct PendingConversion {
     structural_children: bool,
 }
 
+/// The page never drops the canvas at narrow widths: supporting panes become explicit drawers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneMode {
+    ThreePane,
+    ThreePaneCompact,
+    CanvasWithDrawers,
+}
+
+pub fn pane_mode(width: f32) -> PaneMode {
+    if width >= 1100.0 {
+        PaneMode::ThreePane
+    } else if width >= 720.0 {
+        PaneMode::ThreePaneCompact
+    } else {
+        PaneMode::CanvasWithDrawers
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunControlAvailability {
+    pub can_validate: bool,
+    pub can_dry_run: bool,
+    pub can_run_once: bool,
+    pub can_run_live: bool,
+    pub can_pause: bool,
+    pub can_resume: bool,
+    pub can_stop: bool,
+    pub primary_label: &'static str,
+    pub primary_detail: &'static str,
+    pub disabled_reason: Option<String>,
+}
+
+pub fn run_control_availability(state: &MacroPageState) -> RunControlAvailability {
+    let monitor = monitor_from_runtime_state(state, state.selected_saved_macro_id());
+    let can_start = state.selected_saved.is_some() && monitor.status == RunStatus::Idle;
+    let disabled_reason = (!can_start).then(|| {
+        if state.selected_saved.is_none() {
+            "Save and select a validated macro before running.".to_string()
+        } else {
+            "A macro run is already active or has not returned to idle.".to_string()
+        }
+    });
+    let (primary_label, primary_detail) = match monitor.mode {
+        Some(RunMode::DryRun) => ("Dry Run", "Observe only"),
+        Some(RunMode::Live) => ("Run", "Live"),
+        Some(RunMode::ObservationOnly) => ("Run Once", "Observe only"),
+        None => ("Run", "Live"),
+    };
+
+    RunControlAvailability {
+        can_validate: state.draft.is_some() && state.editor_mutations_allowed(),
+        can_dry_run: can_start,
+        can_run_once: can_start,
+        can_run_live: can_start,
+        can_pause: monitor.status == RunStatus::Running,
+        can_resume: monitor.status == RunStatus::Paused,
+        can_stop: matches!(
+            monitor.status,
+            RunStatus::Running | RunStatus::Paused | RunStatus::Stopping
+        ),
+        primary_label,
+        primary_detail,
+        disabled_reason,
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MacroPage;
 
@@ -1147,8 +1237,6 @@ impl MacroPage {
 
         ui.set_width(ui.available_width());
         ui.vertical(|ui| {
-            title(ui);
-            ui.add_space(8.0);
             image_package_reverification(ui, state);
             let wizard_pending = state.active_wizard_request.is_some();
             let wizard_action = state
@@ -1172,10 +1260,22 @@ impl MacroPage {
         });
     }
 
-    pub fn show_monitor(ui: &mut Ui, state: &MacroPageState) {
+    /// Bottom composition deliberately owns presentation only. NativeApp drains the bounded
+    /// intent queue after rendering and remains the sole controller/store owner.
+    pub fn show_bottom(ui: &mut Ui, state: &mut MacroPageState) {
         let selected_macro_id = state.selected_saved_macro_id();
         let monitor = monitor_from_runtime_state(state, selected_macro_id);
-        monitor::show(ui, &monitor);
+        let controls = run_control_availability(state);
+        if ui.available_width() < 720.0 {
+            run_controls(ui, state, &controls);
+            ui.add_space(6.0);
+            monitor::show(ui, &monitor);
+        } else {
+            ui.columns(2, |columns| {
+                run_controls(&mut columns[0], state, &controls);
+                monitor::show(&mut columns[1], &monitor);
+            });
+        }
     }
 }
 
@@ -1359,43 +1459,6 @@ fn current_canvas_selection(state: &MacroPageState) -> Option<CanvasSelection> {
     state.selected_canvas.clone()
 }
 
-fn title(ui: &mut Ui) {
-    Frame::none()
-        .fill(Color32::from_rgb(18, 18, 19))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(57, 48, 41)))
-        .rounding(6.0)
-        .inner_margin(egui::Margin::same(14.0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("MACRO FORGE")
-                            .monospace()
-                            .size(text::PAGE_TITLE)
-                            .strong()
-                            .color(Color32::from_rgb(224, 119, 53)),
-                    );
-                    ui.label(
-                        RichText::new(
-                            "Observe, arbitrate, then act - one immutable revision at a time",
-                        )
-                        .size(text::SUPPORTING)
-                        .color(Color32::from_gray(138)),
-                    );
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("STRUCTURED EDITOR")
-                            .monospace()
-                            .size(text::META)
-                            .strong()
-                            .color(Color32::from_rgb(174, 142, 102)),
-                    );
-                });
-            });
-        });
-}
-
 fn status_strip(
     ui: &mut Ui,
     state: &mut MacroPageState,
@@ -1498,9 +1561,6 @@ fn status_strip(
                         begin_editor_authoring(state, EditorAuthoringKind::CaptureTarget);
                     }
                 }
-                if ui.add_enabled(can_edit, Button::new("Validate")).clicked() {
-                    state.enqueue_intent(MacroIntent::Validate);
-                }
                 let can_save = can_edit
                     && state.draft.is_some()
                     && problems.is_empty()
@@ -1511,43 +1571,6 @@ fn status_strip(
                 if ui.add_enabled(can_save, Button::new("Save")).clicked() {
                     state.enqueue_intent(MacroIntent::Save);
                 }
-                let can_run = state.selected_saved.is_some() && monitor.status == RunStatus::Idle;
-                if ui.add_enabled(can_run, Button::new("Dry Run")).clicked() {
-                    state.enqueue_intent(MacroIntent::DryRun);
-                }
-                if ui.add_enabled(can_run, Button::new("Run Once")).clicked() {
-                    state.enqueue_intent(MacroIntent::RunOnce);
-                }
-                if ui.add_enabled(can_run, Button::new("Run")).clicked() {
-                    state.enqueue_intent(MacroIntent::Run);
-                }
-                if ui.add_enabled(can_run, Button::new("Live Run")).clicked() {
-                    state.enqueue_intent(MacroIntent::RunLive);
-                }
-                if ui
-                    .add_enabled(monitor.status == RunStatus::Running, Button::new("Pause"))
-                    .clicked()
-                {
-                    state.enqueue_intent(MacroIntent::Pause);
-                }
-                if ui
-                    .add_enabled(monitor.status == RunStatus::Paused, Button::new("Resume"))
-                    .clicked()
-                {
-                    state.enqueue_intent(MacroIntent::Resume);
-                }
-                if ui
-                    .add_enabled(
-                        matches!(
-                            monitor.status,
-                            RunStatus::Running | RunStatus::Paused | RunStatus::Stopping
-                        ),
-                        Button::new("Stop"),
-                    )
-                    .clicked()
-                {
-                    state.enqueue_intent(MacroIntent::Stop);
-                }
                 if let Some(target) = inspector::problem_navigation_target(problems, 0) {
                     if ui.small_button("Open first problem").clicked() {
                         navigate = Some(target);
@@ -1556,6 +1579,76 @@ fn status_strip(
             });
         });
     navigate
+}
+
+fn run_controls(ui: &mut Ui, state: &mut MacroPageState, controls: &RunControlAvailability) {
+    section(ui, "RUN CONTROLS", |ui| {
+        ui.label(
+            RichText::new(
+                "Validate before saving. Dry Run performs observation only; Live may inject input.",
+            )
+            .size(text::SUPPORTING)
+            .color(Color32::from_gray(176)),
+        );
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            if disabled_action(ui, controls.can_validate, Button::new("Validate"), controls) {
+                state.enqueue_intent(MacroIntent::Validate);
+            }
+            if disabled_action(
+                ui,
+                controls.can_dry_run,
+                Button::new("Dry Run\nObserve only"),
+                controls,
+            ) {
+                state.enqueue_intent(MacroIntent::DryRun);
+            }
+            if disabled_action(ui, controls.can_run_once, Button::new("Run Once"), controls) {
+                state.enqueue_intent(MacroIntent::RunOnce);
+            }
+            if disabled_action(
+                ui,
+                controls.can_run_live,
+                Button::new(
+                    RichText::new("Run\nLive")
+                        .strong()
+                        .color(Color32::from_rgb(242, 174, 109)),
+                ),
+                controls,
+            ) {
+                state.enqueue_intent(MacroIntent::RunLive);
+            }
+            if disabled_action(ui, controls.can_pause, Button::new("Pause"), controls) {
+                state.enqueue_intent(MacroIntent::Pause);
+            }
+            if disabled_action(ui, controls.can_resume, Button::new("Resume"), controls) {
+                state.enqueue_intent(MacroIntent::Resume);
+            }
+            let stop = Button::new(
+                RichText::new("Stop")
+                    .strong()
+                    .color(Color32::from_rgb(245, 125, 112)),
+            );
+            if disabled_action(ui, controls.can_stop, stop, controls) {
+                state.enqueue_intent(MacroIntent::Stop);
+            }
+        });
+    });
+}
+
+fn disabled_action(
+    ui: &mut Ui,
+    enabled: bool,
+    button: Button,
+    controls: &RunControlAvailability,
+) -> bool {
+    let response = ui.add_enabled(enabled, button);
+    if !enabled {
+        if let Some(reason) = &controls.disabled_reason {
+            response.clone().on_hover_text(reason);
+        }
+    }
+    response.clicked()
 }
 
 fn validation_summary(state: &MacroPageState, problems: &[ValidationProblem]) -> &'static str {
@@ -1688,16 +1781,60 @@ fn workspace(
         })
         .unwrap_or(inspector::InspectorProjection::Empty);
     let editable = state.editor_mutations_allowed();
-    if ui.available_width() >= 900.0 {
-        ui.columns(3, |columns| {
-            section(&mut columns[0], "LIBRARY", |ui| {
-                if let Some(intent) =
-                    library::show(ui, library_rows, state.selected_saved_macro_id())
-                {
-                    state.enqueue_intent(intent);
-                }
-            });
-            section(&mut columns[1], "CANONICAL CANVAS", |ui| {
+    let filtered_rows = library_rows
+        .iter()
+        .filter(|row| {
+            let query = state.library_search.trim().to_ascii_lowercase();
+            query.is_empty()
+                || row.name.to_ascii_lowercase().contains(&query)
+                || row.status.label().to_ascii_lowercase().contains(&query)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match pane_mode(ui.available_width()) {
+        PaneMode::ThreePane | PaneMode::ThreePaneCompact => {
+            let compact = pane_mode(ui.available_width()) == PaneMode::ThreePaneCompact;
+            let side_width = if compact { 175.0 } else { 250.0 };
+            let side_max = if compact { 230.0 } else { 340.0 };
+            egui::SidePanel::left("macro-library-pane")
+                .resizable(true)
+                .default_width(side_width)
+                .min_width(150.0)
+                .max_width(side_max)
+                .show_inside(ui, |ui| {
+                    section(ui, "LIBRARY", |ui| {
+                        library_pane(ui, state, &filtered_rows);
+                    });
+                });
+            egui::SidePanel::right("macro-inspector-pane")
+                .resizable(true)
+                .default_width(side_width)
+                .min_width(170.0)
+                .max_width(side_max)
+                .show_inside(ui, |ui| {
+                    section(ui, "BLOCK INSPECTOR", |ui| {
+                        if let Some(intent) = inspector::show(ui, &projection, editable) {
+                            handle_inspector_intent(state, intent);
+                        }
+                    });
+                });
+            egui::CentralPanel::default()
+                .frame(Frame::none())
+                .show_inside(ui, |ui| {
+                    section(ui, "EVENT CANVAS", |ui| {
+                        editor_toolbar(ui, state);
+                        selection = show_interactive_canvas(
+                            ui,
+                            state,
+                            canvas,
+                            monitor.active_block.as_deref(),
+                            selected_canvas.as_ref(),
+                        );
+                    });
+                });
+        }
+        PaneMode::CanvasWithDrawers => {
+            section(ui, "EVENT CANVAS", |ui| {
                 editor_toolbar(ui, state);
                 selection = show_interactive_canvas(
                     ui,
@@ -1707,37 +1844,123 @@ fn workspace(
                     selected_canvas.as_ref(),
                 );
             });
-            section(&mut columns[2], "INSPECTOR", |ui| {
-                if let Some(intent) = inspector::show(ui, &projection, editable) {
-                    handle_inspector_intent(state, intent);
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new("Library drawer")
+                .default_open(false)
+                .show(ui, |ui| library_pane(ui, state, &filtered_rows));
+            egui::CollapsingHeader::new("Inspector drawer")
+                .default_open(false)
+                .show(ui, |ui| {
+                    if let Some(intent) = inspector::show(ui, &projection, editable) {
+                        handle_inspector_intent(state, intent);
+                    }
+                });
+        }
+    }
+    selection
+}
+
+fn library_pane(ui: &mut Ui, state: &mut MacroPageState, rows: &[MacroLibraryRow]) {
+    ui.horizontal(|ui| {
+        ui.label("Search");
+        ui.text_edit_singleline(&mut state.library_search);
+    });
+    if ui
+        .add_enabled(
+            state.wizard.is_none() && state.active_wizard_request.is_none(),
+            Button::new("New Macro"),
+        )
+        .clicked()
+    {
+        create_starter_draft(state);
+    }
+    if let Some(intent) = library::show(ui, rows, state.selected_saved_macro_id()) {
+        state.enqueue_intent(intent);
+    }
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new("Manage selected macro")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(RichText::new("Secondary actions").size(text::SUPPORTING));
+            ui.text_edit_singleline(&mut state.library_rename)
+                .on_hover_text("New name for Rename or Duplicate.");
+            ui.horizontal_wrapped(|ui| {
+                let has_selected = state.selected_saved.is_some();
+                if ui
+                    .add_enabled(
+                        has_selected && !state.library_rename.trim().is_empty(),
+                        Button::new("Rename"),
+                    )
+                    .clicked()
+                {
+                    state.enqueue_intent(MacroIntent::Rename {
+                        name: state.library_rename.trim().to_owned(),
+                    });
+                }
+                if let Some(macro_id) = state
+                    .selected_saved
+                    .as_ref()
+                    .map(|selected| selected.macro_id.clone())
+                {
+                    if ui
+                        .add_enabled(
+                            !state.library_rename.trim().is_empty(),
+                            Button::new("Duplicate"),
+                        )
+                        .clicked()
+                    {
+                        state.enqueue_intent(MacroIntent::Duplicate {
+                            macro_id,
+                            name: state.library_rename.trim().to_owned(),
+                        });
+                    }
+                }
+            });
+            ui.text_edit_singleline(&mut state.library_package_path)
+                .on_hover_text("Package folder for Import or Export.");
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        !state.library_package_path.trim().is_empty(),
+                        Button::new("Import"),
+                    )
+                    .clicked()
+                {
+                    state.enqueue_intent(MacroIntent::ImportPackage {
+                        package_root: state.library_package_path.trim().to_owned(),
+                    });
+                }
+                if state.selected_saved.is_some() {
+                    if ui
+                        .add_enabled(
+                            !state.library_package_path.trim().is_empty(),
+                            Button::new("Export"),
+                        )
+                        .clicked()
+                    {
+                        state.enqueue_intent(MacroIntent::Export {
+                            package_root: state.library_package_path.trim().to_owned(),
+                        });
+                    }
+                    ui.checkbox(&mut state.confirm_library_delete, "Confirm delete");
+                    if ui
+                        .add_enabled(state.confirm_library_delete, Button::new("Delete selected"))
+                        .clicked()
+                    {
+                        state.enqueue_intent(MacroIntent::Delete);
+                        state.confirm_library_delete = false;
+                    }
                 }
             });
         });
-    } else {
-        section(ui, "LIBRARY", |ui| {
-            if let Some(intent) = library::show(ui, library_rows, state.selected_saved_macro_id()) {
-                state.enqueue_intent(intent);
-            }
-        });
-        ui.add_space(8.0);
-        section(ui, "CANONICAL CANVAS", |ui| {
-            editor_toolbar(ui, state);
-            selection = show_interactive_canvas(
-                ui,
-                state,
-                canvas,
-                monitor.active_block.as_deref(),
-                selected_canvas.as_ref(),
-            );
-        });
-        ui.add_space(8.0);
-        section(ui, "INSPECTOR", |ui| {
-            if let Some(intent) = inspector::show(ui, &projection, editable) {
-                handle_inspector_intent(state, intent);
-            }
-        });
-    }
-    selection
+}
+
+fn create_starter_draft(state: &mut MacroPageState) {
+    state.begin_draft_session();
+    state.draft = Some(EditorDraft::new(starter_macro_definition()));
+    state.selected_block_id = Some("observe-1".into());
+    state.selected_canvas = Some(CanvasSelection::Block("observe-1".into()));
+    state.editor_feedback = Some("Created an unsaved starter draft for editor authoring.".into());
 }
 
 fn show_interactive_canvas(
@@ -3547,6 +3770,40 @@ mod tests {
         assert!(state.draft.is_none());
         assert!(state.runtime_events.is_empty());
         assert!(state.enabled);
+    }
+
+    #[test]
+    fn nine_hundred_pixel_window_keeps_three_compact_panes() {
+        assert_eq!(pane_mode(900.0), PaneMode::ThreePaneCompact);
+    }
+
+    #[test]
+    fn narrow_window_keeps_canvas_and_uses_drawers() {
+        assert_eq!(pane_mode(719.0), PaneMode::CanvasWithDrawers);
+    }
+
+    #[test]
+    fn dry_run_is_never_reported_as_live_run() {
+        let mut state = MacroPageState::default();
+        state.set_selected_saved(SavedMacroIdentity {
+            macro_id: "macro".into(),
+            revision: 1,
+            definition_hash: "hash".into(),
+        });
+        state.runtime_events.push(RunEvent::RunStarted {
+            sequence: 1,
+            elapsed_ms: 0,
+            run_id: "dry-run".into(),
+            macro_id: "macro".into(),
+            revision: 1,
+            definition_hash: "hash".into(),
+            mode: RunMode::DryRun,
+        });
+
+        let controls = run_control_availability(&state);
+
+        assert_eq!(controls.primary_label, "Dry Run");
+        assert_eq!(controls.primary_detail, "Observe only");
     }
 
     #[test]

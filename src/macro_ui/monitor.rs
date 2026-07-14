@@ -594,6 +594,27 @@ pub fn show(ui: &mut Ui, monitor: &MonitorProjection) {
                     monitor_cell(ui, "Scale / stability", scale_stability(monitor).as_deref());
                     monitor_cell(ui, "Action state", action_state(monitor).as_deref());
                     ui.end_row();
+                    monitor_cell(
+                        ui,
+                        "Latest observation",
+                        observation_summary(monitor).as_deref(),
+                    );
+                    monitor_cell(ui, "Last action", monitor.action_block_id.as_deref());
+                    monitor_cell(
+                        ui,
+                        "Run mode",
+                        monitor.mode.map(|mode| format!("{mode:?}")).as_deref(),
+                    );
+                    monitor_cell(
+                        ui,
+                        "Stop reason",
+                        monitor
+                            .stop_outcome
+                            .as_ref()
+                            .map(StopOutcome::label)
+                            .as_deref(),
+                    );
+                    ui.end_row();
                 });
             ui.add_space(7.0);
             ui.separator();
@@ -617,6 +638,16 @@ pub fn show(ui: &mut Ui, monitor: &MonitorProjection) {
                 ),
             );
         });
+}
+
+fn observation_summary(monitor: &MonitorProjection) -> Option<String> {
+    monitor.observation_matched.map(|matched| {
+        if matched {
+            "Match observed".to_string()
+        } else {
+            "No match observed".to_string()
+        }
+    })
 }
 
 fn monitor_cell(ui: &mut Ui, label: &str, value: Option<&str>) {

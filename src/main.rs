@@ -1975,10 +1975,28 @@ impl App for NativeApp {
                         if self.page == AppPage::Enchant {
                             status_pill(ui, self.status, self.status.label());
                         } else {
+                            let target = self
+                                .macro_state
+                                .draft
+                                .as_ref()
+                                .map(|draft| draft.target.title_contains.as_str())
+                                .filter(|title| !title.is_empty())
+                                .unwrap_or("No target selected");
+                            let saved = self
+                                .macro_state
+                                .selected_saved
+                                .as_ref()
+                                .map(|saved| format!("Saved r{}", saved.revision))
+                                .unwrap_or_else(|| "Draft only".into());
                             ui.label(
-                                RichText::new("Macro workspace")
+                                RichText::new(format!("Target: {target}"))
                                     .size(ui_theme::text::SUPPORTING)
                                     .color(Color32::from_rgb(194, 143, 94)),
+                            );
+                            ui.label(
+                                RichText::new(saved)
+                                    .size(ui_theme::text::SUPPORTING)
+                                    .color(Color32::from_gray(185)),
                             );
                         }
                     });
@@ -1997,7 +2015,7 @@ impl App for NativeApp {
                 TopBottomPanel::bottom("macro_run_monitor")
                     .exact_height(MacroPage::MONITOR_HEIGHT)
                     .show(ctx, |ui| {
-                        MacroPage::show_monitor(ui, &self.macro_state);
+                        MacroPage::show_bottom(ui, &mut self.macro_state);
                     });
             }
         }

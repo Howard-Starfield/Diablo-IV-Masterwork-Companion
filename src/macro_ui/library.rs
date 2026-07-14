@@ -21,9 +21,8 @@ impl MacroLibraryStatus {
         match self {
             Self::Draft => "Draft",
             Self::Ready => "Ready",
-            Self::NeedsRevalidation => "Needs Revalidation",
+            Self::NeedsRevalidation | Self::StoppedWithError => "Needs Attention",
             Self::Running => "Running",
-            Self::StoppedWithError => "Stopped with Error",
             Self::Disabled => "Disabled",
         }
     }

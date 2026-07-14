@@ -3,6 +3,7 @@ use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui};
 use crate::engine::macro_engine::{MacroDefinition, RunStatus, ValidationProblem};
 
 use super::monitor::{MonitorProjection, StopOutcome};
+use super::MacroIntent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacroLibraryStatus {
@@ -86,7 +87,11 @@ pub fn project_definition(
     }
 }
 
-pub fn show(ui: &mut Ui, rows: &[MacroLibraryRow], selected_id: Option<&str>) {
+pub fn show(
+    ui: &mut Ui,
+    rows: &[MacroLibraryRow],
+    selected_id: Option<&str>,
+) -> Option<MacroIntent> {
     if rows.is_empty() {
         Frame::none()
             .fill(Color32::from_rgb(14, 16, 18))
@@ -105,9 +110,10 @@ pub fn show(ui: &mut Ui, rows: &[MacroLibraryRow], selected_id: Option<&str>) {
                         .color(Color32::from_gray(120)),
                 );
             });
-        return;
+        return None;
     }
 
+    let mut intent = None;
     for row in rows {
         let selected = selected_id == Some(row.id.as_str());
         Frame::none()
@@ -127,11 +133,18 @@ pub fn show(ui: &mut Ui, rows: &[MacroLibraryRow], selected_id: Option<&str>) {
             .rounding(5.0)
             .inner_margin(egui::Margin::same(10.0))
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new(&row.name)
-                        .strong()
-                        .color(Color32::from_gray(218)),
-                );
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new(&row.name)
+                            .strong()
+                            .color(Color32::from_gray(218)),
+                    ))
+                    .clicked()
+                {
+                    intent = Some(MacroIntent::Select {
+                        macro_id: row.id.clone(),
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(row.status.label())
@@ -159,6 +172,7 @@ pub fn show(ui: &mut Ui, rows: &[MacroLibraryRow], selected_id: Option<&str>) {
             });
         ui.add_space(6.0);
     }
+    intent
 }
 
 fn status_color(status: MacroLibraryStatus) -> Color32 {
@@ -175,7 +189,7 @@ fn status_color(status: MacroLibraryStatus) -> Color32 {
 #[cfg(test)]
 mod tests {
     use crate::engine::macro_engine::{
-        FocusLossPolicy, Limit, MACRO_SCHEMA_VERSION, SafetyPolicy, StopReason, TargetProfile,
+        FocusLossPolicy, Limit, SafetyPolicy, StopReason, TargetProfile, MACRO_SCHEMA_VERSION,
     };
 
     use super::*;

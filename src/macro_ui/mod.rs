@@ -6,15 +6,18 @@ mod timeline;
 mod wizard;
 
 pub use editor::*;
+pub use library::{project_definition, MacroLibraryRow};
+pub use monitor::RunDefinitionSnapshot;
 pub use wizard::*;
+
+use std::collections::VecDeque;
 
 use eframe::egui::{self, Align, Button, Color32, Frame, Layout, RichText, Stroke, Ui};
 
-use crate::engine::macro_engine::{RunEvent, ValidationProblem};
+use crate::engine::macro_engine::{RunEvent, RunStatus, ValidationProblem};
 
-use library::{MacroLibraryRow, project_definition};
-use monitor::{MonitorProjection, RunDefinitionSnapshot, project_last_completion, project_monitor};
-use timeline::{TimelineRow, TimelineSelection, project_timeline};
+use monitor::{project_last_completion, project_monitor, MonitorProjection};
+use timeline::{project_timeline, TimelineRow, TimelineSelection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EditorAuthoringRequestId(pub u64);
@@ -83,15 +86,98 @@ pub enum EditorAuthoringError {
     EditRejected,
 }
 
+/// Immutable identity of the saved definition that the UI has selected.  This is deliberately
+/// separate from the editable draft: controls may only ask the composition root to run this
+/// identity, never an in-memory editor value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedMacroIdentity {
+    pub macro_id: String,
+    pub revision: u64,
+    pub definition_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacroIntent {
+    Select { macro_id: String },
+    Validate,
+    Save,
+    DryRun,
+    RunOnce,
+    Run,
+    RunLive,
+    Pause,
+    Resume,
+    Stop,
+    Rename { name: String },
+    Duplicate { macro_id: String, name: String },
+    SetEnabled { enabled: bool },
+    Delete,
+    ShowHistory,
+    DeleteHistory { run_id: String },
+    Export { package_root: String },
+    ImportPackage { package_root: String },
+    CleanupOrphans,
+}
+
+impl MacroIntent {
+    fn is_stop(&self) -> bool {
+        matches!(self, Self::Stop)
+    }
+}
+
+/// Small UI-only queue.  Stop is retained under pressure so a busy UI can never make the normal
+/// controller stop path unreachable; native ESC is intentionally not represented here.
+#[derive(Debug)]
+pub struct MacroIntentQueue {
+    capacity: usize,
+    values: VecDeque<MacroIntent>,
+}
+
+impl MacroIntentQueue {
+    pub const DEFAULT_CAPACITY: usize = 32;
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity > 0, "macro intent capacity must be positive");
+        Self {
+            capacity,
+            values: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    pub fn push(&mut self, intent: MacroIntent) {
+        if self.values.len() < self.capacity {
+            self.values.push_back(intent);
+            return;
+        }
+        if intent.is_stop() {
+            if let Some(index) = self.values.iter().position(|queued| !queued.is_stop()) {
+                self.values.remove(index);
+                self.values.push_back(intent);
+            }
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<MacroIntent> {
+        self.values.pop_front()
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
 /// Canonical editor state. It intentionally owns no runtime command sender, capture service,
 /// mouse controller, or platform input handle.
 #[derive(Debug)]
 pub struct MacroPageState {
     pub draft: Option<EditorDraft>,
+    pub selected_saved: Option<SavedMacroIdentity>,
     pub saved_revision: Option<u64>,
     pub enabled: bool,
     pub running_snapshot: Option<RunDefinitionSnapshot>,
     pub runtime_events: Vec<RunEvent>,
+    pub library_rows: Vec<MacroLibraryRow>,
+    intents: MacroIntentQueue,
     pub selected_block_id: Option<String>,
     selected_timeline: Option<TimelineSelection>,
     pub pending_inspector_intent: Option<inspector::InspectorIntent>,
@@ -116,10 +202,13 @@ impl Default for MacroPageState {
     fn default() -> Self {
         Self {
             draft: None,
+            selected_saved: None,
             saved_revision: None,
             enabled: true,
             running_snapshot: None,
             runtime_events: Vec::new(),
+            library_rows: Vec::new(),
+            intents: MacroIntentQueue::with_capacity(MacroIntentQueue::DEFAULT_CAPACITY),
             selected_block_id: None,
             selected_timeline: None,
             pending_inspector_intent: None,
@@ -142,6 +231,46 @@ impl Default for MacroPageState {
 }
 
 impl MacroPageState {
+    pub fn set_selected_saved(&mut self, saved: SavedMacroIdentity) {
+        self.saved_revision = Some(saved.revision);
+        self.selected_saved = Some(saved);
+    }
+
+    pub fn clear_selected_saved(&mut self) {
+        self.selected_saved = None;
+        self.saved_revision = None;
+    }
+
+    pub fn selected_saved_macro_id(&self) -> Option<&str> {
+        self.selected_saved
+            .as_ref()
+            .map(|saved| saved.macro_id.as_str())
+    }
+
+    pub fn enqueue_intent(&mut self, intent: MacroIntent) {
+        self.intents.push(intent);
+    }
+
+    pub fn take_intent(&mut self) -> Option<MacroIntent> {
+        self.intents.pop()
+    }
+
+    pub fn load_saved_draft(
+        &mut self,
+        definition: crate::engine::macro_engine::MacroDefinition,
+        saved: SavedMacroIdentity,
+    ) {
+        self.begin_draft_session();
+        self.draft = Some(EditorDraft::new(definition));
+        self.set_selected_saved(saved);
+        self.selected_block_id = None;
+        self.selected_timeline = None;
+        self.editor_feedback = None;
+    }
+
+    pub fn validate_draft(&mut self) {
+        let _ = dispatch_editor_command(self, EditorCommand::MarkValidated);
+    }
     fn allocate_authoring_session(&mut self) -> wizard::AuthoringSessionId {
         let session = wizard::AuthoringSessionId(self.next_authoring_session_id);
         self.next_authoring_session_id = self.next_authoring_session_id.saturating_add(1);
@@ -716,10 +845,7 @@ impl MacroPage {
                 DraftEditability::Editable
             };
         }
-        let selected_macro_id = state
-            .draft
-            .as_ref()
-            .map(|definition| definition.id.as_str());
+        let selected_macro_id = state.selected_saved_macro_id();
         let monitor = project_monitor(
             selected_macro_id,
             state.running_snapshot.as_ref(),
@@ -732,20 +858,24 @@ impl MacroPage {
             .as_ref()
             .map(editor_validation_problems)
             .unwrap_or_default();
-        let library_rows = state
-            .draft
-            .as_ref()
-            .map(|definition| {
-                vec![project_definition(
-                    definition,
-                    state.saved_revision,
-                    state.enabled,
-                    &problems,
-                    &monitor,
-                    last_completion.as_ref(),
-                )]
-            })
-            .unwrap_or_default();
+        let library_rows = if state.library_rows.is_empty() {
+            state
+                .draft
+                .as_ref()
+                .map(|definition| {
+                    vec![project_definition(
+                        definition,
+                        state.saved_revision,
+                        state.enabled,
+                        &problems,
+                        &monitor,
+                        last_completion.as_ref(),
+                    )]
+                })
+                .unwrap_or_default()
+        } else {
+            state.library_rows.clone()
+        };
         let timeline_rows = state
             .draft
             .as_ref()
@@ -785,10 +915,7 @@ impl MacroPage {
     }
 
     pub fn show_monitor(ui: &mut Ui, state: &MacroPageState) {
-        let selected_macro_id = state
-            .draft
-            .as_ref()
-            .map(|definition| definition.id.as_str());
+        let selected_macro_id = state.selected_saved_macro_id();
         let monitor = project_monitor(
             selected_macro_id,
             state.running_snapshot.as_ref(),
@@ -825,7 +952,7 @@ fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAc
                 .unwrap_or_else(|| state.allocate_authoring_session());
             state.draft = Some(EditorDraft::new(output.definition));
             state.draft_session = Some(generated_session);
-            state.saved_revision = None;
+            state.clear_selected_saved();
             state.selected_block_id = selected.clone();
             state.selected_timeline = selected.map(TimelineSelection::Identity);
             state.wizard = None;
@@ -1028,16 +1155,55 @@ fn status_strip(
                     }
                 }
                 if ui.add_enabled(can_edit, Button::new("Validate")).clicked() {
-                    let _ = dispatch_editor_command(state, EditorCommand::MarkValidated);
+                    state.enqueue_intent(MacroIntent::Validate);
                 }
-                for label in ["Dry Run", "Run Once", "Run", "Pause", "Stop"] {
-                    ui.add_enabled(false, Button::new(label));
+                let can_save = can_edit
+                    && state.draft.is_some()
+                    && problems.is_empty()
+                    && state
+                        .draft
+                        .as_ref()
+                        .is_some_and(|draft| draft.status == DraftStatus::Ready);
+                if ui.add_enabled(can_save, Button::new("Save")).clicked() {
+                    state.enqueue_intent(MacroIntent::Save);
                 }
-                ui.label(
-                    RichText::new("Controls unlock only after editor/runtime wiring")
-                        .size(10.0)
-                        .color(Color32::from_gray(107)),
-                );
+                let can_run = state.selected_saved.is_some() && monitor.status == RunStatus::Idle;
+                if ui.add_enabled(can_run, Button::new("Dry Run")).clicked() {
+                    state.enqueue_intent(MacroIntent::DryRun);
+                }
+                if ui.add_enabled(can_run, Button::new("Run Once")).clicked() {
+                    state.enqueue_intent(MacroIntent::RunOnce);
+                }
+                if ui.add_enabled(can_run, Button::new("Run")).clicked() {
+                    state.enqueue_intent(MacroIntent::Run);
+                }
+                if ui.add_enabled(can_run, Button::new("Live Run")).clicked() {
+                    state.enqueue_intent(MacroIntent::RunLive);
+                }
+                if ui
+                    .add_enabled(monitor.status == RunStatus::Running, Button::new("Pause"))
+                    .clicked()
+                {
+                    state.enqueue_intent(MacroIntent::Pause);
+                }
+                if ui
+                    .add_enabled(monitor.status == RunStatus::Paused, Button::new("Resume"))
+                    .clicked()
+                {
+                    state.enqueue_intent(MacroIntent::Resume);
+                }
+                if ui
+                    .add_enabled(
+                        matches!(
+                            monitor.status,
+                            RunStatus::Running | RunStatus::Paused | RunStatus::Stopping
+                        ),
+                        Button::new("Stop"),
+                    )
+                    .clicked()
+                {
+                    state.enqueue_intent(MacroIntent::Stop);
+                }
                 if let Some(target) = inspector::problem_navigation_target(problems, 0) {
                     if ui.small_button("Open first problem").clicked() {
                         navigate = Some(target);
@@ -1181,14 +1347,11 @@ fn workspace(
     if ui.available_width() >= 900.0 {
         ui.columns(3, |columns| {
             section(&mut columns[0], "LIBRARY", |ui| {
-                library::show(
-                    ui,
-                    library_rows,
-                    state
-                        .draft
-                        .as_ref()
-                        .map(|definition| definition.id.as_str()),
-                );
+                if let Some(intent) =
+                    library::show(ui, library_rows, state.selected_saved_macro_id())
+                {
+                    state.enqueue_intent(intent);
+                }
             });
             section(&mut columns[1], "EVENT TIMELINE", |ui| {
                 editor_toolbar(ui, state);
@@ -1207,14 +1370,9 @@ fn workspace(
         });
     } else {
         section(ui, "LIBRARY", |ui| {
-            library::show(
-                ui,
-                library_rows,
-                state
-                    .draft
-                    .as_ref()
-                    .map(|definition| definition.id.as_str()),
-            );
+            if let Some(intent) = library::show(ui, library_rows, state.selected_saved_macro_id()) {
+                state.enqueue_intent(intent);
+            }
         });
         ui.add_space(8.0);
         section(ui, "EVENT TIMELINE", |ui| {
@@ -2876,6 +3034,43 @@ mod tests {
     }
 
     #[test]
+    fn saved_identity_is_stable_when_the_editable_draft_changes() {
+        let mut state = MacroPageState {
+            draft: Some(fixture()),
+            ..MacroPageState::default()
+        };
+        state.set_selected_saved(SavedMacroIdentity {
+            macro_id: "macro".into(),
+            revision: 1,
+            definition_hash: "saved-hash".into(),
+        });
+
+        state.draft.as_mut().unwrap().definition.name = "Unsaved edit".into();
+        state.enqueue_intent(MacroIntent::Run);
+
+        assert_eq!(
+            state.selected_saved.as_ref().unwrap().definition_hash,
+            "saved-hash"
+        );
+        assert_eq!(state.take_intent(), Some(MacroIntent::Run));
+        assert_eq!(state.selected_saved_macro_id(), Some("macro"));
+    }
+
+    #[test]
+    fn bounded_intents_evict_noncritical_work_but_retain_stop() {
+        let mut intents = MacroIntentQueue::with_capacity(2);
+        intents.push(MacroIntent::Select {
+            macro_id: "one".into(),
+        });
+        intents.push(MacroIntent::Run);
+        intents.push(MacroIntent::Stop);
+
+        assert_eq!(intents.len(), 2);
+        assert_eq!(intents.pop(), Some(MacroIntent::Run));
+        assert_eq!(intents.pop(), Some(MacroIntent::Stop));
+    }
+
+    #[test]
     fn revision_summary_distinguishes_draft_saved_and_running() {
         let mut monitor = MonitorProjection::default();
         monitor.running_revision = Some(3);
@@ -3020,13 +3215,11 @@ mod tests {
             },
         );
         assert_eq!(result, Err(EditorError::RunInProgress));
-        assert!(
-            state
-                .editor_feedback
-                .as_deref()
-                .unwrap()
-                .contains("RunInProgress")
-        );
+        assert!(state
+            .editor_feedback
+            .as_deref()
+            .unwrap()
+            .contains("RunInProgress"));
     }
 
     #[test]
@@ -3897,11 +4090,9 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(
-            editor_validation_problems(state.draft.as_ref().unwrap())
-                .iter()
-                .any(|problem| problem.code == "editor.detector_test_failed")
-        );
+        assert!(editor_validation_problems(state.draft.as_ref().unwrap())
+            .iter()
+            .any(|problem| problem.code == "editor.detector_test_failed"));
         assert_eq!(
             apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,),
             Err(EditorError::ValidationFailed)
@@ -3924,11 +4115,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(
-            editor_validation_problems(state.draft.as_ref().unwrap())
-                .iter()
-                .any(|problem| problem.code == "editor.detector_test_failed")
-        );
+        assert!(editor_validation_problems(state.draft.as_ref().unwrap())
+            .iter()
+            .any(|problem| problem.code == "editor.detector_test_failed"));
         assert_eq!(
             apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,),
             Err(EditorError::ValidationFailed)
@@ -3955,11 +4144,9 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(
-            !editor_validation_problems(state.draft.as_ref().unwrap())
-                .iter()
-                .any(|problem| problem.code == "editor.detector_test_failed")
-        );
+        assert!(!editor_validation_problems(state.draft.as_ref().unwrap())
+            .iter()
+            .any(|problem| problem.code == "editor.detector_test_failed"));
         assert!(
             apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,)
                 .is_ok()
@@ -3993,11 +4180,9 @@ mod tests {
             EditorCommand::ReplaceTextRule { rule: edited_rule },
         )
         .unwrap();
-        assert!(
-            !editor_validation_problems(state.draft.as_ref().unwrap())
-                .iter()
-                .any(|problem| problem.code == "editor.detector_test_failed")
-        );
+        assert!(!editor_validation_problems(state.draft.as_ref().unwrap())
+            .iter()
+            .any(|problem| problem.code == "editor.detector_test_failed"));
         assert!(
             apply_editor_command(state.draft.as_mut().unwrap(), EditorCommand::MarkValidated,)
                 .is_ok()
@@ -4072,11 +4257,9 @@ mod tests {
                 }),
             })
             .unwrap();
-        assert!(
-            state.draft.as_ref().unwrap().image_rules[0]
-                .verification
-                .is_none()
-        );
+        assert!(state.draft.as_ref().unwrap().image_rules[0]
+            .verification
+            .is_none());
 
         let rule = state.draft.as_ref().unwrap().image_rules[0].clone();
         let region_revision = state.draft.as_ref().unwrap().regions[0].revision;
@@ -4159,11 +4342,9 @@ mod tests {
             }),
             Err(EditorAuthoringError::OutcomeMismatch)
         );
-        assert!(
-            state.draft.as_ref().unwrap().image_rules[0]
-                .verification
-                .is_none()
-        );
+        assert!(state.draft.as_ref().unwrap().image_rules[0]
+            .verification
+            .is_none());
 
         handle_inspector_intent(
             &mut state,
@@ -4187,11 +4368,9 @@ mod tests {
             })
             .unwrap();
 
-        assert!(
-            state.draft.as_ref().unwrap().image_rules[0]
-                .verification
-                .is_some()
-        );
+        assert!(state.draft.as_ref().unwrap().image_rules[0]
+            .verification
+            .is_some());
         assert!(validate_macro(state.draft.as_ref().unwrap()).is_empty());
 
         handle_inspector_intent(
@@ -4215,16 +4394,12 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(
-            state.draft.as_ref().unwrap().image_rules[0]
-                .verification
-                .is_none()
-        );
-        assert!(
-            editor_validation_problems(state.draft.as_ref().unwrap())
-                .iter()
-                .any(|problem| problem.code == "editor.detector_test_failed")
-        );
+        assert!(state.draft.as_ref().unwrap().image_rules[0]
+            .verification
+            .is_none());
+        assert!(editor_validation_problems(state.draft.as_ref().unwrap())
+            .iter()
+            .any(|problem| problem.code == "editor.detector_test_failed"));
 
         handle_inspector_intent(
             &mut state,
@@ -4247,16 +4422,12 @@ mod tests {
                 },
             })
             .unwrap();
-        assert!(
-            state.draft.as_ref().unwrap().image_rules[0]
-                .verification
-                .is_some()
-        );
-        assert!(
-            !editor_validation_problems(state.draft.as_ref().unwrap())
-                .iter()
-                .any(|problem| problem.code == "editor.detector_test_failed")
-        );
+        assert!(state.draft.as_ref().unwrap().image_rules[0]
+            .verification
+            .is_some());
+        assert!(!editor_validation_problems(state.draft.as_ref().unwrap())
+            .iter()
+            .any(|problem| problem.code == "editor.detector_test_failed"));
 
         let mut edited = state.draft.as_ref().unwrap().image_rules[0].clone();
         edited.threshold = 0.92;
@@ -4268,13 +4439,11 @@ mod tests {
                 block_id: "observe-1".into(),
             },
         );
-        assert!(
-            state
-                .take_editor_authoring_request()
-                .unwrap()
-                .image_negative_samples
-                .is_empty()
-        );
+        assert!(state
+            .take_editor_authoring_request()
+            .unwrap()
+            .image_negative_samples
+            .is_empty());
     }
 
     #[test]

@@ -4,14 +4,14 @@
 )]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::Cursor,
     path::PathBuf,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
+        Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -21,48 +21,51 @@ mod engine;
 mod macro_ui;
 
 use crate::engine::{
-    config::{EnchantConfig, MouseMovementProfile, default_mouse_movement_profile},
+    config::{default_mouse_movement_profile, EnchantConfig, MouseMovementProfile},
     enchant_loop::{EnchantEvent, EnchantRunner, OcrReader, RegionCapture},
     macro_engine::{
-        AssetRef, AssetStore, ClusterPolicy, DEFAULT_MAX_SCORE_CELLS, ImageMatchCandidate,
-        ImageMatchConfig, ImageMatchResult, ImageMatcher, ImageRule, ImageRuleVerification,
-        ImageRuleVerificationInput, MacroStore, NegativeCorpusSample,
-        NegativeSampleEvaluationInputs, TargetProfile, authoring_test_text_rule, cluster_peaks,
+        authoring_test_text_rule, cluster_peaks, AssetRef, AssetStore, ClusterPolicy,
+        ControllerRunRequest, ImageMatchCandidate, ImageMatchConfig, ImageMatchResult,
+        ImageMatcher, ImageRule, ImageRuleVerification, ImageRuleVerificationInput,
+        MacroController, MacroStore, NegativeCorpusSample, NegativeSampleEvaluationInputs,
+        PreparedPackageImport, RunEvent, RunMode, SavedRevision, TargetProfile,
+        DEFAULT_MAX_SCORE_CELLS,
     },
-    matcher::{MatchResult, match_affix},
+    matcher::{match_affix, MatchResult},
     platform::{
-        CaptureRequestId, CapturedTargetBinding, CapturedTargetProfile, EscStopSignal,
-        MacroCaptureKind, MacroCaptureRequest, MacroCaptureSelection, SendInputController,
-        WindowsOcrReader, XcapRegionCapture, enable_per_monitor_dpi_awareness,
+        build_windows_macro_runtime, enable_per_monitor_dpi_awareness,
         record_mouse_movement_profile, resolve_target_from_selection, select_macro_capture,
-        select_screen_rect,
+        select_screen_rect, CaptureRequestId, CapturedTargetBinding, CapturedTargetProfile,
+        EscStopSignal, MacroCaptureKind, MacroCaptureRequest, MacroCaptureSelection,
+        SendInputController, WindowsMacroRuntimeBundle, WindowsOcrReader, XcapRegionCapture,
     },
     types::{PointRatio, Rect, RectRatio},
 };
 use crate::macro_ui::{
     AuthoringSessionId, EditorAuthoringKind, EditorAuthoringOutcome, EditorAuthoringRequest,
-    EditorAuthoringResult, EditorDraft, MacroPage, MacroPageState, WizardAuthoringKind,
-    WizardAuthoringOutcome, WizardAuthoringRequest, WizardAuthoringResult, WizardDetector,
+    EditorAuthoringResult, EditorDraft, MacroIntent, MacroPage, MacroPageState,
+    RunDefinitionSnapshot, SavedMacroIdentity, WizardAuthoringKind, WizardAuthoringOutcome,
+    WizardAuthoringRequest, WizardAuthoringResult, WizardDetector,
 };
 use eframe::{
-    App, CreationContext,
     egui::{
         self, Align, Button, CentralPanel, Color32, Context, Frame, Grid, Layout, RichText, Sense,
         Slider, Stroke, TopBottomPanel, Ui, Vec2, ViewportCommand, Widget,
     },
+    App, CreationContext,
 };
 use image::{DynamicImage, ImageFormat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use windows::{
+    core::{w, HSTRING},
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, SetLastError, WIN32_ERROR,
+            CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, HANDLE, WIN32_ERROR,
         },
         System::Threading::CreateMutexW,
-        UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW},
+        UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK},
     },
-    core::{HSTRING, w},
 };
 
 const APP_WIDTH: f32 = 600.0;
@@ -70,6 +73,16 @@ const APP_HEIGHT: f32 = 760.0;
 const CALIBRATION_BUTTON_WIDTH: f32 = 138.0;
 const ACTION_BUTTON_HEIGHT: f32 = 38.0;
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\BoBoCompanion.SingleInstance.v1";
+
+fn macro_run_request(intent: &MacroIntent) -> Option<ControllerRunRequest> {
+    match intent {
+        MacroIntent::DryRun => Some(ControllerRunRequest::once(RunMode::DryRun)),
+        MacroIntent::RunOnce => Some(ControllerRunRequest::once(RunMode::ObservationOnly)),
+        MacroIntent::Run => Some(ControllerRunRequest::continuous(RunMode::ObservationOnly)),
+        MacroIntent::RunLive => Some(ControllerRunRequest::continuous(RunMode::Live)),
+        _ => None,
+    }
+}
 
 struct NamedMutexCreation<H> {
     handle: H,
@@ -150,22 +163,21 @@ fn main() -> eframe::Result<()> {
 
     // Keep this guard alive for the entire UI process so staged macro revisions cannot be
     // concurrently recovered or replaced by another application instance.
-    let _single_instance = match SingleInstanceGuard::acquire_with(
-        Win32NamedMutexBackend,
-        SINGLE_INSTANCE_MUTEX_NAME,
-    ) {
-        Ok(Some(guard)) => guard,
-        Ok(None) => {
-            show_startup_notice("BoBo Companion is already running.");
-            return Ok(());
-        }
-        Err(error) => {
-            show_startup_notice(&format!(
+    let _single_instance =
+        match SingleInstanceGuard::acquire_with(Win32NamedMutexBackend, SINGLE_INSTANCE_MUTEX_NAME)
+        {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                show_startup_notice("BoBo Companion is already running.");
+                return Ok(());
+            }
+            Err(error) => {
+                show_startup_notice(&format!(
                 "BoBo Companion could not establish its single-instance safety boundary:\n\n{error}"
             ));
-            return Ok(());
-        }
-    };
+                return Ok(());
+            }
+        };
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("BoBo Companion")
@@ -440,7 +452,10 @@ struct NativeApp {
     active_ocr_rect: Option<Rect>,
     dirty: bool,
     macro_authoring_targets: HashMap<AuthoringSessionId, CapturedTargetBinding>,
-    macro_store: Option<MacroStore>,
+    macro_store: Option<Arc<MacroStore>>,
+    selected_saved_revision: Option<SavedRevision>,
+    macro_controller: Option<MacroController>,
+    active_macro_bundle: Option<WindowsMacroRuntimeBundle>,
 }
 
 impl NativeApp {
@@ -476,6 +491,9 @@ impl NativeApp {
             dirty: migrated_config,
             macro_authoring_targets: HashMap::new(),
             macro_store,
+            selected_saved_revision: None,
+            macro_controller: None,
+            active_macro_bundle: None,
         }
     }
 
@@ -532,6 +550,403 @@ impl NativeApp {
             };
             send_ui_event(&tx, &repaint, UiEvent::CaptureFinished(kind, result));
         });
+    }
+
+    fn refresh_macro_library(&mut self) {
+        let Some(store) = self.macro_store.as_ref() else {
+            return;
+        };
+        let rows = store
+            .list_macros()
+            .ok()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|summary| {
+                store.load_current(&summary.id).ok().map(|saved| {
+                    crate::macro_ui::project_definition(
+                        &saved.definition,
+                        Some(saved.definition.revision),
+                        summary.enabled,
+                        &[],
+                        &Default::default(),
+                        None,
+                    )
+                })
+            })
+            .collect();
+        self.macro_state.library_rows = rows;
+    }
+
+    fn select_saved_macro(&mut self, macro_id: String) {
+        if self.macro_controller.is_some() {
+            self.macro_state.editor_feedback =
+                Some("Finish the active run before selecting another saved macro.".into());
+            return;
+        }
+        let Some(store) = self.macro_store.as_ref() else {
+            self.macro_state.editor_feedback = Some("Macro store is unavailable.".into());
+            return;
+        };
+        match store.load_current(&macro_id) {
+            Ok(saved) => {
+                let revision = saved.definition.revision;
+                self.selected_saved_revision = Some(saved.clone());
+                self.macro_state.load_saved_draft(
+                    saved.definition,
+                    SavedMacroIdentity {
+                        macro_id,
+                        revision,
+                        definition_hash: saved.definition_hash,
+                    },
+                )
+            }
+            Err(error) => {
+                self.macro_state.editor_feedback = Some(format!("Could not load macro: {error}"))
+            }
+        }
+    }
+
+    fn save_macro_draft(&mut self) {
+        let Some(store) = self.macro_store.as_ref() else {
+            self.macro_state.editor_feedback = Some("Macro store is unavailable.".into());
+            return;
+        };
+        let Some(draft) = self.macro_state.draft.as_ref() else {
+            return;
+        };
+        if !crate::macro_ui::editor_validation_problems(draft).is_empty() {
+            self.macro_state.editor_feedback = Some("Validate the draft before saving.".into());
+            return;
+        }
+        let mut candidate = draft.definition.clone();
+        candidate.revision = self
+            .macro_state
+            .selected_saved
+            .as_ref()
+            .map(|saved| saved.revision.saturating_add(1))
+            .unwrap_or(1);
+        match store.save_validated(candidate) {
+            Ok(saved) => {
+                self.selected_saved_revision = Some(saved.clone());
+                let identity = SavedMacroIdentity {
+                    macro_id: saved.definition.id.clone(),
+                    revision: saved.definition.revision,
+                    definition_hash: saved.definition_hash,
+                };
+                self.macro_state
+                    .load_saved_draft(saved.definition, identity);
+                self.macro_state.editor_feedback = Some("Saved validated revision.".into());
+                self.refresh_macro_library();
+            }
+            Err(error) => self.macro_state.editor_feedback = Some(format!("Save failed: {error}")),
+        }
+    }
+
+    fn start_saved_macro(&mut self, request: ControllerRunRequest) {
+        if self.macro_controller.is_some() {
+            self.macro_state.editor_feedback = Some("A macro run is already active.".into());
+            return;
+        }
+        let Some(store) = self.macro_store.as_ref() else {
+            self.macro_state.editor_feedback = Some("Macro store is unavailable.".into());
+            return;
+        };
+        let Some(selected) = self.macro_state.selected_saved.clone() else {
+            self.macro_state.editor_feedback =
+                Some("Select a saved revision before running.".into());
+            return;
+        };
+        let Some(native_selected) = self.selected_saved_revision.as_ref() else {
+            self.macro_state.editor_feedback =
+                Some("Reload the saved revision before running.".into());
+            return;
+        };
+        if native_selected.definition.id != selected.macro_id
+            || native_selected.definition.revision != selected.revision
+            || native_selected.definition_hash != selected.definition_hash
+        {
+            self.macro_state.editor_feedback =
+                Some("Saved selection changed; reload it before running.".into());
+            return;
+        }
+        let Ok(saved) = store.load_current(&selected.macro_id) else {
+            self.macro_state.editor_feedback =
+                Some("Selected saved revision is unavailable.".into());
+            return;
+        };
+        if saved.definition.revision != selected.revision
+            || saved.definition_hash != selected.definition_hash
+        {
+            self.macro_state.editor_feedback =
+                Some("Saved revision changed; reload it before running.".into());
+            return;
+        }
+        self.selected_saved_revision = Some(saved.clone());
+        let binding = self
+            .macro_state
+            .active_draft_session()
+            .and_then(|session| self.macro_authoring_targets.get(&session))
+            .filter(|binding| binding_matches_target_profile(binding, &saved.definition.target));
+        let Some(binding) = binding else {
+            self.macro_state.editor_feedback =
+                Some("Capture the exact saved target before running this revision.".into());
+            return;
+        };
+        let bundle = match build_windows_macro_runtime(binding, &saved.definition.target) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                self.macro_state.editor_feedback =
+                    Some(format!("Live runtime setup failed: {error}"));
+                return;
+            }
+        };
+        let controller = MacroController::new(bundle.runtime.clone(), Arc::clone(store), 256);
+        if let Err(error) = controller.start_saved(&selected.macro_id, request) {
+            self.macro_state.editor_feedback = Some(format!("Run failed to start: {error}"));
+            return;
+        }
+        self.macro_controller = Some(controller);
+        self.active_macro_bundle = Some(bundle);
+    }
+
+    fn sync_macro_runtime(&mut self) {
+        let Some(controller) = self.macro_controller.as_ref() else {
+            return;
+        };
+        let saved = controller.active_revision();
+        while let Some(event) = controller.try_next_event() {
+            if self.macro_state.runtime_events.len() >= 256 {
+                self.macro_state.runtime_events.remove(0);
+            }
+            if let RunEvent::RunStarted { run_id, .. } = &event {
+                if let Some(saved) = saved.clone() {
+                    self.macro_state.running_snapshot =
+                        Some(RunDefinitionSnapshot::from_saved(run_id.clone(), saved));
+                }
+            }
+            self.macro_state.runtime_events.push(event);
+        }
+        if controller.status() == crate::engine::macro_engine::MacroControllerStatus::Idle {
+            if let Err(error) = controller.wait_until_idle(Duration::from_secs(2)) {
+                self.macro_state.editor_feedback =
+                    Some(format!("Macro worker shutdown failed: {error}"));
+                return;
+            }
+            self.macro_controller = None;
+            self.active_macro_bundle = None;
+            self.macro_state.running_snapshot = None;
+            self.refresh_macro_library();
+        }
+    }
+
+    fn dispatch_macro_intents(&mut self) {
+        if self.macro_state.selected_saved.is_none() {
+            self.selected_saved_revision = None;
+        }
+        while let Some(intent) = self.macro_state.take_intent() {
+            if let Some(request) = macro_run_request(&intent) {
+                self.start_saved_macro(request);
+                continue;
+            }
+            match intent {
+                MacroIntent::Select { macro_id } => self.select_saved_macro(macro_id),
+                MacroIntent::Validate => self.macro_state.validate_draft(),
+                MacroIntent::Save => self.save_macro_draft(),
+                MacroIntent::DryRun
+                | MacroIntent::RunOnce
+                | MacroIntent::Run
+                | MacroIntent::RunLive => unreachable!("run intents are handled above"),
+                MacroIntent::Pause => {
+                    if let Some(controller) = self.macro_controller.as_ref() {
+                        controller.pause();
+                    }
+                }
+                MacroIntent::Resume => {
+                    if let Some(controller) = self.macro_controller.as_ref() {
+                        if let Err(error) = controller.resume() {
+                            self.macro_state.editor_feedback =
+                                Some(format!("Resume failed: {error}"));
+                        }
+                    }
+                }
+                MacroIntent::Stop => {
+                    if let Some(controller) = self.macro_controller.as_ref() {
+                        controller.stop();
+                    }
+                }
+                MacroIntent::SetEnabled { enabled } => {
+                    if let (Some(store), Some(saved)) = (
+                        self.macro_store.as_ref(),
+                        self.macro_state.selected_saved.as_ref(),
+                    ) {
+                        if let Err(error) = store.set_macro_enabled(&saved.macro_id, enabled) {
+                            self.macro_state.editor_feedback =
+                                Some(format!("Enablement failed: {error}"));
+                        } else {
+                            self.refresh_macro_library();
+                        }
+                    }
+                }
+                MacroIntent::Delete => {
+                    if let (Some(store), Some(saved)) = (
+                        self.macro_store.as_ref(),
+                        self.macro_state.selected_saved.clone(),
+                    ) {
+                        match store.delete_macro(&saved.macro_id) {
+                            Ok(()) => {
+                                self.macro_state.clear_selected_saved();
+                                self.selected_saved_revision = None;
+                                self.refresh_macro_library();
+                            }
+                            Err(error) => {
+                                self.macro_state.editor_feedback =
+                                    Some(format!("Delete failed: {error}"))
+                            }
+                        }
+                    }
+                }
+                MacroIntent::Rename { name } => {
+                    if let (Some(store), Some(saved)) = (
+                        self.macro_store.as_ref(),
+                        self.macro_state.selected_saved.clone(),
+                    ) {
+                        match store.rename_macro(&saved.macro_id, &saved.definition_hash, &name) {
+                            Ok(saved) => {
+                                self.selected_saved_revision = Some(saved.clone());
+                                let revision = saved.definition.revision;
+                                let macro_id = saved.definition.id.clone();
+                                let definition_hash = saved.definition_hash;
+                                self.macro_state.load_saved_draft(
+                                    saved.definition,
+                                    SavedMacroIdentity {
+                                        macro_id,
+                                        revision,
+                                        definition_hash,
+                                    },
+                                );
+                                self.refresh_macro_library();
+                            }
+                            Err(error) => {
+                                self.macro_state.editor_feedback =
+                                    Some(format!("Rename failed: {error}"))
+                            }
+                        }
+                    }
+                }
+                MacroIntent::Duplicate { macro_id, name } => {
+                    if let (Some(store), Some(saved)) = (
+                        self.macro_store.as_ref(),
+                        self.macro_state.selected_saved.as_ref(),
+                    ) {
+                        match store.duplicate_macro(&saved.macro_id, &macro_id, &name) {
+                            Ok(saved) => {
+                                self.selected_saved_revision = Some(saved.clone());
+                                let revision = saved.definition.revision;
+                                self.macro_state.load_saved_draft(
+                                    saved.definition,
+                                    SavedMacroIdentity {
+                                        macro_id,
+                                        revision,
+                                        definition_hash: saved.definition_hash,
+                                    },
+                                );
+                                self.refresh_macro_library();
+                            }
+                            Err(error) => {
+                                self.macro_state.editor_feedback =
+                                    Some(format!("Duplicate failed: {error}"))
+                            }
+                        }
+                    }
+                }
+                MacroIntent::ShowHistory => {
+                    if let Some(store) = self.macro_store.as_ref() {
+                        match store.list_run_history() {
+                            Ok(history) => {
+                                self.macro_state.editor_feedback = Some(format!(
+                                    "{} saved run history entr{}.",
+                                    history.len(),
+                                    if history.len() == 1 { "y" } else { "ies" }
+                                ))
+                            }
+                            Err(error) => {
+                                self.macro_state.editor_feedback =
+                                    Some(format!("History unavailable: {error}"))
+                            }
+                        }
+                    }
+                }
+                MacroIntent::DeleteHistory { run_id } => {
+                    if let Some(store) = self.macro_store.as_ref() {
+                        if let Err(error) = store.delete_run_history(&run_id) {
+                            self.macro_state.editor_feedback =
+                                Some(format!("History delete failed: {error}"));
+                        }
+                    }
+                }
+                MacroIntent::Export { package_root } => {
+                    if let (Some(store), Some(saved)) = (
+                        self.macro_store.as_ref(),
+                        self.macro_state.selected_saved.as_ref(),
+                    ) {
+                        if let Err(error) = store
+                            .export_current_package(&saved.macro_id, &PathBuf::from(package_root))
+                        {
+                            self.macro_state.editor_feedback =
+                                Some(format!("Export failed: {error}"));
+                        }
+                    }
+                }
+                MacroIntent::ImportPackage { package_root } => {
+                    if let Some(store) = self.macro_store.as_ref() {
+                        match store.prepare_package_import(&PathBuf::from(package_root)) {
+                            Ok(PreparedPackageImport::Text(prepared)) => match store.commit_text_package_import(prepared) {
+                                Ok(saved) => {
+                                    self.selected_saved_revision = Some(saved.clone());
+                                    let revision = saved.definition.revision;
+                                    let macro_id = saved.definition.id.clone();
+                                    let definition_hash = saved.definition_hash;
+                                    self.macro_state.load_saved_draft(
+                                        saved.definition,
+                                        SavedMacroIdentity { macro_id, revision, definition_hash },
+                                    );
+                                    self.refresh_macro_library();
+                                }
+                                Err(error) => self.macro_state.editor_feedback = Some(format!("Text import failed: {error}")),
+                            },
+                            Ok(PreparedPackageImport::Image(_)) => self.macro_state.editor_feedback = Some("Image packages require local recapture and re-verification; import was not committed.".into()),
+                            Err(error) => self.macro_state.editor_feedback = Some(format!("Import failed: {error}")),
+                        }
+                    }
+                }
+                MacroIntent::CleanupOrphans => {
+                    if let Some(store) = self.macro_store.as_ref() {
+                        let active_assets = self
+                            .macro_controller
+                            .as_ref()
+                            .and_then(MacroController::active_revision)
+                            .map(|saved| {
+                                saved
+                                    .pinned_assets
+                                    .into_iter()
+                                    .map(|pinned| pinned.asset)
+                                    .collect::<HashSet<_>>()
+                            })
+                            .unwrap_or_default();
+                        match store.cleanup_orphan_assets(&active_assets) {
+                            Ok(removed) => {
+                                self.macro_state.editor_feedback =
+                                    Some(format!("Removed {removed} orphan asset(s)."))
+                            }
+                            Err(error) => {
+                                self.macro_state.editor_feedback =
+                                    Some(format!("Asset cleanup failed: {error}"))
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn begin_macro_authoring(&mut self, request: WizardAuthoringRequest) {
@@ -1086,6 +1501,10 @@ impl App for NativeApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll_events(ctx);
         self.save_if_dirty();
+        self.sync_macro_runtime();
+        if self.page == AppPage::Macro {
+            self.refresh_macro_library();
+        }
 
         TopBottomPanel::top("title_bar")
             .exact_height(42.0)
@@ -1155,6 +1574,7 @@ impl App for NativeApp {
                     });
             });
         if self.page == AppPage::Macro {
+            self.dispatch_macro_intents();
             let active_sessions = self.macro_state.active_authoring_sessions();
             prune_authoring_targets(&mut self.macro_authoring_targets, &active_sessions);
             if let Some(request) = self.macro_state.take_wizard_request() {
@@ -2439,13 +2859,13 @@ fn find_editor_condition<'a>(
     None
 }
 
-fn open_macro_authoring_store() -> Option<MacroStore> {
+fn open_macro_authoring_store() -> Option<Arc<MacroStore>> {
     let root = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("BoBo Companion")
         .join("Macro Authoring");
-    MacroStore::open(&root).ok()
+    MacroStore::open(&root).ok().map(Arc::new)
 }
 
 fn config_path() -> PathBuf {
@@ -2574,17 +2994,15 @@ mod routing_tests {
         assert_eq!(primary_closes.load(Ordering::SeqCst), 1);
 
         let duplicate_closes = Arc::new(AtomicUsize::new(0));
-        assert!(
-            SingleInstanceGuard::acquire_with(
-                FakeNamedMutexBackend {
-                    already_exists: true,
-                    closes: Arc::clone(&duplicate_closes),
-                },
-                "test-duplicate",
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(SingleInstanceGuard::acquire_with(
+            FakeNamedMutexBackend {
+                already_exists: true,
+                closes: Arc::clone(&duplicate_closes),
+            },
+            "test-duplicate",
+        )
+        .unwrap()
+        .is_none());
         assert_eq!(duplicate_closes.load(Ordering::SeqCst), 1);
     }
 
@@ -2653,33 +3071,29 @@ mod routing_tests {
         let store = MacroStore::open(temp.path()).unwrap();
         let assets = store.assets();
 
-        assert!(
-            publish_pending_template_if_current(
-                false,
-                Some(assets),
-                PendingTemplateCapture {
-                    bytes: b"initial".to_vec(),
-                    previous: None,
-                },
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(publish_pending_template_if_current(
+            false,
+            Some(assets),
+            PendingTemplateCapture {
+                bytes: b"initial".to_vec(),
+                previous: None,
+            },
+        )
+        .unwrap()
+        .is_none());
         let initial = assets.put_png(b"initial").unwrap();
         assert!(initial.id.ends_with("-1"));
 
-        assert!(
-            publish_pending_template_if_current(
-                false,
-                Some(assets),
-                PendingTemplateCapture {
-                    bytes: b"stale successor".to_vec(),
-                    previous: Some(initial.clone()),
-                },
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(publish_pending_template_if_current(
+            false,
+            Some(assets),
+            PendingTemplateCapture {
+                bytes: b"stale successor".to_vec(),
+                previous: Some(initial.clone()),
+            },
+        )
+        .unwrap()
+        .is_none());
         let successor = assets
             .put_next_png_revision(&initial, b"accepted successor")
             .unwrap();
@@ -2759,6 +3173,27 @@ mod routing_tests {
         wrong = target;
         wrong.process_path = r#"C:\games\Other.exe"#.into();
         assert!(!captured_profile_matches_target(&captured, &wrong));
+    }
+
+    #[test]
+    fn macro_run_intents_map_to_the_controller_modes_without_live_input() {
+        assert_eq!(
+            macro_run_request(&MacroIntent::DryRun),
+            Some(ControllerRunRequest::once(RunMode::DryRun))
+        );
+        assert_eq!(
+            macro_run_request(&MacroIntent::RunOnce),
+            Some(ControllerRunRequest::once(RunMode::ObservationOnly))
+        );
+        assert_eq!(
+            macro_run_request(&MacroIntent::Run),
+            Some(ControllerRunRequest::continuous(RunMode::ObservationOnly))
+        );
+        assert_eq!(
+            macro_run_request(&MacroIntent::RunLive),
+            Some(ControllerRunRequest::continuous(RunMode::Live))
+        );
+        assert_eq!(macro_run_request(&MacroIntent::Stop), None);
     }
 
     #[test]

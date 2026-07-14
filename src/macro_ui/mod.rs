@@ -360,6 +360,12 @@ impl MacroPageState {
         self.enabled = enabled;
     }
 
+    /// Request durable lifecycle state through NativeApp. The displayed value changes only when
+    /// the store accepts the intent, so a persistence failure naturally leaves it unchanged.
+    pub fn request_enabled(&mut self, enabled: bool) {
+        self.enqueue_intent(MacroIntent::SetEnabled { enabled });
+    }
+
     pub fn clear_selected_saved(&mut self) {
         self.selected_saved = None;
         self.saved_revision = None;
@@ -1218,24 +1224,8 @@ impl MacroPage {
             .as_ref()
             .map(editor_validation_problems)
             .unwrap_or_default();
-        let library_rows = if state.library_rows.is_empty() {
-            state
-                .draft
-                .as_ref()
-                .map(|definition| {
-                    vec![project_definition(
-                        definition,
-                        state.saved_revision,
-                        state.enabled,
-                        &problems,
-                        &monitor,
-                        last_completion.as_ref(),
-                    )]
-                })
-                .unwrap_or_default()
-        } else {
-            state.library_rows.clone()
-        };
+        let library_rows =
+            project_library_rows(state, &monitor, &problems, last_completion.as_ref());
         let canvas = state
             .draft
             .as_ref()
@@ -1373,6 +1363,32 @@ fn last_completion_from_runtime_state(
         ),
         _ => project_last_completion(&state.runtime_events, macro_id),
     }
+}
+
+fn project_library_rows(
+    state: &MacroPageState,
+    monitor: &MonitorProjection,
+    problems: &[ValidationProblem],
+    last_completion: Option<&monitor::StopOutcome>,
+) -> Vec<MacroLibraryRow> {
+    let mut rows = state.library_rows.clone();
+    let Some(definition) = state.draft.as_ref() else {
+        return rows;
+    };
+    let projected = project_definition(
+        definition,
+        state.saved_revision,
+        state.enabled,
+        problems,
+        monitor,
+        last_completion,
+    );
+    if let Some(existing) = rows.iter_mut().find(|row| row.id == projected.id) {
+        *existing = projected;
+    } else {
+        rows.push(projected);
+    }
+    rows
 }
 
 fn select_canvas(state: &mut MacroPageState, selection: CanvasSelection) {
@@ -1962,8 +1978,7 @@ fn library_pane(ui: &mut Ui, state: &mut MacroPageState, rows: &[MacroLibraryRow
                     .on_hover_text("Disabled macros remain saved but cannot be started.")
                     .changed()
                 {
-                    state.set_enabled(enabled);
-                    state.enqueue_intent(MacroIntent::SetEnabled { enabled });
+                    state.request_enabled(enabled);
                 }
             }
             ui.text_edit_singleline(&mut state.library_rename)
@@ -3930,6 +3945,56 @@ mod tests {
         assert_eq!(
             controls.disabled_reason.as_deref(),
             Some("Enable this saved macro before running it.")
+        );
+    }
+
+    #[test]
+    fn selected_library_row_uses_the_live_validation_projection() {
+        let mut state = MacroPageState {
+            draft: Some(fixture()),
+            library_rows: vec![MacroLibraryRow {
+                id: "macro".into(),
+                name: "Macro".into(),
+                revision: 1,
+                status: library::MacroLibraryStatus::Ready,
+                target: "Diablo".into(),
+                dpi: 96,
+                last_validation: "Valid".into(),
+                last_run: "No completed run".into(),
+            }],
+            ..MacroPageState::default()
+        };
+        state.set_selected_saved(SavedMacroIdentity {
+            macro_id: "macro".into(),
+            revision: 1,
+            definition_hash: "hash".into(),
+        });
+        let problems = vec![ValidationProblem {
+            code: "test.invalid".into(),
+            message: "Needs validation".into(),
+            block_id: None,
+        }];
+
+        let rows = project_library_rows(&state, &MonitorProjection::default(), &problems, None);
+
+        assert_eq!(
+            rows[0].status,
+            library::MacroLibraryStatus::NeedsRevalidation
+        );
+        assert_eq!(rows[0].last_validation, "1 issues");
+    }
+
+    #[test]
+    fn enablement_request_leaves_displayed_state_unchanged_until_native_persistence_succeeds() {
+        let mut state = MacroPageState::default();
+        state.set_enabled(true);
+
+        state.request_enabled(false);
+
+        assert!(state.enabled);
+        assert_eq!(
+            state.take_intent(),
+            Some(MacroIntent::SetEnabled { enabled: false })
         );
     }
 

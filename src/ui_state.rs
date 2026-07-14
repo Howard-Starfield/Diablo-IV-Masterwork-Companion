@@ -144,6 +144,15 @@ impl UiStateStore {
         self.dirty = true;
     }
 
+    /// Returns the selected macro's non-executable presentation state, creating only a bounded
+    /// default entry when the caller is already editing that macro.
+    pub fn macro_layout_mut(&mut self, macro_id: &str) -> &mut MacroCanvasLayout {
+        self.state
+            .macro_layouts
+            .entry(macro_id.to_owned())
+            .or_default()
+    }
+
     pub fn save_if_dirty(&mut self) -> anyhow::Result<()> {
         if !self.dirty {
             return Ok(());

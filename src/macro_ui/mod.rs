@@ -1,5 +1,7 @@
+mod canvas_layout;
 mod canvas_model;
 mod editor;
+mod history;
 mod inspector;
 mod library;
 mod monitor;
@@ -22,7 +24,15 @@ use crate::engine::macro_engine::{
 };
 use crate::ui_theme::text;
 
+use crate::ui_state::{MacroCanvasLayout, UiStateStore};
 use canvas_model::{CanvasProjection, CanvasSelection, project_canvas};
+use history::HistoryError;
+
+pub use canvas_layout::{
+    CanvasLayoutEngine, CanvasLayoutError, CanvasViewport, LayoutEdit, auto_arrange, fit_view,
+    graph_bounds, node_rect, reconcile_layout, visible_nodes,
+};
+pub use history::{EditDomain, LayoutHistory, UiEditHistory};
 use monitor::{
     MonitorProjection, project_last_completion,
     project_last_completion_with_controller_projections, project_monitor,
@@ -260,6 +270,11 @@ pub struct MacroPageState {
     pub controller_semantic: Option<ControllerSemanticProjection>,
     pub library_rows: Vec<MacroLibraryRow>,
     pub image_package_reverification: Option<ImagePackageReverificationProgress>,
+    /// Rebuildable presentation state only; it is never part of the executable draft.
+    pub canvas_layout: MacroCanvasLayout,
+    pub ui_edit_history: UiEditHistory,
+    canvas_layout_dirty: bool,
+    canvas_layout_hydrated: bool,
     intents: MacroIntentQueue,
     pub selected_block_id: Option<String>,
     selected_canvas: Option<CanvasSelection>,
@@ -294,6 +309,10 @@ impl Default for MacroPageState {
             controller_semantic: None,
             library_rows: Vec::new(),
             image_package_reverification: None,
+            canvas_layout: MacroCanvasLayout::default(),
+            ui_edit_history: UiEditHistory::default(),
+            canvas_layout_dirty: false,
+            canvas_layout_hydrated: false,
             intents: MacroIntentQueue::with_capacity(MacroIntentQueue::DEFAULT_CAPACITY),
             selected_block_id: None,
             selected_canvas: None,
@@ -366,11 +385,121 @@ impl MacroPageState {
         saved: SavedMacroIdentity,
     ) {
         self.begin_draft_session();
+        self.canvas_layout =
+            reconcile_layout(&project_canvas(&definition), MacroCanvasLayout::default());
+        self.ui_edit_history = UiEditHistory::default();
+        self.canvas_layout_dirty = false;
+        self.canvas_layout_hydrated = false;
         self.draft = Some(EditorDraft::new(definition));
         self.set_selected_saved(saved);
         self.selected_block_id = None;
         self.selected_canvas = None;
         self.editor_feedback = None;
+    }
+
+    /// Reconcile separately loaded presentation state with the currently selected canonical tree.
+    pub fn load_canvas_layout(&mut self, saved: MacroCanvasLayout) {
+        if let Some(draft) = &self.draft {
+            self.canvas_layout = reconcile_layout(&project_canvas(draft), saved);
+            self.ui_edit_history = UiEditHistory::default();
+            self.canvas_layout_dirty = false;
+            self.canvas_layout_hydrated = true;
+        }
+    }
+
+    pub fn hydrate_canvas_layout(&mut self, store: &UiStateStore) {
+        if self.canvas_layout_hydrated {
+            return;
+        }
+        let saved = self
+            .selected_saved_macro_id()
+            .and_then(|id| store.state.macro_layouts.get(id))
+            .cloned()
+            .unwrap_or_default();
+        self.load_canvas_layout(saved);
+    }
+
+    pub fn persist_canvas_layout(&mut self, store: &mut UiStateStore) {
+        let Some(macro_id) = self.selected_saved_macro_id().map(str::to_owned) else {
+            return;
+        };
+        if !self.canvas_layout_dirty {
+            return;
+        }
+        *store.macro_layout_mut(&macro_id) = self.canvas_layout.clone();
+        store.mark_dirty();
+        self.canvas_layout_dirty = false;
+    }
+
+    pub fn move_canvas_node(
+        &mut self,
+        block_id: &str,
+        position: [f32; 2],
+    ) -> Result<(), CanvasLayoutError> {
+        if !self
+            .draft
+            .as_ref()
+            .is_some_and(|draft| project_canvas(draft).node(block_id).is_some())
+        {
+            return Err(CanvasLayoutError::MissingNode(block_id.into()));
+        }
+        let edit = CanvasLayoutEngine::move_node(&mut self.canvas_layout, block_id, position)?;
+        if let LayoutEdit::NodePosition { before, after, .. } = &edit {
+            if before == after {
+                return Ok(());
+            }
+        }
+        self.ui_edit_history.record_layout(edit);
+        self.canvas_layout_dirty = true;
+        Ok(())
+    }
+
+    pub fn auto_arrange_canvas(&mut self) {
+        let Some(draft) = &self.draft else { return };
+        let mut next = auto_arrange(&project_canvas(draft));
+        let before = self.canvas_layout.clone();
+        next.pan = before.pan;
+        next.zoom = before.zoom;
+        next.library_width = before.library_width;
+        next.inspector_width = before.inspector_width;
+        if before == next {
+            return;
+        }
+        self.canvas_layout = next.clone();
+        self.ui_edit_history.record_layout(LayoutEdit::Layout {
+            before,
+            after: next,
+        });
+        self.canvas_layout_dirty = true;
+    }
+
+    pub fn reset_canvas_zoom(&mut self) {
+        self.canvas_layout.zoom = 1.0;
+        self.canvas_layout_dirty = true;
+    }
+
+    pub fn fit_canvas_view(&mut self, canvas_size: [f32; 2]) {
+        let Some(draft) = &self.draft else { return };
+        let viewport = fit_view(
+            canvas_size,
+            graph_bounds(&project_canvas(draft), &self.canvas_layout),
+        );
+        viewport.write_to_layout(&mut self.canvas_layout);
+        self.canvas_layout_dirty = true;
+    }
+
+    fn undo_ui_edit(&mut self) -> Result<EditDomain, HistoryError> {
+        let draft = self.draft.as_mut().ok_or(HistoryError::NothingToUndo)?;
+        let result = self.ui_edit_history.undo(draft, &mut self.canvas_layout)?;
+        self.canvas_layout_dirty |= result == EditDomain::Layout;
+        Ok(result)
+    }
+
+    fn redo_ui_edit(&mut self) -> Result<EditDomain, HistoryError> {
+        let draft = self.draft.as_mut().ok_or(HistoryError::NothingToRedo)?;
+        let result = self.ui_edit_history.redo(draft, &mut self.canvas_layout)?;
+        self.canvas_layout_dirty |= result == EditDomain::Layout;
+        Ok(result)
     }
 
     pub fn validate_draft(&mut self) {
@@ -1615,6 +1744,40 @@ fn dispatch_editor_command(
             Some("Edit rejected: RunInProgress (finish pending authoring first).".into());
         return Err(EditorError::RunInProgress);
     }
+    if command == EditorCommand::Undo {
+        let result =
+            state
+                .undo_ui_edit()
+                .map(|_| EditOutcome::Changed)
+                .map_err(|error| match error {
+                    HistoryError::Definition(error) => error,
+                    HistoryError::NothingToUndo => EditorError::NothingToUndo,
+                    HistoryError::NothingToRedo => EditorError::NothingToUndo,
+                    HistoryError::Layout => EditorError::NothingToUndo,
+                });
+        state.editor_feedback = Some(match &result {
+            Ok(_) => "Undid latest editor change.".into(),
+            Err(error) => format!("Edit rejected: {error:?}"),
+        });
+        return result;
+    }
+    if command == EditorCommand::Redo {
+        let result =
+            state
+                .redo_ui_edit()
+                .map(|_| EditOutcome::Changed)
+                .map_err(|error| match error {
+                    HistoryError::Definition(error) => error,
+                    HistoryError::NothingToUndo => EditorError::NothingToRedo,
+                    HistoryError::NothingToRedo => EditorError::NothingToRedo,
+                    HistoryError::Layout => EditorError::NothingToRedo,
+                });
+        state.editor_feedback = Some(match &result {
+            Ok(_) => "Redid latest editor change.".into(),
+            Err(error) => format!("Edit rejected: {error:?}"),
+        });
+        return result;
+    }
     let clears_image_samples = matches!(&command, EditorCommand::ReplaceImageRule { .. });
     let result = state
         .draft
@@ -1623,6 +1786,9 @@ fn dispatch_editor_command(
         .and_then(|draft| apply_editor_command(draft, command));
     if clears_image_samples && matches!(result, Ok(EditOutcome::Changed)) {
         state.editor_image_negative_samples.clear();
+    }
+    if matches!(result, Ok(EditOutcome::Changed)) {
+        state.ui_edit_history.record_definition();
     }
     state.editor_feedback = Some(match &result {
         Ok(EditOutcome::Changed) => "Draft updated; validation required.".into(),
@@ -1781,6 +1947,21 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
     ui.horizontal_wrapped(|ui| {
         if ui.add_enabled(editable, Button::new("Undo")).clicked() {
             let _ = dispatch_editor_command(state, EditorCommand::Undo);
+        }
+        if ui.add_enabled(editable, Button::new("Redo")).clicked() {
+            let _ = dispatch_editor_command(state, EditorCommand::Redo);
+        }
+        if ui
+            .add_enabled(editable, Button::new("Auto arrange"))
+            .clicked()
+        {
+            state.auto_arrange_canvas();
+        }
+        if ui.button("Fit view").clicked() {
+            state.fit_canvas_view([ui.available_width().max(1.0), 600.0]);
+        }
+        if ui.button("Reset zoom").clicked() {
+            state.reset_canvas_zoom();
         }
         if ui.add_enabled(editable, Button::new("+ Note")).clicked() {
             if let Some(draft) = &state.draft {

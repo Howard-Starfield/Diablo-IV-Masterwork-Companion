@@ -2015,7 +2015,12 @@ impl App for NativeApp {
                         ui.set_width((ui.available_width() - 14.0).max(0.0));
                         match self.page {
                             AppPage::Enchant => self.content(ui, ctx),
-                            AppPage::Macro => MacroPage::show(ui, &mut self.macro_state),
+                            AppPage::Macro => {
+                                self.macro_state.hydrate_canvas_layout(&self.ui_state_store);
+                                MacroPage::show(ui, &mut self.macro_state);
+                                self.macro_state
+                                    .persist_canvas_layout(&mut self.ui_state_store);
+                            }
                         }
                     });
             });

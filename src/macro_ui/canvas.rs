@@ -3,7 +3,7 @@ use eframe::egui::{self, Color32, Id, PointerButton, Pos2, Rect, Sense, Stroke, 
 use crate::macro_ui::canvas_layout::{CanvasViewport, LayoutEdit, node_rect, visible_nodes};
 use crate::macro_ui::canvas_model::{
     CanvasConnectionError, CanvasEdgeKind, CanvasProjection, CanvasSelection, OutputPort,
-    connection_command,
+    connection_command, insertion_target_for_port,
 };
 use crate::macro_ui::{BlockFamily, EditorCommand, EditorDraft};
 use crate::ui_state::MacroCanvasLayout;
@@ -91,17 +91,61 @@ pub struct CanvasResponse {
 }
 
 #[derive(Debug, Clone)]
-struct NodeDrag {
-    id: String,
-    before: [f32; 2],
+enum CanvasGesture {
+    Pan { before: Vec2 },
+    NodeDrag { id: String, before: [f32; 2] },
+    Connector { source: OutputPort },
 }
 
-fn node_drag_id() -> Id {
-    Id::new("macro-canvas-node-drag")
+fn gesture_id() -> Id {
+    Id::new("macro-canvas-gesture")
 }
 
-fn connector_drag_id() -> Id {
-    Id::new("macro-canvas-connector-drag")
+fn gesture_for_start(
+    hit: &CanvasHit,
+    space_down: bool,
+    command_down: bool,
+    start_position: [f32; 2],
+) -> Option<CanvasGesture> {
+    if command_down {
+        return None;
+    }
+    if space_down || matches!(hit, CanvasHit::Background) {
+        return Some(CanvasGesture::Pan {
+            before: Vec2::new(start_position[0], start_position[1]),
+        });
+    }
+    match hit {
+        CanvasHit::Node(id) => Some(CanvasGesture::NodeDrag {
+            id: id.clone(),
+            before: start_position,
+        }),
+        CanvasHit::Output(port) if is_editable_output(port) => Some(CanvasGesture::Connector {
+            source: port.clone(),
+        }),
+        CanvasHit::Background | CanvasHit::Input(_) | CanvasHit::Output(_) => None,
+    }
+}
+
+fn action_for_gesture(gesture: &CanvasGesture, total_drag_delta: Vec2, zoom: f32) -> CanvasAction {
+    match gesture {
+        CanvasGesture::Pan { .. } => CanvasAction::Pan(total_drag_delta),
+        CanvasGesture::NodeDrag { id, .. } => CanvasAction::MoveNode {
+            id: id.clone(),
+            delta: total_drag_delta / zoom.max(f32::MIN_POSITIVE),
+        },
+        CanvasGesture::Connector { .. } => CanvasAction::CancelGesture,
+    }
+}
+
+fn cancel_gesture(layout: &mut MacroCanvasLayout, gesture: &CanvasGesture) {
+    if let CanvasGesture::NodeDrag { id, before } = gesture {
+        layout.node_positions.insert(id.clone(), *before);
+    }
+}
+
+fn is_editable_output(port: &OutputPort) -> bool {
+    !matches!(port, OutputPort::LoopReturn(_))
 }
 
 pub fn reduce_canvas_input(frame: CanvasInputFrame) -> CanvasAction {
@@ -145,9 +189,15 @@ pub fn finish_connection(
     source: OutputPort,
     target: CanvasHit,
 ) -> CanvasResponse {
+    if !is_editable_output(&source) {
+        return rejected_response(CanvasConnectionError::InvalidPort);
+    }
     let target_id = match target {
         CanvasHit::Node(id) | CanvasHit::Input(id) => id,
-        CanvasHit::Background | CanvasHit::Output(_) => {
+        CanvasHit::Background => {
+            if let Err(error) = insertion_target_for_port(&draft.definition, &source) {
+                return rejected_response(error);
+            }
             return CanvasResponse {
                 action: Some(CanvasAction::OpenAddStep {
                     source,
@@ -157,6 +207,7 @@ pub fn finish_connection(
                 ..Default::default()
             };
         }
+        CanvasHit::Output(_) => return rejected_response(CanvasConnectionError::InvalidPort),
     };
     match connection_command(draft, source.clone(), &target_id) {
         Ok(editor_command) => CanvasResponse {
@@ -209,33 +260,39 @@ pub fn show(
         )
     });
 
-    if response.hovered() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-        ui.ctx().data_mut(|data| {
-            data.remove::<OutputPort>(connector_drag_id());
-            data.remove::<NodeDrag>(node_drag_id());
-        });
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        let gesture = ui
+            .ctx()
+            .data(|data| data.get_temp::<CanvasGesture>(gesture_id()));
+        if let Some(gesture) = gesture.as_ref() {
+            cancel_gesture(layout, gesture);
+            result.layout_changed = matches!(gesture, CanvasGesture::NodeDrag { .. });
+        }
+        ui.ctx()
+            .data_mut(|data| data.remove::<CanvasGesture>(gesture_id()));
         result.action = Some(CanvasAction::CancelGesture);
-    }
-
-    if response.drag_started_by(PointerButton::Primary) && !space_down && !command_down {
-        match &hit {
-            CanvasHit::Node(id) => {
-                let before = layout.node_positions.get(id).copied().unwrap_or([0.0, 0.0]);
-                ui.ctx().data_mut(|data| {
-                    data.insert_temp(
-                        node_drag_id(),
-                        NodeDrag {
-                            id: id.clone(),
-                            before,
-                        },
-                    )
-                });
+    } else {
+        if response.drag_started_by(PointerButton::Middle) {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    gesture_id(),
+                    CanvasGesture::Pan {
+                        before: viewport.pan,
+                    },
+                )
+            });
+        } else if response.drag_started_by(PointerButton::Primary) {
+            let start_position = match &hit {
+                CanvasHit::Node(id) => layout.node_positions.get(id).copied().unwrap_or([0.0, 0.0]),
+                _ => [viewport.pan.x, viewport.pan.y],
+            };
+            if let Some(gesture) = gesture_for_start(&hit, space_down, command_down, start_position)
+            {
+                if editable || !matches!(gesture, CanvasGesture::Connector { .. }) {
+                    ui.ctx()
+                        .data_mut(|data| data.insert_temp(gesture_id(), gesture));
+                }
             }
-            CanvasHit::Output(port) if editable => {
-                ui.ctx()
-                    .data_mut(|data| data.insert_temp(connector_drag_id(), port.clone()));
-            }
-            _ => {}
         }
     }
 
@@ -243,16 +300,8 @@ pub fn show(
         hovered: response.hovered(),
         hit: hit.clone(),
         pointer,
-        primary_drag_delta: if response.dragged_by(PointerButton::Primary) {
-            response.drag_delta()
-        } else {
-            Vec2::ZERO
-        },
-        middle_drag_delta: if response.dragged_by(PointerButton::Middle) {
-            response.drag_delta()
-        } else {
-            Vec2::ZERO
-        },
+        primary_drag_delta: Vec2::ZERO,
+        middle_drag_delta: Vec2::ZERO,
         wheel_y,
         pinch_zoom,
         space_down,
@@ -260,11 +309,6 @@ pub fn show(
     });
 
     match reducer_action {
-        CanvasAction::Pan(delta) if delta != Vec2::ZERO => {
-            viewport.pan += delta;
-            viewport.write_to_layout(layout);
-            result.layout_changed = true;
-        }
         CanvasAction::Zoom { pointer, factor } => {
             viewport.zoom_around(canvas_rect, pointer, factor);
             viewport.write_to_layout(layout);
@@ -273,65 +317,78 @@ pub fn show(
         _ => {}
     }
 
-    let active_drag = ui
+    let active_gesture = ui
         .ctx()
-        .data(|data| data.get_temp::<NodeDrag>(node_drag_id()));
-    if let Some(drag) = active_drag {
-        if (response.dragged_by(PointerButton::Primary)
-            || response.drag_stopped_by(PointerButton::Primary))
-            && !space_down
+        .data(|data| data.get_temp::<CanvasGesture>(gesture_id()));
+    if let Some(gesture) = active_gesture.as_ref() {
+        let primary = response.dragged_by(PointerButton::Primary)
+            || response.drag_stopped_by(PointerButton::Primary);
+        let middle = response.dragged_by(PointerButton::Middle)
+            || response.drag_stopped_by(PointerButton::Middle);
+        let dragging = match gesture {
+            CanvasGesture::Pan { .. } => primary || middle,
+            CanvasGesture::NodeDrag { .. } | CanvasGesture::Connector { .. } => primary,
+        };
+        if dragging {
+            match gesture {
+                CanvasGesture::Pan { before } => {
+                    viewport.pan = *before + response.drag_delta();
+                    viewport.write_to_layout(layout);
+                    result.layout_changed = true;
+                }
+                CanvasGesture::NodeDrag { id, before } => {
+                    let CanvasAction::MoveNode { delta, .. } =
+                        action_for_gesture(gesture, response.drag_delta(), viewport.zoom)
+                    else {
+                        unreachable!("node drag must map to a node move");
+                    };
+                    let position = [before[0] + delta.x, before[1] + delta.y];
+                    if position.iter().all(|value| value.is_finite()) {
+                        layout.node_positions.insert(id.clone(), position);
+                        result.layout_changed = true;
+                    }
+                }
+                CanvasGesture::Connector { .. } => {}
+            }
+        }
+        if response.drag_stopped_by(PointerButton::Primary)
+            || response.drag_stopped_by(PointerButton::Middle)
         {
-            let delta = response.drag_delta() / viewport.zoom.max(f32::MIN_POSITIVE);
-            let position = [drag.before[0] + delta.x, drag.before[1] + delta.y];
-            if position.iter().all(|value| value.is_finite()) {
-                layout.node_positions.insert(drag.id.clone(), position);
-                result.layout_changed = true;
-            }
-        }
-        if response.drag_stopped_by(PointerButton::Primary) {
-            let after = layout.node_positions.get(&drag.id).copied();
-            if after != Some(drag.before) {
-                result.action = Some(CanvasAction::MoveNode {
-                    id: drag.id.clone(),
-                    delta: Vec2::new(
-                        after.unwrap_or(drag.before)[0] - drag.before[0],
-                        after.unwrap_or(drag.before)[1] - drag.before[1],
-                    ),
-                });
-                result.layout_edit = Some(LayoutEdit::NodePosition {
-                    id: drag.id,
-                    before: Some(drag.before),
-                    after,
-                });
+            match gesture {
+                CanvasGesture::NodeDrag { id, before } => {
+                    let after = layout.node_positions.get(id).copied();
+                    if after != Some(*before) {
+                        result.action = Some(action_for_gesture(
+                            gesture,
+                            response.drag_delta(),
+                            viewport.zoom,
+                        ));
+                        result.layout_edit = Some(LayoutEdit::NodePosition {
+                            id: id.clone(),
+                            before: Some(*before),
+                            after,
+                        });
+                    }
+                }
+                CanvasGesture::Connector { source } => {
+                    let mut connection = draft.map_or_else(
+                        || rejected_response(CanvasConnectionError::MissingSource("draft".into())),
+                        |draft| finish_connection(draft, source.clone(), hit.clone()),
+                    );
+                    if let Some(CanvasAction::OpenAddStep { world_position, .. }) =
+                        connection.action.as_mut()
+                    {
+                        *world_position = pointer
+                            .map(|point| viewport.world_from_screen(canvas_rect, point))
+                            .map(|point| [point.x, point.y])
+                            .unwrap_or([0.0, 0.0]);
+                    }
+                    result = connection;
+                }
+                CanvasGesture::Pan { .. } => {}
             }
             ui.ctx()
-                .data_mut(|data| data.remove::<NodeDrag>(node_drag_id()));
-        }
-    }
-
-    let connector = ui
-        .ctx()
-        .data(|data| data.get_temp::<OutputPort>(connector_drag_id()));
-    if let Some(ref source) = connector {
-        if response.drag_stopped_by(PointerButton::Primary) {
-            ui.ctx()
-                .data_mut(|data| data.remove::<OutputPort>(connector_drag_id()));
-            let mut connection = draft.map_or_else(
-                || rejected_response(CanvasConnectionError::MissingSource("draft".into())),
-                |draft| finish_connection(draft, source.clone(), hit.clone()),
-            );
-            if matches!(hit, CanvasHit::Background) {
-                connection.action = Some(CanvasAction::OpenAddStep {
-                    source: source.clone(),
-                    world_position: pointer
-                        .map(|point| viewport.world_from_screen(canvas_rect, point))
-                        .map(|point| [point.x, point.y])
-                        .unwrap_or([0.0, 0.0]),
-                    allowed: allowed_families(),
-                });
-                connection.editor_command = None;
-            }
-            result = connection;
+                .data_mut(|data| data.remove::<CanvasGesture>(gesture_id()));
         }
     }
 
@@ -342,6 +399,10 @@ pub fn show(
         }
     }
 
+    let connector = active_gesture.as_ref().and_then(|gesture| match gesture {
+        CanvasGesture::Connector { source } => Some(source),
+        CanvasGesture::Pan { .. } | CanvasGesture::NodeDrag { .. } => None,
+    });
     paint_canvas(
         &painter,
         graph,
@@ -350,7 +411,7 @@ pub fn show(
         canvas_rect,
         selected,
         active_block,
-        connector.as_ref(),
+        connector,
         pointer,
     );
     if active_block.is_some() {
@@ -403,7 +464,9 @@ fn hit_test(
             return CanvasHit::Input(node.id.clone());
         }
         for (index, port) in node.outputs.iter().enumerate() {
-            if point.distance(output_handle(rect, index)) <= HANDLE_RADIUS * 1.8 {
+            if is_editable_output(port)
+                && point.distance(output_handle(rect, index)) <= HANDLE_RADIUS * 1.8
+            {
                 return CanvasHit::Output(port.clone());
             }
         }
@@ -614,8 +677,10 @@ fn paint_node(
         colors::SUPPORTING_TEXT,
     );
     painter.circle_filled(input_handle(rect), HANDLE_RADIUS, colors::BORDER);
-    for index in 0..node.outputs.len() {
-        painter.circle_filled(output_handle(rect, index), HANDLE_RADIUS, category.accent);
+    for (index, port) in node.outputs.iter().enumerate() {
+        if is_editable_output(port) {
+            painter.circle_filled(output_handle(rect, index), HANDLE_RADIUS, category.accent);
+        }
     }
 }
 
@@ -706,5 +771,40 @@ mod tests {
             Some(CanvasAction::RejectedConnection(_))
         ));
         assert!(response.editor_command.is_none());
+    }
+
+    #[test]
+    fn node_drag_keeps_its_start_kind_after_the_pointer_leaves_the_node() {
+        let gesture = gesture_for_start(
+            &CanvasHit::Node("observe".into()),
+            false,
+            false,
+            [40.0, 20.0],
+        );
+        assert!(matches!(gesture, Some(CanvasGesture::NodeDrag { .. })));
+        assert_eq!(
+            action_for_gesture(gesture.as_ref().unwrap(), egui::vec2(30.0, -10.0), 1.0),
+            CanvasAction::MoveNode {
+                id: "observe".into(),
+                delta: egui::vec2(30.0, -10.0),
+            }
+        );
+    }
+
+    #[test]
+    fn escape_restores_the_node_position_from_drag_start() {
+        let mut layout = MacroCanvasLayout::default();
+        layout.node_positions.insert("observe".into(), [80.0, 40.0]);
+        let gesture = CanvasGesture::NodeDrag {
+            id: "observe".into(),
+            before: [40.0, 20.0],
+        };
+        cancel_gesture(&mut layout, &gesture);
+        assert_eq!(layout.node_positions["observe"], [40.0, 20.0]);
+    }
+
+    #[test]
+    fn generated_loop_return_is_not_an_editable_connector_handle() {
+        assert!(!is_editable_output(&OutputPort::LoopReturn("loop".into())));
     }
 }

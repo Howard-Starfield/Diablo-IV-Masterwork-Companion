@@ -2059,13 +2059,21 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                         text: "New step".into(),
                     },
                 };
-                let target = pending_canvas_port
-                    .as_ref()
-                    .and_then(|port| insertion_target_for_port(&draft.definition, port).ok())
-                    .unwrap_or(InsertionTarget {
+                let target = if let Some(port) = pending_canvas_port.as_ref() {
+                    match insertion_target_for_port(&draft.definition, port) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            state.editor_feedback =
+                                Some(format!("Connection rejected: {}", error.message()));
+                            return;
+                        }
+                    }
+                } else {
+                    InsertionTarget {
                         container: ContainerPath::Root,
                         index: draft.blocks.len(),
-                    });
+                    }
+                };
                 if dispatch_editor_command(state, EditorCommand::InsertBlock { target, block })
                     .is_ok()
                 {

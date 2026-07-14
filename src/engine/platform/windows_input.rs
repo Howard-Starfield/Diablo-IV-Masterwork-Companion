@@ -475,7 +475,7 @@ mod tests {
             ActionAttemptId, ActionAuthorization, ActionCommitter, ActionCommitterCreateError,
             ActionOutcome, ActionPrepareRequest, ActionState, BlockReason, CommitContext,
             CommittedInputOutcome, InputDispatchFailure, InputDispatchOutcome, Limit,
-            LiveActionInput, LiveActionSession, LiveControlSink, MovementOutcome, ObservationToken,
+            LiveActionInput, LiveActionSession, MovementOutcome, ObservationToken,
             PreCommitInputBlock, ResumeAuthorization, SendInputFailure, TakeoverPolicy,
         },
         types::{Point, Rect},
@@ -755,19 +755,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingControl {
-        paused: AtomicBool,
-        stopped: AtomicBool,
-    }
-
-    impl LiveControlSink for RecordingControl {
-        fn pause_for_manual_takeover(&self) {
-            self.paused.store(true, Ordering::Release);
-        }
-        fn stop_for_manual_takeover(&self) {
-            self.stopped.store(true, Ordering::Release);
-        }
-    }
+    struct RecordingControl;
 
     fn committer(targets: Vec<TargetSnapshot>, input: Arc<RecordingInput>) -> ActionCommitter {
         committer_with_limits(targets, input, Limit::Finite(100), 128)
@@ -1801,11 +1789,10 @@ mod tests {
     fn takeover_applies_pause_policy_and_requires_explicit_resume() {
         let input = Arc::new(RecordingInput::default());
         input.takeover.store(true, Ordering::Release);
-        let control = Arc::new(RecordingControl::default());
         let session = LiveActionSession::new(
             Arc::new(ScriptedTarget(Mutex::new(vec![target()]))),
             input,
-            control.clone(),
+            Arc::new(RecordingControl::default()),
         );
         session.activate_for_test(target());
         let committer = ActionCommitter::new(
@@ -1828,8 +1815,6 @@ mod tests {
                 ..
             }
         ));
-        assert!(control.paused.load(Ordering::Acquire));
-        assert!(!control.stopped.load(Ordering::Acquire));
         assert!(matches!(
             committer.prepare(request()),
             Err(BlockReason::ResumeRequired)

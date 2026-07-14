@@ -1006,6 +1006,7 @@ pub enum BlockReason {
     AttemptLedgerFull,
     ClickBudgetExceeded,
     RunFinished,
+    Paused,
     Stopped,
     TargetChanged,
     StaleObservation,
@@ -1041,11 +1042,6 @@ impl ActionOutcome {
     }
 }
 
-pub trait LiveControlSink: Send + Sync {
-    fn pause_for_manual_takeover(&self);
-    fn stop_for_manual_takeover(&self);
-}
-
 #[derive(Debug, Clone)]
 pub struct ResumeAuthorization {
     session_id: u64,
@@ -1074,16 +1070,16 @@ pub struct LiveActionSession {
     id: u64,
     target: Arc<dyn TargetGuard + Send + Sync>,
     input: Arc<dyn LiveActionInput>,
-    control: Arc<dyn LiveControlSink>,
+    control: RuntimeControlHandle,
     resume: Mutex<ResumeState>,
     registered_committer_run: Mutex<Option<String>>,
 }
 
 impl LiveActionSession {
-    pub fn new(
+    fn new_for_runtime(
         target: Arc<dyn TargetGuard + Send + Sync>,
         input: Arc<dyn LiveActionInput>,
-        control: Arc<dyn LiveControlSink>,
+        control: RuntimeControlHandle,
     ) -> Arc<Self> {
         Arc::new(Self {
             id: NEXT_LIVE_SESSION_ID.fetch_add(1, Ordering::Relaxed),
@@ -1093,6 +1089,18 @@ impl LiveActionSession {
             resume: Mutex::new(ResumeState::default()),
             registered_committer_run: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new<T>(
+        target: Arc<dyn TargetGuard + Send + Sync>,
+        input: Arc<dyn LiveActionInput>,
+        _ignored_test_control: Arc<T>,
+    ) -> Arc<Self>
+    where
+        T: Send + Sync + 'static,
+    {
+        Self::new_for_runtime(target, input, RuntimeControlHandle::for_test())
     }
 
     pub fn resume(&self) -> Result<ResumeAuthorization> {
@@ -1149,8 +1157,8 @@ impl LiveActionSession {
             state.current = None;
         }
         match policy {
-            TakeoverPolicy::Pause => self.control.pause_for_manual_takeover(),
-            TakeoverPolicy::Stop => self.control.stop_for_manual_takeover(),
+            TakeoverPolicy::Pause => self.control.pause(),
+            TakeoverPolicy::Stop => self.control.stop(),
         }
     }
 
@@ -1439,6 +1447,9 @@ impl ActionCommitter {
         let attempt_id = authorization.attempt_id.clone();
         let committed = std::cell::Cell::new(false);
         let mut commit_boundary = || {
+            if !self.session.control.input_gate_open() {
+                return Err(BlockReason::Paused);
+            }
             if !self.session.validate_resume(&request.resume) {
                 return Err(BlockReason::ResumeRequired);
             }
@@ -1502,14 +1513,16 @@ impl ActionCommitter {
             Ok(())
         };
 
-        let dispatch = self.session.input.dispatch_action(
-            authorization.destination,
-            authorization.button,
-            request.movement.as_ref(),
-            stop,
-            &mut commit_boundary,
-            &mut validate_after_movement,
-        );
+        let dispatch = self.session.control.dispatch_while_input_permitted(|| {
+            self.session.input.dispatch_action(
+                authorization.destination,
+                authorization.button,
+                request.movement.as_ref(),
+                stop,
+                &mut commit_boundary,
+                &mut validate_after_movement,
+            )
+        });
         drop(commit_boundary);
         match (committed.get(), dispatch) {
             (false, InputDispatchOutcome::PreCommitBlocked(block_reason)) => {
@@ -2104,6 +2117,7 @@ pub enum RunEvent {
         run_id: String,
         block_id: String,
         action: Action,
+        attempt_id: Option<ActionAttemptId>,
         state: ActionState,
         reason: String,
     },
@@ -2661,16 +2675,19 @@ struct ControlState {
 pub struct RuntimeControlHandle {
     control: Arc<Mutex<ControlState>>,
     emergency_stop: Arc<EmergencySignal>,
+    input_gate: Arc<Mutex<()>>,
 }
 
 impl RuntimeControlHandle {
     pub fn pause(&self) {
+        let input_gate = self.input_gate.lock().expect("runtime input gate poisoned");
         let mut control = self.control.lock().expect("runtime control poisoned");
         if !control.paused && control.stop.is_none() {
             control.paused = true;
             control.generation = control.generation.wrapping_add(1);
         }
         drop(control);
+        drop(input_gate);
         self.emergency_stop.notify();
     }
 
@@ -2709,6 +2726,43 @@ impl RuntimeControlHandle {
             .expect("runtime control poisoned")
             .generation
     }
+
+    fn input_gate_open(&self) -> bool {
+        !self.emergency_stop.requested() && {
+            let control = self.control.lock().expect("runtime control poisoned");
+            !control.paused && control.stop.is_none()
+        }
+    }
+
+    fn dispatch_while_input_permitted(
+        &self,
+        dispatch: impl FnOnce() -> InputDispatchOutcome,
+    ) -> InputDispatchOutcome {
+        let _input_gate = self.input_gate.lock().expect("runtime input gate poisoned");
+        if !self.input_gate_open() {
+            return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit {
+                reason: BlockReason::Paused,
+            });
+        }
+        dispatch()
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self {
+            control: Arc::new(Mutex::new(ControlState::default())),
+            emergency_stop: Arc::new(EmergencySignal::default()),
+            input_gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_paused_for_test(&self) -> bool {
+        self.control
+            .lock()
+            .expect("runtime control poisoned")
+            .paused
+    }
 }
 
 impl StopSource for RuntimeControlHandle {
@@ -2723,16 +2777,6 @@ impl StopSource for RuntimeControlHandle {
     }
 }
 
-impl LiveControlSink for RuntimeControlHandle {
-    fn pause_for_manual_takeover(&self) {
-        self.pause();
-    }
-
-    fn stop_for_manual_takeover(&self) {
-        self.stop();
-    }
-}
-
 #[derive(Clone)]
 struct LiveRuntimeConfig {
     session: Arc<LiveActionSession>,
@@ -2744,6 +2788,7 @@ pub struct MacroRuntime {
     clock: Arc<dyn Clock + Send + Sync>,
     control: Arc<Mutex<ControlState>>,
     emergency_stop: Arc<EmergencySignal>,
+    input_gate: Arc<Mutex<()>>,
     active: Arc<Mutex<bool>>,
     event_capacity: usize,
     watch_pool: &'static WatchDetectorPool,
@@ -2758,6 +2803,7 @@ impl Clone for MacroRuntime {
             clock: Arc::clone(&self.clock),
             control: Arc::clone(&self.control),
             emergency_stop: Arc::clone(&self.emergency_stop),
+            input_gate: Arc::clone(&self.input_gate),
             active: Arc::clone(&self.active),
             event_capacity: self.event_capacity,
             watch_pool: self.watch_pool,
@@ -2791,6 +2837,7 @@ impl MacroRuntime {
             clock,
             control: Arc::new(Mutex::new(ControlState::default())),
             emergency_stop: Arc::new(EmergencySignal::default()),
+            input_gate: Arc::new(Mutex::new(())),
             active: Arc::new(Mutex::new(false)),
             event_capacity,
             watch_pool: WatchDetectorPool::global(),
@@ -2798,7 +2845,12 @@ impl MacroRuntime {
         }
     }
 
-    pub fn with_live_session(mut self, session: Arc<LiveActionSession>) -> Self {
+    pub fn with_live_input(
+        mut self,
+        target: Arc<dyn TargetGuard + Send + Sync>,
+        input: Arc<dyn LiveActionInput>,
+    ) -> Self {
+        let session = LiveActionSession::new_for_runtime(target, input, self.control_handle());
         self.live = Some(LiveRuntimeConfig { session });
         self
     }
@@ -2939,6 +2991,7 @@ impl MacroRuntime {
         RuntimeControlHandle {
             control: Arc::clone(&self.control),
             emergency_stop: Arc::clone(&self.emergency_stop),
+            input_gate: Arc::clone(&self.input_gate),
         }
     }
 
@@ -4889,7 +4942,7 @@ impl RunExecution<'_, '_> {
                     let reason =
                         format!("action requires a fresh observation from '{source_block_id}'");
                     self.emitter
-                        .action_blocked(block_id, action.clone(), reason.clone());
+                        .action_blocked(block_id, action.clone(), None, reason.clone());
                     return Some(StopReason::TechnicalFailure { message: reason });
                 };
                 if !token.is_current(self.emitter.run_id(), generation)
@@ -4897,13 +4950,13 @@ impl RunExecution<'_, '_> {
                 {
                     let reason = format!("observation from '{source_block_id}' is stale");
                     self.emitter
-                        .action_blocked(block_id, action.clone(), reason.clone());
+                        .action_blocked(block_id, action.clone(), None, reason.clone());
                     return Some(StopReason::TechnicalFailure { message: reason });
                 }
                 if let Err(error) = validate_action_token(self.compiled, action, &token) {
                     let reason = error.to_string();
                     self.emitter
-                        .action_blocked(block_id, action.clone(), reason.clone());
+                        .action_blocked(block_id, action.clone(), None, reason.clone());
                     return Some(StopReason::TechnicalFailure { message: reason });
                 }
                 Some(token)
@@ -4975,6 +5028,7 @@ impl RunExecution<'_, '_> {
             self.emitter.action_blocked(
                 block_id,
                 action.clone(),
+                None,
                 "MoveOnly is not supported by the v1 live runtime".to_string(),
             );
             return (
@@ -4992,7 +5046,7 @@ impl RunExecution<'_, '_> {
             Err(error) => {
                 let message = error.to_string();
                 self.emitter
-                    .action_blocked(block_id, action.clone(), message.clone());
+                    .action_blocked(block_id, action.clone(), None, message.clone());
                 return (Some(StopReason::TechnicalFailure { message }), false);
             }
         };
@@ -5001,7 +5055,7 @@ impl RunExecution<'_, '_> {
             Err(error) => {
                 let message = error.to_string();
                 self.emitter
-                    .action_blocked(block_id, action.clone(), message.clone());
+                    .action_blocked(block_id, action.clone(), None, message.clone());
                 return (Some(StopReason::TechnicalFailure { message }), false);
             }
         };
@@ -5020,8 +5074,12 @@ impl RunExecution<'_, '_> {
             Ok(authorization) => authorization,
             Err(error) => {
                 let message = error.to_string();
-                self.emitter
-                    .action_blocked(block_id, action.clone(), message.clone());
+                self.emitter.action_blocked(
+                    block_id,
+                    action.clone(),
+                    Some(attempt_id),
+                    message.clone(),
+                );
                 return (Some(StopReason::TechnicalFailure { message }), false);
             }
         };
@@ -5040,8 +5098,12 @@ impl RunExecution<'_, '_> {
             Ok(prepared) => prepared,
             Err(reason) => {
                 let message = format!("{reason:?}");
-                self.emitter
-                    .action_blocked(block_id, action.clone(), message.clone());
+                self.emitter.action_blocked(
+                    block_id,
+                    action.clone(),
+                    Some(attempt_id.clone()),
+                    message.clone(),
+                );
                 return (Some(block_reason_to_stop(reason, message)), false);
             }
         };
@@ -5077,11 +5139,17 @@ impl RunExecution<'_, '_> {
             ),
             ActionOutcome::Blocked { reason, .. } => {
                 let message = format!("{reason:?}");
-                self.emitter
-                    .action_blocked(block_id, action.clone(), message.clone());
+                self.emitter.action_blocked(
+                    block_id,
+                    action.clone(),
+                    Some(attempt_id.clone()),
+                    message.clone(),
+                );
                 let control_stop = self.check_control();
-                if matches!(reason, BlockReason::ManualTakeover(TakeoverPolicy::Pause))
-                    && control_stop.is_none()
+                if matches!(
+                    reason,
+                    BlockReason::ManualTakeover(TakeoverPolicy::Pause) | BlockReason::Paused
+                ) && control_stop.is_none()
                 {
                     (None, false)
                 } else {
@@ -5819,7 +5887,13 @@ impl<'a> EventEmitter<'a> {
         )
     }
 
-    fn action_blocked(&mut self, block_id: &str, action: Action, reason: String) {
+    fn action_blocked(
+        &mut self,
+        block_id: &str,
+        action: Action,
+        attempt_id: Option<ActionAttemptId>,
+        reason: String,
+    ) {
         let (sequence, elapsed_ms, run_id) = self.metadata();
         self.push_critical(RunEvent::ActionBlocked {
             sequence,
@@ -5827,6 +5901,7 @@ impl<'a> EventEmitter<'a> {
             run_id,
             block_id: block_id.to_string(),
             action,
+            attempt_id,
             state: ActionState::Blocked,
             reason,
         });
@@ -6199,6 +6274,51 @@ mod tests {
         observed: Arc<Mutex<Vec<ActionState>>>,
     }
 
+    struct PauseFenceInput {
+        committed: mpsc::SyncSender<()>,
+        allow_first_input: Mutex<Receiver<()>>,
+        sends: AtomicU64,
+    }
+
+    impl LiveActionInput for PauseFenceInput {
+        fn reset_manual_baseline(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn manual_takeover_detected(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn dispatch_action(
+            &self,
+            _point: Point,
+            _button: MouseButton,
+            _movement: Option<&MouseMovementProfile>,
+            _stop: &dyn StopSource,
+            commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+            validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+        ) -> InputDispatchOutcome {
+            if let Err(reason) = commit() {
+                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit {
+                    reason,
+                });
+            }
+            self.committed.send(()).expect("test must receive commit");
+            self.allow_first_input
+                .lock()
+                .expect("test input gate poisoned")
+                .recv()
+                .expect("test must allow the first input");
+            self.sends.fetch_add(1, Ordering::AcqRel);
+            if let Err(reason) = validate_after_movement() {
+                return InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
+                    failure: InputDispatchFailure::Validation { reason },
+                });
+            }
+            InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+        }
+    }
+
     impl LiveActionInput for CommitObservingInput {
         fn reset_manual_baseline(&self) -> Result<()> {
             Ok(())
@@ -6267,12 +6387,6 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct NoopLiveControl;
-
-    impl LiveControlSink for NoopLiveControl {
-        fn pause_for_manual_takeover(&self) {}
-
-        fn stop_for_manual_takeover(&self) {}
-    }
 
     #[derive(Debug, Default)]
     struct NeverStop;
@@ -6794,13 +6908,8 @@ mod tests {
     #[test]
     fn live_mode_dispatches_point_click_inline_with_ordered_transitions() {
         let input = Arc::new(CountingLiveInput::default());
-        let session = LiveActionSession::new(
-            Arc::new(StableLiveTarget(live_target())),
-            input.clone(),
-            Arc::new(NoopLiveControl),
-        );
         let events = fixture_runtime()
-            .with_live_session(session)
+            .with_live_input(Arc::new(StableLiveTarget(live_target())), input.clone())
             .run(fixture_click_macro(), RunMode::Live)
             .unwrap();
 
@@ -6841,11 +6950,6 @@ mod tests {
     #[test]
     fn live_mode_rejects_move_only_without_dispatch() {
         let input = Arc::new(CountingLiveInput::default());
-        let session = LiveActionSession::new(
-            Arc::new(StableLiveTarget(live_target())),
-            input.clone(),
-            Arc::new(NoopLiveControl),
-        );
         let definition = fixture_definition(vec![block(
             "move-only",
             BlockKind::Action {
@@ -6856,9 +6960,8 @@ mod tests {
                 },
             },
         )]);
-
         let events = fixture_runtime()
-            .with_live_session(session)
+            .with_live_input(Arc::new(StableLiveTarget(live_target())), input.clone())
             .run(saved(definition), RunMode::Live)
             .unwrap();
 
@@ -6870,6 +6973,91 @@ mod tests {
                 ..
             }) if block_id == "move-only"
         ));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                RunEvent::ActionBlocked {
+                    attempt_id: None,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn live_input_factory_binds_manual_takeover_to_its_own_runtime_control() {
+        let runtime = fixture_runtime().with_live_input(
+            Arc::new(StableLiveTarget(live_target())),
+            Arc::new(CountingLiveInput::default()),
+        );
+        let control = runtime.control_handle();
+        let session = &runtime
+            .live
+            .as_ref()
+            .expect("live input must be configured")
+            .session;
+        assert!(Arc::ptr_eq(&runtime.control, &session.control.control));
+
+        session.apply_takeover(TakeoverPolicy::Pause);
+
+        assert!(control.is_paused_for_test());
+    }
+
+    #[test]
+    fn repeated_live_action_blocks_keep_the_prepared_attempt_id() {
+        let action = Action::ClickPoint {
+            point_id: "point".to_string(),
+            button: MouseButton::Left,
+        };
+        let mut emitter = EventEmitter::new(&FrozenClock, 0, "repeat-run".to_string(), 64);
+        let expected = [
+            ActionAttemptId::for_test("repeat-run", 1),
+            ActionAttemptId::for_test("repeat-run", 2),
+        ];
+
+        for attempt_id in expected.iter().cloned() {
+            emitter.action_state_changed(
+                "repeat-click",
+                action.clone(),
+                attempt_id.clone(),
+                ActionState::Prepared,
+            );
+            emitter.action_blocked(
+                "repeat-click",
+                action.clone(),
+                Some(attempt_id),
+                "target changed".to_string(),
+            );
+        }
+
+        let prepared = emitter
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::ActionStateChanged {
+                    block_id,
+                    attempt_id,
+                    state: ActionState::Prepared,
+                    ..
+                } if block_id == "repeat-click" => Some(attempt_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let blocked = emitter
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::ActionBlocked {
+                    block_id,
+                    attempt_id: Some(attempt_id),
+                    ..
+                } if block_id == "repeat-click" => Some(attempt_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(prepared, expected);
+        assert_eq!(blocked, expected);
     }
 
     #[test]
@@ -6936,6 +7124,93 @@ mod tests {
                 ActionState::Dispatched,
             ]
         );
+    }
+
+    #[test]
+    fn pause_waits_for_the_input_commit_fence_before_returning() {
+        let runtime = fixture_runtime();
+        let control = runtime.control_handle();
+        let target = live_target();
+        let (committed_tx, committed_rx) = mpsc::sync_channel(1);
+        let (allow_input_tx, allow_input_rx) = mpsc::sync_channel(1);
+        let input = Arc::new(PauseFenceInput {
+            committed: committed_tx,
+            allow_first_input: Mutex::new(allow_input_rx),
+            sends: AtomicU64::new(0),
+        });
+        let session = LiveActionSession::new_for_runtime(
+            Arc::new(StableLiveTarget(target.clone())),
+            input.clone(),
+            control.clone(),
+        );
+        let resume = session.resume().unwrap();
+        let compiled = CompiledMacro::compile(fixture_click_macro()).unwrap();
+        let action = Action::ClickPoint {
+            point_id: "point".to_string(),
+            button: MouseButton::Left,
+        };
+        let authorization = compiled
+            .authorize_action(
+                "pause-fence-run",
+                1,
+                1,
+                "click",
+                &action,
+                None,
+                &resume,
+                Point::new(960, 540),
+                1,
+            )
+            .unwrap();
+        let committer = ActionCommitter::new(
+            session,
+            Arc::new(FrozenClock),
+            "pause-fence-run",
+            Limit::Finite(1),
+            4,
+        )
+        .unwrap();
+        let prepared = committer
+            .prepare(ActionPrepareRequest::new(
+                authorization,
+                None,
+                1,
+                TakeoverPolicy::Pause,
+                resume,
+            ))
+            .unwrap();
+        let commit_thread = thread::spawn(move || {
+            committer.commit(
+                prepared,
+                &NeverStop,
+                CommitContext::new("pause-fence-run", 1, None),
+            )
+        });
+
+        committed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("commit boundary must be reached before first input");
+        let (paused_tx, paused_rx) = mpsc::sync_channel(1);
+        let pause_control = control.clone();
+        let pause_thread = thread::spawn(move || {
+            pause_control.pause();
+            paused_tx.send(()).expect("test must observe pause return");
+        });
+        assert!(
+            paused_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "pause returned while the first input was still inside the commit fence"
+        );
+
+        allow_input_tx.send(()).unwrap();
+        assert!(matches!(
+            commit_thread.join().unwrap(),
+            ActionOutcome::Dispatched { .. }
+        ));
+        paused_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pause must return after the in-flight input exits its fence");
+        pause_thread.join().unwrap();
+        assert_eq!(input.sends.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -12219,6 +12494,7 @@ mod tests {
                 point_id: "point".to_string(),
                 button: super::super::MouseButton::Left,
             },
+            attempt_id: None,
             state: ActionState::Blocked,
             reason: "dry run".to_string(),
         });

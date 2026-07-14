@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use eframe::egui::{self, Color32, Frame, Grid, RichText, Stroke, Ui};
 
 use crate::engine::macro_engine::{
-    ActionState, Block, BlockKind, MacroDefinition, RunEvent, RunMode, RunStatus, SavedRevision,
-    StopReason,
+    ActionAttemptId, ActionState, Block, BlockKind, MacroDefinition, RunEvent, RunMode, RunStatus,
+    SavedRevision, StopReason,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +27,7 @@ pub struct MonitorProjection {
     pub observation_matched: Option<bool>,
     pub action_state: Option<ActionState>,
     pub action_block_id: Option<String>,
+    pub action_attempt_id: Option<ActionAttemptId>,
     pub stop_outcome: Option<StopOutcome>,
     pub error: Option<String>,
     loop_iterations_by_id: BTreeMap<String, u64>,
@@ -53,6 +54,7 @@ impl Default for MonitorProjection {
             observation_matched: None,
             action_state: None,
             action_block_id: None,
+            action_attempt_id: None,
             stop_outcome: None,
             error: None,
             loop_iterations_by_id: BTreeMap::new(),
@@ -184,15 +186,30 @@ pub fn project_monitor(
             }
             RunEvent::ActionPlanned {
                 block_id, state, ..
-            }
-            | RunEvent::ActionBlocked {
-                block_id, state, ..
-            }
-            | RunEvent::ActionStateChanged {
-                block_id, state, ..
             } => {
                 projection.action_state = Some(*state);
                 projection.action_block_id = Some(block_id.clone());
+                projection.action_attempt_id = None;
+            }
+            RunEvent::ActionBlocked {
+                block_id,
+                attempt_id,
+                state,
+                ..
+            } => {
+                projection.action_state = Some(*state);
+                projection.action_block_id = Some(block_id.clone());
+                projection.action_attempt_id = attempt_id.clone();
+            }
+            RunEvent::ActionStateChanged {
+                block_id,
+                attempt_id,
+                state,
+                ..
+            } => {
+                projection.action_state = Some(*state);
+                projection.action_block_id = Some(block_id.clone());
+                projection.action_attempt_id = Some(attempt_id.clone());
             }
             RunEvent::ObservationCompleted { evidence, .. } => {
                 projection.observation_matched = Some(evidence.matched);
@@ -761,6 +778,10 @@ mod tests {
         assert_eq!(monitor.scale_percent, Some(105));
         assert_eq!(monitor.stable_frames, Some(2));
         assert_eq!(monitor.action_state, Some(ActionState::Prepared));
+        assert_eq!(
+            monitor.action_attempt_id,
+            Some(ActionAttemptId::for_test("run-1", 1))
+        );
         assert_eq!(
             monitor.stop_outcome,
             Some(StopOutcome {

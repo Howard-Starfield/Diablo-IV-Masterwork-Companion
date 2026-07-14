@@ -3105,6 +3105,7 @@ impl Default for ControllerState {
 
 struct ControllerEventBuffer {
     capacity: usize,
+    snapshot_lock: Mutex<()>,
     events: Mutex<VecDeque<RunEvent>>,
     lifecycle: Mutex<ControllerLifecycleProjection>,
     semantic: Mutex<ControllerSemanticProjection>,
@@ -3137,8 +3138,21 @@ pub struct ControllerSemanticProjection {
     pub latest_error: Option<RunEvent>,
 }
 
+/// One controller-owned read of monitor state. `replay`, lifecycle, and semantic data all come
+/// from the same event-buffer boundary, so continuous cycles cannot cross-contaminate the UI.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ControllerMonitorSnapshot {
+    pub replay: Vec<RunEvent>,
+    pub lifecycle: ControllerLifecycleProjection,
+    pub semantic: ControllerSemanticProjection,
+}
+
 impl ControllerEventBuffer {
     fn push(&self, event: RunEvent) {
+        let _snapshot_lock = self
+            .snapshot_lock
+            .lock()
+            .expect("controller monitor snapshot lock poisoned");
         {
             let mut semantic = self
                 .semantic
@@ -3233,6 +3247,10 @@ impl ControllerEventBuffer {
     }
 
     fn lifecycle_projection(&self) -> ControllerLifecycleProjection {
+        let _snapshot_lock = self
+            .snapshot_lock
+            .lock()
+            .expect("controller monitor snapshot lock poisoned");
         self.lifecycle
             .lock()
             .expect("controller lifecycle projection poisoned")
@@ -3240,10 +3258,42 @@ impl ControllerEventBuffer {
     }
 
     fn semantic_projection(&self) -> ControllerSemanticProjection {
+        let _snapshot_lock = self
+            .snapshot_lock
+            .lock()
+            .expect("controller monitor snapshot lock poisoned");
         self.semantic
             .lock()
             .expect("controller semantic projection poisoned")
             .clone()
+    }
+
+    fn drain_monitor_snapshot(&self) -> ControllerMonitorSnapshot {
+        let _snapshot_lock = self
+            .snapshot_lock
+            .lock()
+            .expect("controller monitor snapshot lock poisoned");
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("controller lifecycle projection poisoned")
+            .clone();
+        let semantic = self
+            .semantic
+            .lock()
+            .expect("controller semantic projection poisoned")
+            .clone();
+        let replay = self
+            .events
+            .lock()
+            .expect("controller event buffer poisoned")
+            .drain(..)
+            .collect();
+        ControllerMonitorSnapshot {
+            replay,
+            lifecycle,
+            semantic,
+        }
     }
 }
 
@@ -3341,6 +3391,7 @@ impl MacroController {
             state: Arc::new(Mutex::new(ControllerState::default())),
             events: Arc::new(ControllerEventBuffer {
                 capacity: event_capacity,
+                snapshot_lock: Mutex::new(()),
                 events: Mutex::new(VecDeque::with_capacity(event_capacity)),
                 lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
                 semantic: Mutex::new(ControllerSemanticProjection::default()),
@@ -3619,6 +3670,10 @@ impl MacroController {
 
     pub fn semantic_projection(&self) -> ControllerSemanticProjection {
         self.events.semantic_projection()
+    }
+
+    pub fn drain_monitor_snapshot(&self) -> ControllerMonitorSnapshot {
+        self.events.drain_monitor_snapshot()
     }
 
     pub fn wait_until_idle(&self, timeout: Duration) -> Result<()> {
@@ -12488,6 +12543,7 @@ mod tests {
         let _collision = store.acquire_active_run("collision-run").unwrap();
         let buffer = Arc::new(ControllerEventBuffer {
             capacity: 8,
+            snapshot_lock: Mutex::new(()),
             events: Mutex::new(VecDeque::new()),
             lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
             semantic: Mutex::new(ControllerSemanticProjection::default()),
@@ -12520,12 +12576,54 @@ mod tests {
     }
 
     #[test]
+    fn monitor_snapshot_keeps_each_concurrent_cycle_consistent() {
+        let buffer = Arc::new(ControllerEventBuffer {
+            capacity: 1,
+            snapshot_lock: Mutex::new(()),
+            events: Mutex::new(VecDeque::new()),
+            lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
+            semantic: Mutex::new(ControllerSemanticProjection::default()),
+        });
+        let (advance_tx, advance_rx) = mpsc::sync_channel(1);
+        let (published_tx, published_rx) = mpsc::sync_channel(1);
+        let producer_buffer = Arc::clone(&buffer);
+        let producer = thread::spawn(move || {
+            for run_id in ["cycle-a", "cycle-b"] {
+                advance_rx.recv().unwrap();
+                producer_buffer.push(controller_started_event(run_id));
+                published_tx.send(run_id).unwrap();
+            }
+        });
+
+        for expected_run_id in ["cycle-a", "cycle-b"] {
+            advance_tx.send(()).unwrap();
+            assert_eq!(published_rx.recv().unwrap(), expected_run_id);
+            let snapshot = buffer.drain_monitor_snapshot();
+
+            assert!(matches!(
+                snapshot.lifecycle.run_started,
+                Some(RunEvent::RunStarted { ref run_id, .. }) if run_id == expected_run_id
+            ));
+            assert!(matches!(
+                snapshot.semantic.run_started,
+                Some(RunEvent::RunStarted { ref run_id, .. }) if run_id == expected_run_id
+            ));
+            assert!(matches!(
+                snapshot.replay.as_slice(),
+                [RunEvent::RunStarted { run_id, .. }] if run_id == expected_run_id
+            ));
+        }
+        producer.join().unwrap();
+    }
+
+    #[test]
     fn lifecycle_projection_survives_disabled_journal_and_tiny_replay() {
         let temp = tempfile::tempdir().unwrap();
         let store = Arc::new(MacroStore::open(temp.path()).unwrap());
         let _existing = store.open_journal("disabled-run", JournalLimits::new(1_024, 2));
         let buffer = Arc::new(ControllerEventBuffer {
             capacity: 1,
+            snapshot_lock: Mutex::new(()),
             events: Mutex::new(VecDeque::new()),
             lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
             semantic: Mutex::new(ControllerSemanticProjection::default()),
@@ -12565,6 +12663,7 @@ mod tests {
         let store = Arc::new(MacroStore::open(temp.path()).unwrap());
         let buffer = Arc::new(ControllerEventBuffer {
             capacity: 1,
+            snapshot_lock: Mutex::new(()),
             events: Mutex::new(VecDeque::new()),
             lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
             semantic: Mutex::new(ControllerSemanticProjection::default()),
@@ -12599,6 +12698,7 @@ mod tests {
         let _existing = store.open_journal("semantic-run", JournalLimits::new(1_024, 2));
         let buffer = Arc::new(ControllerEventBuffer {
             capacity: 1,
+            snapshot_lock: Mutex::new(()),
             events: Mutex::new(VecDeque::new()),
             lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
             semantic: Mutex::new(ControllerSemanticProjection::default()),
@@ -12623,6 +12723,7 @@ mod tests {
         let store = Arc::new(MacroStore::open(temp.path()).unwrap());
         let buffer = Arc::new(ControllerEventBuffer {
             capacity: 1,
+            snapshot_lock: Mutex::new(()),
             events: Mutex::new(VecDeque::new()),
             lifecycle: Mutex::new(ControllerLifecycleProjection::default()),
             semantic: Mutex::new(ControllerSemanticProjection::default()),

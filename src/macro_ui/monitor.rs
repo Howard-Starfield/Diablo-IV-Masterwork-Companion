@@ -317,10 +317,19 @@ fn controller_projection_events(
     semantic: &ControllerSemanticProjection,
 ) -> Vec<RunEvent> {
     let mut events = replay_events.to_vec();
-    if let Some(run_started) = lifecycle
+    let semantic_run_id = semantic.run_started.as_ref().map(event_run_id);
+    let lifecycle_started = lifecycle
         .run_started
         .as_ref()
-        .or(semantic.run_started.as_ref())
+        .filter(|event| semantic_run_id.map_or(true, |run_id| event_run_id(event) == run_id));
+    let lifecycle_stopped = lifecycle
+        .run_stopped
+        .as_ref()
+        .filter(|event| semantic_run_id.map_or(true, |run_id| event_run_id(event) == run_id));
+    if let Some(run_started) = semantic
+        .run_started
+        .as_ref()
+        .or(lifecycle_started)
         .filter(|event| !events.contains(event))
     {
         let run_id = event_run_id(run_started);
@@ -331,7 +340,7 @@ fn controller_projection_events(
         events.insert(insertion_index, run_started.clone());
     }
     for event in [
-        lifecycle.run_stopped.as_ref(),
+        lifecycle_stopped,
         semantic.status.as_ref(),
         semantic.active_block.as_ref(),
         semantic.latest_observation.as_ref(),
@@ -1178,6 +1187,42 @@ mod tests {
 
         assert_eq!(monitor.run_id.as_deref(), Some("newer-run"));
         assert_eq!(completion.reason, StopReason::EmergencyStopped);
+    }
+
+    #[test]
+    fn semantic_projection_wins_when_lifecycle_is_from_an_older_cycle() {
+        let lifecycle = ControllerLifecycleProjection {
+            run_started: Some(started(1, "cycle-a", "alpha", 1, "hash-a")),
+            run_stopped: Some(RunEvent::RunStopped {
+                sequence: 9,
+                elapsed_ms: 90,
+                run_id: "cycle-a".to_string(),
+                status: RunStatus::Stopped,
+                reason: StopReason::Completed,
+            }),
+        };
+        let semantic = ControllerSemanticProjection {
+            run_started: Some(started(1, "cycle-b", "alpha", 2, "hash-b")),
+            status: Some(RunEvent::StatusChanged {
+                sequence: 2,
+                elapsed_ms: 10,
+                run_id: "cycle-b".to_string(),
+                status: RunStatus::Running,
+            }),
+            ..ControllerSemanticProjection::default()
+        };
+
+        let monitor = project_monitor_with_controller_projections(
+            Some("alpha"),
+            None,
+            &[semantic.status.clone().unwrap()],
+            &lifecycle,
+            &semantic,
+        );
+
+        assert_eq!(monitor.run_id.as_deref(), Some("cycle-b"));
+        assert_eq!(monitor.running_revision, Some(2));
+        assert_eq!(monitor.status, RunStatus::Running);
     }
 
     #[test]

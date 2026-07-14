@@ -717,19 +717,18 @@ impl NativeApp {
             return;
         };
         let saved = controller.active_revision();
-        let lifecycle = controller.lifecycle_projection();
-        let semantic = controller.semantic_projection();
+        let snapshot = controller.drain_monitor_snapshot();
         if let (Some(saved), Some(RunEvent::RunStarted { run_id, .. })) =
-            (saved.as_ref(), lifecycle.run_started.as_ref())
+            (saved.as_ref(), snapshot.lifecycle.run_started.as_ref())
         {
             self.macro_state.running_snapshot = Some(RunDefinitionSnapshot::from_saved(
                 run_id.clone(),
                 saved.clone(),
             ));
         }
-        self.macro_state.controller_lifecycle = Some(lifecycle);
-        self.macro_state.controller_semantic = Some(semantic);
-        while let Some(event) = controller.try_next_event() {
+        self.macro_state.controller_lifecycle = Some(snapshot.lifecycle);
+        self.macro_state.controller_semantic = Some(snapshot.semantic);
+        for event in snapshot.replay {
             if self.macro_state.runtime_events.len() >= 256 {
                 self.macro_state.runtime_events.remove(0);
             }

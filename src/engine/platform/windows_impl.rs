@@ -55,13 +55,18 @@ use xcap::{Monitor, Window};
 
 use super::super::{
     automation::{
-        AtomicCaptureSnapshot, AtomicFrameCapture, AtomicFrameSnapshotSource, CaptureSource,
+        AtomicCaptureSnapshot, AtomicFrameCapture, AtomicFrameSnapshotSource, CaptureSource, Clock,
         InputSink, MouseButton, StopSource, SystemClock, TargetGuard, TargetSnapshot,
     },
     config::{MouseMovementModel, MouseMovementProfile, MouseMovementSample, MouseMovementStep},
     enchant_loop::OcrReader,
+    macro_engine::{
+        ConditionDetector, ConditionDetectorRouter, ImageDetector, LiveActionInput, MacroRuntime,
+        RuntimeControlHandle, TargetProfile, TextDetector,
+    },
     types::{Point, Rect, ScreenImage},
 };
+use super::windows_input::WindowsInputSink;
 use super::windows_snapshot::{
     CanonicalWindowIdentity, Win32WindowsSnapshotSource, WindowsSnapshotSource,
     client_rect_in_screen, window_class, window_title,
@@ -283,6 +288,146 @@ pub fn xcap_atomic_window_capture(window_id: u32) -> XcapAtomicWindowCapture {
         XcapWindowRegionCapture::new(window_id),
         SystemClock::default(),
     )
+}
+
+/// A run-owned native Macro runtime. Its capture and target guard originate from one captured
+/// binding, while its emergency watcher is stopped before any bundle field is released.
+#[allow(dead_code)]
+pub(crate) struct WindowsMacroRuntimeBundle {
+    pub(crate) runtime: MacroRuntime,
+    pub(crate) control: RuntimeControlHandle,
+    escape_watcher: EscRuntimeEmergencyWatcher,
+}
+
+impl Drop for WindowsMacroRuntimeBundle {
+    fn drop(&mut self) {
+        self.escape_watcher.shutdown();
+    }
+}
+
+/// Builds the production live-runtime dependencies for an already captured target. The typed
+/// binding is intentionally the only native target input; raw HWND/xcap ids stay private here.
+#[allow(dead_code)]
+pub(crate) fn build_windows_macro_runtime(
+    binding: &CapturedTargetBinding,
+    saved_target: &TargetProfile,
+) -> Result<WindowsMacroRuntimeBundle> {
+    anyhow::ensure!(
+        saved_target_matches_captured_binding(saved_target, &binding.profile),
+        "saved macro target does not match the captured target binding"
+    );
+
+    let capture = Arc::new(xcap_atomic_window_capture(binding_xcap_window_id(binding)?));
+    let detector = windows_condition_detector_router(
+        Arc::new(TextDetector::default()),
+        Arc::new(ImageDetector::new()),
+    );
+    let input = Arc::new(WindowsInputSink::new().context("failed to initialize live input")?);
+    let runtime = compose_windows_macro_runtime(
+        capture,
+        binding.guard.clone(),
+        detector,
+        input,
+        Arc::new(SystemClock::default()),
+    );
+    let control = runtime.control_handle();
+    let escape_watcher =
+        EscRuntimeEmergencyWatcher::spawn(Arc::new(EscStopSignal::default()), control.clone());
+
+    Ok(WindowsMacroRuntimeBundle {
+        runtime,
+        control,
+        escape_watcher,
+    })
+}
+
+fn saved_target_matches_captured_binding(
+    saved_target: &TargetProfile,
+    captured: &CapturedTargetProfile,
+) -> bool {
+    saved_target
+        .process_path
+        .eq_ignore_ascii_case(&captured.process_path)
+        && saved_target.window_class == captured.window_class
+        && captured.title.contains(&saved_target.title_contains)
+        && saved_target.captured_client_width == captured.client_rect.width
+        && saved_target.captured_client_height == captured.client_rect.height
+        && saved_target.captured_dpi == captured.dpi
+}
+
+fn binding_xcap_window_id(binding: &CapturedTargetBinding) -> Result<u32> {
+    u32::try_from(binding.expected.window_id)
+        .context("captured target binding has a non-canonical xcap window identity")
+}
+
+fn windows_condition_detector_router(
+    text: Arc<dyn ConditionDetector>,
+    image: Arc<dyn ConditionDetector>,
+) -> Arc<dyn ConditionDetector> {
+    Arc::new(ConditionDetectorRouter::new(text, image))
+}
+
+#[allow(dead_code)]
+fn compose_windows_macro_runtime(
+    capture: Arc<dyn CaptureSource + Send + Sync>,
+    guard: WindowsTargetGuard,
+    detector: Arc<dyn ConditionDetector>,
+    input: Arc<dyn LiveActionInput>,
+    clock: Arc<dyn Clock + Send + Sync>,
+) -> MacroRuntime {
+    MacroRuntime::new(capture, detector, clock).with_live_input(Arc::new(guard), input)
+}
+
+trait EscapeStopSource: Send + Sync + 'static {
+    fn is_stop_requested(&self) -> bool;
+}
+
+impl EscapeStopSource for EscStopSignal {
+    fn is_stop_requested(&self) -> bool {
+        EscStopSignal::is_stop_requested(self)
+    }
+}
+
+#[derive(Debug)]
+struct EscRuntimeEmergencyWatcher {
+    shutdown: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl EscRuntimeEmergencyWatcher {
+    fn spawn<S>(escape: Arc<S>, control: RuntimeControlHandle) -> Self
+    where
+        S: EscapeStopSource,
+    {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || {
+            while !worker_shutdown.load(Ordering::SeqCst) {
+                if escape.is_stop_requested() {
+                    control.emergency_stop();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(8));
+            }
+        });
+        Self {
+            shutdown,
+            worker: Some(worker),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for EscRuntimeEmergencyWatcher {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 fn rect_contains(container: Rect, nested: Rect) -> bool {
@@ -1570,12 +1715,20 @@ fn cursor_pos() -> Result<Point> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
 
     use image::RgbaImage;
+    use sha2::{Digest, Sha256};
 
     use crate::engine::{
         automation::{AtomicFrameCapture, Clock, TargetGuard},
+        macro_engine::*,
         types::ScreenImage,
     };
 
@@ -1685,6 +1838,224 @@ mod tests {
             is_minimized: false,
             is_foreground: true,
         }
+    }
+
+    fn saved_target_for(profile: &CapturedTargetProfile) -> TargetProfile {
+        TargetProfile {
+            process_path: profile.process_path.clone(),
+            window_class: profile.window_class.clone(),
+            title_contains: profile.title.clone(),
+            captured_client_width: profile.client_rect.width,
+            captured_client_height: profile.client_rect.height,
+            captured_dpi: profile.dpi,
+        }
+    }
+
+    #[test]
+    fn factory_rejects_saved_target_that_does_not_match_captured_binding() {
+        let profile = CapturedTargetProfile {
+            process_path: r"C:\\Games\\Diablo IV.exe".to_string(),
+            window_class: "D3DWindowClass".to_string(),
+            title: "Diablo IV - Sanctuary".to_string(),
+            client_rect: Rect::new(100, 200, 800, 600),
+            dpi: 144,
+        };
+        let saved = saved_target_for(&profile);
+
+        assert!(saved_target_matches_captured_binding(&saved, &profile));
+
+        let mut wrong_process = saved.clone();
+        wrong_process.process_path = "C:\\Games\\Other.exe".to_string();
+        assert!(!saved_target_matches_captured_binding(
+            &wrong_process,
+            &profile
+        ));
+
+        let mut wrong_class = saved.clone();
+        wrong_class.window_class = "OtherWindowClass".to_string();
+        assert!(!saved_target_matches_captured_binding(
+            &wrong_class,
+            &profile
+        ));
+
+        let mut wrong_title = saved.clone();
+        wrong_title.title_contains = "Helltide".to_string();
+        assert!(!saved_target_matches_captured_binding(
+            &wrong_title,
+            &profile
+        ));
+
+        let mut wrong_width = saved.clone();
+        wrong_width.captured_client_width += 1;
+        assert!(!saved_target_matches_captured_binding(
+            &wrong_width,
+            &profile
+        ));
+
+        let mut wrong_height = saved.clone();
+        wrong_height.captured_client_height += 1;
+        assert!(!saved_target_matches_captured_binding(
+            &wrong_height,
+            &profile
+        ));
+
+        let mut wrong_dpi = saved;
+        wrong_dpi.captured_dpi += 1;
+        assert!(!saved_target_matches_captured_binding(&wrong_dpi, &profile));
+    }
+
+    #[test]
+    fn factory_keeps_high_bit_capture_identity_aligned_with_binding_guard() {
+        let high_bit_window_id = 0x8000_0001;
+        let mut snapshot = actionable_authoring_snapshot();
+        snapshot.identity = CanonicalWindowIdentity::from_xcap_window_id(high_bit_window_id);
+        let binding = authoring_binding(snapshot.clone(), snapshot, Arc::new(AtomicUsize::new(0)));
+
+        assert_eq!(
+            binding_xcap_window_id(&binding).unwrap(),
+            high_bit_window_id
+        );
+        assert_eq!(
+            binding.guard.snapshot().unwrap().window_id,
+            u64::from(high_bit_window_id)
+        );
+    }
+
+    #[derive(Default)]
+    struct TaggedDetector {
+        observed: Arc<Mutex<Vec<&'static str>>>,
+        tag: &'static str,
+    }
+
+    impl TaggedDetector {
+        fn new(tag: &'static str) -> Self {
+            Self {
+                observed: Arc::new(Mutex::new(Vec::new())),
+                tag,
+            }
+        }
+    }
+
+    impl ConditionDetector for TaggedDetector {
+        fn observe(
+            &self,
+            _request: &ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<DetectorEvidence> {
+            self.observed.lock().unwrap().push(self.tag);
+            Ok(DetectorEvidence::unmatched(1, 1))
+        }
+    }
+
+    fn compiled_router_fixture() -> CompiledMacro {
+        let definition = MacroDefinition {
+            schema_version: MACRO_SCHEMA_VERSION,
+            id: "router".to_string(),
+            name: "router".to_string(),
+            revision: 1,
+            target: TargetProfile {
+                process_path: "game.exe".to_string(),
+                window_class: "game".to_string(),
+                title_contains: "Diablo".to_string(),
+                captured_client_width: 64,
+                captured_client_height: 48,
+                captured_dpi: 96,
+            },
+            regions: vec![],
+            points: vec![],
+            text_rules: vec![],
+            image_rules: vec![],
+            blocks: vec![Block {
+                id: "comment".to_string(),
+                enabled: true,
+                kind: BlockKind::Comment {
+                    text: "router fixture".to_string(),
+                },
+            }],
+            safety: SafetyPolicy {
+                max_runtime_ms: Limit::Finite(1_000),
+                max_clicks: Limit::Finite(1),
+                max_observation_retries: Limit::Finite(1),
+                max_observations_per_second: 1,
+                minimum_click_interval_ms: 1,
+                focus_loss: FocusLossPolicy::Stop,
+            },
+        };
+        let bytes = serde_json::to_vec_pretty(&definition).unwrap();
+        CompiledMacro::compile(SavedRevision {
+            definition,
+            definition_hash: format!("{:x}", Sha256::digest(bytes)),
+            pinned_assets: vec![],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn factory_routes_text_and_image_conditions_to_distinct_engines() {
+        let text = Arc::new(TaggedDetector::new("text"));
+        let image = Arc::new(TaggedDetector::new("image"));
+        let router = windows_condition_detector_router(text.clone(), image.clone());
+        let compiled = compiled_router_fixture();
+        let capture = FakeRawCapture;
+        let text_condition = Condition::Text {
+            source_block_id: "text".to_string(),
+            rule_id: "text".to_string(),
+            mode: ObserveMode::CheckNow,
+        };
+        let image_condition = Condition::Image {
+            source_block_id: "image".to_string(),
+            rule_id: "image".to_string(),
+            mode: ObserveMode::CheckNow,
+        };
+
+        for condition in [&text_condition, &image_condition] {
+            router
+                .observe(
+                    &ObservationRequest {
+                        run_id: "router",
+                        generation: 1,
+                        side_effect_epoch: 0,
+                        condition,
+                        compiled: &compiled,
+                        observed_at_ms: 1,
+                    },
+                    &capture,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(*text.observed.lock().unwrap(), vec!["text"]);
+        assert_eq!(*image.observed.lock().unwrap(), vec!["image"]);
+    }
+
+    #[derive(Debug, Default)]
+    struct TestEscapeStop(AtomicBool);
+
+    impl EscapeStopSource for TestEscapeStop {
+        fn is_stop_requested(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn factory_escape_watcher_stops_the_runtime_control_directly() {
+        let runtime = MacroRuntime::new(
+            Arc::new(FakeRawCapture),
+            Arc::new(UnavailableDetector),
+            Arc::new(FixedClock),
+        );
+        let control = runtime.control_handle();
+        let escape = Arc::new(TestEscapeStop::default());
+        let watcher = EscRuntimeEmergencyWatcher::spawn(Arc::clone(&escape), control.clone());
+
+        escape.0.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !control.is_stopped() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(control.is_stopped());
+        drop(watcher);
     }
 
     #[test]

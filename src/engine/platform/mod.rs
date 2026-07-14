@@ -27,6 +27,9 @@ pub use windows_impl::{
 };
 #[cfg(windows)]
 #[allow(unused_imports)]
+pub(crate) use windows_impl::{WindowsMacroRuntimeBundle, build_windows_macro_runtime};
+#[cfg(windows)]
+#[allow(unused_imports)]
 pub use windows_input::{ManualInputMonitor, WindowsInputSink};
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]

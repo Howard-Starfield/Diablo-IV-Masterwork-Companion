@@ -317,10 +317,21 @@ fn controller_projection_events(
     semantic: &ControllerSemanticProjection,
 ) -> Vec<RunEvent> {
     let mut events = replay_events.to_vec();
+    if let Some(run_started) = lifecycle
+        .run_started
+        .as_ref()
+        .or(semantic.run_started.as_ref())
+        .filter(|event| !events.contains(event))
+    {
+        let run_id = event_run_id(run_started);
+        let insertion_index = events
+            .iter()
+            .position(|event| event_run_id(event) == run_id)
+            .unwrap_or(events.len());
+        events.insert(insertion_index, run_started.clone());
+    }
     for event in [
-        lifecycle.run_started.as_ref(),
         lifecycle.run_stopped.as_ref(),
-        semantic.run_started.as_ref(),
         semantic.status.as_ref(),
         semantic.active_block.as_ref(),
         semantic.latest_observation.as_ref(),
@@ -340,7 +351,6 @@ fn controller_projection_events(
             events.push(event.clone());
         }
     }
-    events.sort_by_key(RunEvent::sequence);
     events
 }
 
@@ -1119,6 +1129,54 @@ mod tests {
             monitor.stop_outcome.as_ref().map(|outcome| &outcome.reason),
             Some(&StopReason::EmergencyStopped)
         );
+        assert_eq!(completion.reason, StopReason::EmergencyStopped);
+    }
+
+    #[test]
+    fn controller_projection_keeps_newer_short_run_after_older_long_run() {
+        let older_stopped = RunEvent::RunStopped {
+            sequence: 100,
+            elapsed_ms: 1_000,
+            run_id: "older-run".to_string(),
+            status: RunStatus::Stopped,
+            reason: StopReason::Completed,
+        };
+        let newer_stopped = RunEvent::RunStopped {
+            sequence: 3,
+            elapsed_ms: 30,
+            run_id: "newer-run".to_string(),
+            status: RunStatus::Stopped,
+            reason: StopReason::EmergencyStopped,
+        };
+        let lifecycle = ControllerLifecycleProjection {
+            run_started: Some(started(1, "newer-run", "alpha", 2, "newer-hash")),
+            run_stopped: Some(newer_stopped.clone()),
+        };
+        let semantic = ControllerSemanticProjection {
+            run_started: lifecycle.run_started.clone(),
+            run_stopped: Some(newer_stopped.clone()),
+            status: Some(newer_stopped.clone()),
+            ..ControllerSemanticProjection::default()
+        };
+        let replay = vec![
+            started(1, "older-run", "alpha", 1, "older-hash"),
+            older_stopped,
+            newer_stopped,
+        ];
+
+        let monitor = project_monitor_with_controller_projections(
+            Some("alpha"),
+            None,
+            &replay,
+            &lifecycle,
+            &semantic,
+        );
+        let completion = project_last_completion_with_controller_projections(
+            &replay, "alpha", &lifecycle, &semantic,
+        )
+        .unwrap();
+
+        assert_eq!(monitor.run_id.as_deref(), Some("newer-run"));
         assert_eq!(completion.reason, StopReason::EmergencyStopped);
     }
 

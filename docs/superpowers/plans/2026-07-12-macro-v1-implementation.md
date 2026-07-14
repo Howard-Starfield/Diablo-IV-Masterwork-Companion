@@ -1076,6 +1076,8 @@ git commit -m "feat: connect macro runtime and library"
 
 ### Task 14: Enforce Corpus, Concurrency, Cancellation, and Endurance Gates
 
+Before starting Task 14, execute and accept the focused UI plan in `docs/superpowers/plans/2026-07-13-frontend-readability-macro-canvas.md`. That plan supersedes the earlier timeline-list presentation while preserving the canonical editor, checked runtime, and all safety gates in this plan.
+
 **Files:**
 - Modify: `src/bin/macro_detection_bench.rs`
 - Create: `tests/macro_adversarial.rs`

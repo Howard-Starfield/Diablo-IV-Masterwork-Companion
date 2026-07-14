@@ -550,6 +550,29 @@ impl BotState {
     }
 }
 
+pub struct EnchantLabels {
+    pub select_window: &'static str,
+    pub capture_text_area: &'static str,
+    pub target_affix: &'static str,
+    pub enchant_button: &'static str,
+    pub replace_button: &'static str,
+    pub close_button: &'static str,
+}
+
+pub const ENCHANT_LABELS: EnchantLabels = EnchantLabels {
+    select_window: "Select game window",
+    capture_text_area: "Capture text area",
+    target_affix: "Target affix",
+    enchant_button: "Set Enchant button",
+    replace_button: "Set Replace button",
+    close_button: "Set Close button",
+};
+
+#[derive(Debug, Default)]
+struct EnchantDiagnosticsState {
+    open: bool,
+}
+
 struct NativeApp {
     page: AppPage,
     macro_state: MacroPageState,
@@ -562,6 +585,7 @@ struct NativeApp {
     rx: Receiver<UiEvent>,
     status: BotState,
     status_message: String,
+    enchant_diagnostics: EnchantDiagnosticsState,
     last_result: Option<TestOcrResult>,
     attempt: u32,
     stop_signal: Option<EscStopSignal>,
@@ -600,6 +624,7 @@ impl NativeApp {
             rx,
             status: BotState::Ready,
             status_message: "Positions autosave and reload on next open.".to_string(),
+            enchant_diagnostics: EnchantDiagnosticsState::default(),
             last_result: Some(TestOcrResult {
                 result: match_affix(
                     "No OCR result yet",
@@ -2081,16 +2106,9 @@ impl NativeApp {
             ui.add_space(8.0);
             self.steps(ui, ctx);
             ui.add_space(8.0);
-            if ui.available_width() >= 900.0 {
-                ui.columns(2, |columns| {
-                    self.setup_panel(&mut columns[0]);
-                    self.status_panel(&mut columns[1]);
-                });
-            } else {
-                self.setup_panel(ui);
-                ui.add_space(8.0);
-                self.status_panel(ui);
-            }
+            self.setup_panel(ui);
+            ui.add_space(8.0);
+            self.diagnostics(ui);
         });
     }
 
@@ -2110,13 +2128,14 @@ impl NativeApp {
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new("Native Rust OCR").color(Color32::from_rgb(255, 145, 55)),
+                            RichText::new("Enchant assistant")
+                                .color(ui_theme::colors::DIABLO_ORANGE),
                         );
                     });
                 });
                 ui.label(
-                    RichText::new("Live OCR enchant detection and automated reroll assistance")
-                        .color(Color32::from_gray(150)),
+                    RichText::new("Set up a target affix, then safely reroll until it appears.")
+                        .color(ui_theme::colors::SUPPORTING_TEXT),
                 );
             });
     }
@@ -2125,9 +2144,9 @@ impl NativeApp {
         let result = self.last_result.clone();
         let matched = result.as_ref().is_some_and(|r| r.result.matched);
         let accent = if matched {
-            Color32::from_rgb(76, 202, 118)
+            ui_theme::colors::SUCCESS
         } else {
-            Color32::from_rgb(239, 91, 76)
+            ui_theme::colors::DANGER
         };
         Frame::none()
             .fill(Color32::from_rgb(15, 17, 19))
@@ -2138,15 +2157,19 @@ impl NativeApp {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Live OCR Result")
+                        RichText::new("Current result")
                             .strong()
                             .size(ui_theme::text::SECTION_TITLE),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new(if matched { "MATCH" } else { "NO MATCH" })
-                                .color(accent)
-                                .strong(),
+                            RichText::new(if matched {
+                                "TARGET FOUND"
+                            } else {
+                                "NO TARGET YET"
+                            })
+                            .color(accent)
+                            .strong(),
                         );
                     });
                 });
@@ -2177,62 +2200,24 @@ impl NativeApp {
                         });
                     });
                 ui.add_space(8.0);
-                Grid::new("ocr_metrics")
-                    .num_columns(4)
-                    .min_col_width(112.0)
-                    .spacing([20.0, 4.0])
-                    .show(ui, |ui| {
-                        metric(ui, "Match", if matched { "Yes" } else { "No" }, accent);
-                        metric(
-                            ui,
-                            "Closest",
-                            result
-                                .as_ref()
-                                .and_then(|r| r.result.target.as_deref())
-                                .unwrap_or("None"),
-                            Color32::from_rgb(255, 158, 58),
-                        );
-                        metric(
-                            ui,
-                            "Score",
-                            &format!(
-                                "{:.0}%",
-                                result.as_ref().map(|r| r.result.score).unwrap_or(0.0) * 100.0
-                            ),
-                            Color32::WHITE,
-                        );
-                        metric(
-                            ui,
-                            "OCR Time",
-                            &format!("{} ms", result.as_ref().map(|r| r.ocr_time_ms).unwrap_or(0)),
-                            Color32::WHITE,
-                        );
-                        ui.end_row();
-                    });
-                if let Some(result) = result.as_ref() {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(format!("Normalized: {}", result.result.normalized_text))
-                            .size(ui_theme::text::META)
-                            .color(Color32::from_gray(145)),
+                ui.horizontal(|ui| {
+                    metric(ui, "Match", if matched { "Yes" } else { "No" }, accent);
+                    metric(
+                        ui,
+                        "Closest target",
+                        result
+                            .as_ref()
+                            .and_then(|r| r.result.target.as_deref())
+                            .unwrap_or("None"),
+                        ui_theme::colors::DIABLO_ORANGE,
                     );
-                    if result.capture_rect.width > 0 && result.capture_rect.height > 0 {
-                        ui.label(
-                            RichText::new(format!(
-                                "Captured: {}",
-                                format_rect(Some(result.capture_rect))
-                            ))
-                            .size(ui_theme::text::META)
-                            .color(Color32::from_gray(145)),
-                        );
-                    }
-                }
+                });
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Target Affix")
+                        RichText::new(ENCHANT_LABELS.target_affix)
                             .size(ui_theme::text::SECTION_TITLE)
                             .strong()
                             .color(Color32::from_gray(220)),
@@ -2252,29 +2237,28 @@ impl NativeApp {
     fn steps(&mut self, ui: &mut Ui, ctx: &Context) {
         let window = self.config.enchant_window;
         let button_width = CALIBRATION_BUTTON_WIDTH;
-        ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Setup checklist")
+                .size(ui_theme::text::SECTION_TITLE)
+                .strong(),
+        );
+        ui.horizontal_wrapped(|ui| {
             if step_button(
                 ui,
                 button_width,
                 "1",
-                "Enchant Button",
-                self.config.has_enchant_button(),
+                ENCHANT_LABELS.select_window,
+                window.is_some(),
             )
             .clicked()
             {
-                if let Some(window) = window {
-                    self.begin_capture(ctx, CaptureKind::EnchantButton { window });
-                } else {
-                    self.status_message =
-                        "First drag around the full Occultist window.".to_string();
-                    self.begin_capture(ctx, CaptureKind::EnchantWindow);
-                }
+                self.begin_capture(ctx, CaptureKind::EnchantWindow);
             }
             if step_button(
                 ui,
                 button_width,
                 "2",
-                "Affix OCR Region",
+                ENCHANT_LABELS.capture_text_area,
                 self.config.ocr_region.is_some(),
             )
             .clicked()
@@ -2291,7 +2275,24 @@ impl NativeApp {
                 ui,
                 button_width,
                 "3",
-                "Replace Affix",
+                ENCHANT_LABELS.enchant_button,
+                self.config.has_enchant_button(),
+            )
+            .clicked()
+            {
+                if let Some(window) = window {
+                    self.begin_capture(ctx, CaptureKind::EnchantButton { window });
+                } else {
+                    self.status_message =
+                        "First drag around the full Occultist window.".to_string();
+                    self.begin_capture(ctx, CaptureKind::EnchantWindow);
+                }
+            }
+            if step_button(
+                ui,
+                button_width,
+                "4",
+                ENCHANT_LABELS.replace_button,
                 self.config.has_replace_button(),
             )
             .clicked()
@@ -2307,8 +2308,8 @@ impl NativeApp {
             if step_button(
                 ui,
                 button_width,
-                "4",
-                "Close Button",
+                "5",
+                ENCHANT_LABELS.close_button,
                 self.config.has_close_button(),
             )
             .clicked()
@@ -2325,13 +2326,13 @@ impl NativeApp {
     }
 
     fn setup_panel(&mut self, ui: &mut Ui) {
-        panel(ui, "Enchant OCR Setup", |ui| {
+        panel(ui, "Run options", |ui| {
             ui.set_width(ui.available_width());
             Grid::new("setup_grid")
                 .num_columns(2)
                 .spacing([18.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Max Attempts (0 = Infinite)");
+                    ui.label("Maximum attempts (0 = keep going)");
                     if egui::DragValue::new(&mut self.config.max_attempts)
                         .clamp_range(0..=999)
                         .ui(ui)
@@ -2340,7 +2341,7 @@ impl NativeApp {
                         self.mark_dirty();
                     }
                     ui.end_row();
-                    ui.label("Match Threshold");
+                    ui.label("Match sensitivity");
                     if ui
                         .add(
                             Slider::new(&mut self.config.fuzzy_threshold, 0.0..=1.0)
@@ -2354,61 +2355,114 @@ impl NativeApp {
                 });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Test OCR").clicked() {
+                if ui.button("Check text area").clicked() {
                     self.begin_ocr_test();
                 }
-                if ui.button("Record Mouse Movement").clicked() {
+                if ui.button("Record mouse movement").clicked() {
                     self.begin_mouse_movement_recording();
                 }
             });
         });
     }
 
-    fn status_panel(&self, ui: &mut Ui) {
-        panel(ui, "Saved Calibration", |ui| {
-            ui.set_width(ui.available_width());
-            status_line(ui, "Window", format_rect(self.config.enchant_window));
-            status_line(
-                ui,
-                "Affix OCR Region",
-                format_rect_ratio(self.config.ocr_region),
-            );
-            status_line(
-                ui,
-                "Enchant Button Region",
-                format_region_or_point(
-                    self.config.enchant_button_region,
-                    self.config.enchant_button,
-                ),
-            );
-            status_line(
-                ui,
-                "Replace Button Region",
-                format_region_or_point(
-                    self.config.replace_button_region,
-                    self.config.replace_button,
-                ),
-            );
-            status_line(
-                ui,
-                "Close Button Region",
-                format_region_or_point(self.config.close_button_region, self.config.close_button),
-            );
-            status_line(
-                ui,
-                "Mouse Movement",
-                format_mouse_movement(self.config.mouse_movement.as_ref()),
-            );
-            ui.add_space(8.0);
-            ui.label(RichText::new("Workflow").strong());
-            ui.label(
-                RichText::new(
-                    "Enchant -> OCR scan -> stop on match -> Replace Affix -> Close -> repeat",
-                )
-                .size(ui_theme::text::SUPPORTING)
-                .color(Color32::from_gray(150)),
-            );
-        });
+    fn diagnostics(&mut self, ui: &mut Ui) {
+        let open = self.enchant_diagnostics.open;
+        let response = egui::CollapsingHeader::new("Diagnostics")
+            .id_source("enchant_diagnostics")
+            .default_open(false)
+            .open(Some(open))
+            .show(ui, |ui| self.show_enchant_diagnostics(ui));
+        if response.header_response.clicked() {
+            self.enchant_diagnostics.open = !open;
+        }
+    }
+
+    fn show_enchant_diagnostics(&self, ui: &mut Ui) {
+        let result = self.last_result.as_ref();
+        Frame::none()
+            .fill(ui_theme::colors::SURFACE)
+            .stroke(Stroke::new(1.0, ui_theme::colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("Latest text check").strong());
+                status_line(
+                    ui,
+                    "Normalized text",
+                    result
+                        .map(|scan| scan.result.normalized_text.clone())
+                        .unwrap_or_else(|| "No result".to_string()),
+                );
+                status_line(
+                    ui,
+                    "Match score",
+                    format!(
+                        "{:.0}%",
+                        result.map(|scan| scan.result.score).unwrap_or(0.0) * 100.0
+                    ),
+                );
+                status_line(
+                    ui,
+                    "Read time",
+                    format!("{} ms", result.map(|scan| scan.ocr_time_ms).unwrap_or(0)),
+                );
+                status_line(
+                    ui,
+                    "Captured area",
+                    result
+                        .map(|scan| format_rect(Some(scan.capture_rect)))
+                        .unwrap_or_else(|| "Not set".to_string()),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("Saved capture details").strong());
+                status_line(ui, "Game window", format_rect(self.config.enchant_window));
+                status_line(
+                    ui,
+                    "Text area ratio",
+                    format_rect_ratio(self.config.ocr_region),
+                );
+                status_line(
+                    ui,
+                    "Enchant button ratio",
+                    format_region_or_point(
+                        self.config.enchant_button_region,
+                        self.config.enchant_button,
+                    ),
+                );
+                status_line(
+                    ui,
+                    "Replace button ratio",
+                    format_region_or_point(
+                        self.config.replace_button_region,
+                        self.config.replace_button,
+                    ),
+                );
+                status_line(
+                    ui,
+                    "Close button ratio",
+                    format_region_or_point(
+                        self.config.close_button_region,
+                        self.config.close_button,
+                    ),
+                );
+                status_line(
+                    ui,
+                    "Mouse movement",
+                    format_mouse_movement(self.config.mouse_movement.as_ref()),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("Automation trace").strong());
+                ui.label(
+                    RichText::new(
+                        "Enchant -> scan text -> stop on target -> Replace -> Close -> repeat",
+                    )
+                    .size(ui_theme::text::SUPPORTING)
+                    .color(ui_theme::colors::SUPPORTING_TEXT),
+                );
+            });
     }
 
     fn bottom_bar(&mut self, ui: &mut Ui) {
@@ -2529,12 +2583,12 @@ fn metric(ui: &mut Ui, label: &str, value: &str, color: Color32) {
 
 fn status_pill(ui: &mut Ui, status: BotState, label: &str) {
     let color = match status {
-        BotState::Running | BotState::Matched => Color32::from_rgb(76, 202, 118),
-        BotState::Error | BotState::NeedsCalibration => Color32::from_rgb(239, 91, 76),
+        BotState::Running | BotState::Matched => ui_theme::colors::SUCCESS,
+        BotState::Error | BotState::NeedsCalibration => ui_theme::colors::DANGER,
         BotState::Calibrating | BotState::RecordingMovement | BotState::TestingOcr => {
-            Color32::from_rgb(255, 158, 58)
+            ui_theme::colors::WARNING
         }
-        _ => Color32::from_rgb(130, 139, 148),
+        _ => ui_theme::colors::STATUS_IDLE,
     };
     Frame::none()
         .fill(Color32::from_rgb(17, 20, 23))
@@ -3629,6 +3683,23 @@ mod routing_tests {
         );
         assert_eq!(bottom_surface(AppPage::Macro), BottomSurface::MacroMonitor);
         assert!(MacroPage::BOTTOM_MAX_HEIGHT < APP_HEIGHT);
+    }
+
+    #[test]
+    fn diagnostics_visibility_does_not_change_ready_config() {
+        let config = NativeConfig::default();
+        let before = serde_json::to_vec(&config).unwrap();
+        let mut diagnostics = EnchantDiagnosticsState::default();
+        diagnostics.open = !diagnostics.open;
+        assert!(diagnostics.open);
+        assert_eq!(serde_json::to_vec(&config).unwrap(), before);
+    }
+
+    #[test]
+    fn beginner_labels_are_task_oriented() {
+        assert_eq!(ENCHANT_LABELS.capture_text_area, "Capture text area");
+        assert_eq!(ENCHANT_LABELS.target_affix, "Target affix");
+        assert!(!ENCHANT_LABELS.capture_text_area.contains("OCR"));
     }
 
     #[derive(Debug, Clone)]

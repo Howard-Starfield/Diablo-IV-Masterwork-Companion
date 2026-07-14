@@ -23,6 +23,10 @@ pub mod colors {
     pub const DECIDE_PURPLE: Color32 = Color32::from_rgb(166, 126, 210);
     pub const ACT_ORANGE: Color32 = Color32::from_rgb(225, 128, 64);
     pub const REPEAT_TEAL: Color32 = Color32::from_rgb(83, 175, 166);
+    pub const SUCCESS: Color32 = Color32::from_rgb(76, 202, 118);
+    pub const WARNING: Color32 = Color32::from_rgb(255, 158, 58);
+    pub const DANGER: Color32 = Color32::from_rgb(239, 91, 76);
+    pub const STATUS_IDLE: Color32 = Color32::from_rgb(130, 139, 148);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

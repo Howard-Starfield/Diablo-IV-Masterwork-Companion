@@ -1,3 +1,4 @@
+mod canvas;
 mod canvas_layout;
 mod canvas_model;
 mod editor;
@@ -25,7 +26,7 @@ use crate::engine::macro_engine::{
 use crate::ui_theme::text;
 
 use crate::ui_state::{MacroCanvasLayout, UiStateStore};
-use canvas_model::{CanvasProjection, CanvasSelection, project_canvas};
+use canvas_model::{CanvasProjection, CanvasSelection, insertion_target_for_port, project_canvas};
 use history::HistoryError;
 
 pub use canvas_layout::{
@@ -278,6 +279,7 @@ pub struct MacroPageState {
     intents: MacroIntentQueue,
     pub selected_block_id: Option<String>,
     selected_canvas: Option<CanvasSelection>,
+    pending_canvas_port: Option<canvas_model::OutputPort>,
     pub pending_inspector_intent: Option<inspector::InspectorIntent>,
     pub editor_feedback: Option<String>,
     pending_conversion: Option<PendingConversion>,
@@ -316,6 +318,7 @@ impl Default for MacroPageState {
             intents: MacroIntentQueue::with_capacity(MacroIntentQueue::DEFAULT_CAPACITY),
             selected_block_id: None,
             selected_canvas: None,
+            pending_canvas_port: None,
             pending_inspector_intent: None,
             editor_feedback: None,
             pending_conversion: None,
@@ -475,6 +478,15 @@ impl MacroPageState {
 
     pub fn reset_canvas_zoom(&mut self) {
         self.canvas_layout.zoom = 1.0;
+        self.canvas_layout_dirty = true;
+    }
+
+    fn record_canvas_layout_edit(&mut self, edit: LayoutEdit) {
+        self.ui_edit_history.record_layout(edit);
+        self.canvas_layout_dirty = true;
+    }
+
+    fn mark_canvas_layout_changed(&mut self) {
         self.canvas_layout_dirty = true;
     }
 
@@ -1687,8 +1699,9 @@ fn workspace(
             });
             section(&mut columns[1], "CANONICAL CANVAS", |ui| {
                 editor_toolbar(ui, state);
-                selection = show_canvas_projection(
+                selection = show_interactive_canvas(
                     ui,
+                    state,
                     canvas,
                     monitor.active_block.as_deref(),
                     selected_canvas.as_ref(),
@@ -1709,8 +1722,9 @@ fn workspace(
         ui.add_space(8.0);
         section(ui, "CANONICAL CANVAS", |ui| {
             editor_toolbar(ui, state);
-            selection = show_canvas_projection(
+            selection = show_interactive_canvas(
                 ui,
+                state,
                 canvas,
                 monitor.active_block.as_deref(),
                 selected_canvas.as_ref(),
@@ -1726,10 +1740,9 @@ fn workspace(
     selection
 }
 
-/// Transitional canvas surface for the pure projection. The later canvas renderer owns pan,
-/// zoom, and connector gestures; this surface intentionally exposes no independent graph state.
-fn show_canvas_projection(
+fn show_interactive_canvas(
     ui: &mut Ui,
+    state: &mut MacroPageState,
     canvas: &CanvasProjection,
     active_block: Option<&str>,
     current_selection: Option<&CanvasSelection>,
@@ -1738,19 +1751,68 @@ fn show_canvas_projection(
         ui.label("Create or select a macro to inspect its canonical blocks.");
         return None;
     }
-    let mut clicked = None;
-    ui.horizontal_wrapped(|ui| {
-        for node in &canvas.nodes {
-            let selected = current_selection == Some(&node.selection)
-                || active_block.is_some_and(|id| id == node.id);
-            let response =
-                ui.selectable_label(selected, format!("{}: {}", node.title, node.summary));
-            if response.clicked() {
-                clicked = Some(node.selection.clone());
-            }
+    let shortcuts = !ui.ctx().wants_keyboard_input()
+        && ui.input(|input| {
+            (input.modifiers.command && input.key_pressed(egui::Key::Z))
+                || (input.modifiers.command && input.key_pressed(egui::Key::Y))
+                || input.key_pressed(egui::Key::F)
+        });
+    if shortcuts {
+        let input = ui.input(|input| {
+            (
+                input.modifiers.command && input.key_pressed(egui::Key::Z),
+                input.modifiers.command && input.key_pressed(egui::Key::Y),
+                input.key_pressed(egui::Key::F),
+            )
+        });
+        if input.0 {
+            let _ = dispatch_editor_command(state, EditorCommand::Undo);
         }
-    });
-    clicked
+        if input.1 {
+            let _ = dispatch_editor_command(state, EditorCommand::Redo);
+        }
+        if input.2 {
+            state.fit_canvas_view([ui.available_width().max(1.0), canvas::CANVAS_HEIGHT]);
+        }
+    }
+    let editable = state.editor_mutations_allowed();
+    let response = canvas::show(
+        ui,
+        canvas,
+        &mut state.canvas_layout,
+        current_selection,
+        active_block,
+        state.draft.as_ref(),
+        editable,
+    );
+    apply_canvas_response(state, response)
+}
+
+fn apply_canvas_response(
+    state: &mut MacroPageState,
+    response: canvas::CanvasResponse,
+) -> Option<CanvasSelection> {
+    if response.layout_changed {
+        state.mark_canvas_layout_changed();
+    }
+    if let Some(edit) = response.layout_edit {
+        state.record_canvas_layout_edit(edit);
+    }
+    if let Some(command) = response.editor_command {
+        let _ = dispatch_editor_command(state, command);
+    }
+    match response.action {
+        Some(canvas::CanvasAction::RejectedConnection(message)) => {
+            state.editor_feedback = Some(format!("Connection rejected: {message}"));
+        }
+        Some(canvas::CanvasAction::OpenAddStep { source, .. }) => {
+            state.pending_canvas_port = Some(source);
+            state.editor_feedback =
+                Some("Choose a block below to add it at the connector drop location.".into());
+        }
+        _ => {}
+    }
+    response.selection
 }
 
 fn dispatch_editor_command(
@@ -1949,6 +2011,7 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
     let editable = state.editor_mutations_allowed();
     let selected = state.selected_block_id.clone();
     let selected_canvas = current_canvas_selection(state);
+    let pending_canvas_port = state.pending_canvas_port.clone();
     if let Some(feedback) = &state.editor_feedback {
         ui.label(
             RichText::new(feedback)
@@ -1996,12 +2059,18 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                         text: "New step".into(),
                     },
                 };
-                let target = InsertionTarget {
-                    container: ContainerPath::Root,
-                    index: draft.blocks.len(),
-                };
-                let _ =
-                    dispatch_editor_command(state, EditorCommand::InsertBlock { target, block });
+                let target = pending_canvas_port
+                    .as_ref()
+                    .and_then(|port| insertion_target_for_port(&draft.definition, port).ok())
+                    .unwrap_or(InsertionTarget {
+                        container: ContainerPath::Root,
+                        index: draft.blocks.len(),
+                    });
+                if dispatch_editor_command(state, EditorCommand::InsertBlock { target, block })
+                    .is_ok()
+                {
+                    state.pending_canvas_port = None;
+                }
             }
         }
     });
@@ -2021,11 +2090,19 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                     .as_ref()
                     .ok_or_else(|| "No draft is open.".to_string())
                     .and_then(|draft| {
-                        palette_command_for_selection(draft, selected_canvas.as_ref(), kind)
+                        let command =
+                            palette_command_for_selection(draft, selected_canvas.as_ref(), kind)?;
+                        if let Some(port) = pending_canvas_port.as_ref() {
+                            retarget_insert_command(draft, port, command)
+                        } else {
+                            Ok(command)
+                        }
                     });
                 match command {
                     Ok(command) => {
-                        let _ = dispatch_editor_command(state, command);
+                        if dispatch_editor_command(state, command).is_ok() {
+                            state.pending_canvas_port = None;
+                        }
                     }
                     Err(message) => state.editor_feedback = Some(message),
                 }
@@ -2311,6 +2388,19 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
             });
         }
     }
+}
+
+fn retarget_insert_command(
+    draft: &EditorDraft,
+    port: &canvas_model::OutputPort,
+    command: EditorCommand,
+) -> Result<EditorCommand, String> {
+    let EditorCommand::InsertBlock { block, .. } = command else {
+        return Err("Canvas Add step can only insert a new canonical block.".into());
+    };
+    let target = insertion_target_for_port(&draft.definition, port)
+        .map_err(|error| format!("Connection rejected: {}", error.message()))?;
+    Ok(EditorCommand::InsertBlock { target, block })
 }
 
 fn conversion_preview_ui(ui: &mut Ui, pending: &mut PendingConversion) {

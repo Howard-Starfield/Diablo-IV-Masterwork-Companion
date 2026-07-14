@@ -21,7 +21,8 @@ mod windows_target;
 pub use windows_impl::{
     CaptureRequestId, CapturedTargetBinding, CapturedTargetProfile, EscStopSignal,
     MacroCaptureKind, MacroCaptureRequest, MacroCaptureResponse, MacroCaptureSelection,
-    SendInputController, WindowsOcrReader, XcapRegionCapture, enable_per_monitor_dpi_awareness,
+    SendInputController, WindowPlacement, WindowsOcrReader, XcapRegionCapture,
+    clamp_window_placement, enable_per_monitor_dpi_awareness, preferred_window_placement,
     record_mouse_movement_profile, resolve_target_from_selection, select_macro_capture,
     select_screen_rect, xcap_window_target_guard,
 };

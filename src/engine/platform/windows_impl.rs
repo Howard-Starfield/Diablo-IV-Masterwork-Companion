@@ -20,15 +20,16 @@ use windows::{
     Win32::{
         Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
-            BLACK_BRUSH, BeginPaint, CreatePen, DeleteObject, EndPaint, FillRect, GetStockObject,
-            NULL_BRUSH, PAINTSTRUCT, PS_SOLID, Rectangle, SelectObject, SetBkMode, SetTextColor,
-            TRANSPARENT, TextOutW,
+            BLACK_BRUSH, BeginPaint, CreatePen, DeleteObject, EndPaint, FillRect, GetMonitorInfoW,
+            GetStockObject, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, NULL_BRUSH,
+            PAINTSTRUCT, PS_SOLID, Rectangle, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+            TextOutW,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::{
-                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-                SetThreadDpiAwarenessContext,
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
+                SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
             },
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
@@ -83,6 +84,74 @@ pub fn xcap_window_target_guard(window_id: u32, hints: DurableTargetHints) -> Wi
 pub fn enable_per_monitor_dpi_awareness() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+const NATIVE_DECORATION_HEIGHT: f32 = 48.0;
+const MIN_WINDOW_WIDTH: f32 = 720.0;
+const MIN_WINDOW_HEIGHT: f32 = 680.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowPlacement {
+    pub inner_size: [f32; 2],
+    pub outer_position: [f32; 2],
+}
+
+pub fn clamp_window_placement(
+    preferred: [f32; 2],
+    work_area_physical: [f32; 4],
+    scale: f32,
+) -> WindowPlacement {
+    let scale = scale.max(f32::EPSILON);
+    let work_width = (work_area_physical[2] - work_area_physical[0]).max(0.0) / scale;
+    let work_height = (work_area_physical[3] - work_area_physical[1]).max(0.0) / scale;
+    let max_inner_height = (work_height - NATIVE_DECORATION_HEIGHT).max(0.0);
+    let min_width = MIN_WINDOW_WIDTH.min(work_width);
+    let min_height = MIN_WINDOW_HEIGHT.min(max_inner_height);
+    let inner_size = [
+        preferred[0].clamp(min_width, work_width),
+        preferred[1].clamp(min_height, max_inner_height),
+    ];
+    let outer_size = [inner_size[0], inner_size[1] + NATIVE_DECORATION_HEIGHT];
+    let outer_position = [
+        work_area_physical[0] / scale + (work_width - outer_size[0]) / 2.0,
+        work_area_physical[1] / scale + (work_height - outer_size[1]) / 2.0,
+    ];
+    WindowPlacement {
+        inner_size,
+        outer_position,
+    }
+}
+
+pub fn preferred_window_placement(preferred: [f32; 2]) -> WindowPlacement {
+    let fallback = || clamp_window_placement(preferred, [0.0, 0.0, 1920.0, 1080.0], 1.0);
+    let mut point = POINT::default();
+    unsafe {
+        if GetCursorPos(&mut point).is_err() {
+            return fallback();
+        }
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return fallback();
+        }
+        let mut dpi_x = 96;
+        let mut dpi_y = 96;
+        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let work = info.rcWork;
+        clamp_window_placement(
+            preferred,
+            [
+                work.left as f32,
+                work.top as f32,
+                work.right as f32,
+                work.bottom as f32,
+            ],
+            dpi_x as f32 / 96.0,
+        )
     }
 }
 
@@ -1763,6 +1832,13 @@ mod tests {
         WindowsSnapshotSource,
     };
     use super::*;
+
+    #[test]
+    fn preferred_size_is_clamped_inside_work_area() {
+        let placement = clamp_window_placement([900.0, 1080.0], [0.0, 0.0, 1920.0, 1040.0], 1.0);
+        assert_eq!(placement.inner_size, [900.0, 992.0]);
+        assert!(placement.outer_position[1] >= 0.0);
+    }
 
     #[derive(Debug, Clone, Copy)]
     struct FakeClientGeometry {

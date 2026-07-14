@@ -19,6 +19,7 @@ use std::{
 
 mod engine;
 mod macro_ui;
+mod ui_state;
 mod ui_theme;
 
 use crate::engine::{
@@ -38,7 +39,7 @@ use crate::engine::{
         CaptureRequestId, CapturedTargetBinding, CapturedTargetProfile, EscStopSignal,
         MacroCaptureKind, MacroCaptureRequest, MacroCaptureSelection, SendInputController,
         WindowsMacroRuntimeBundle, WindowsOcrReader, XcapRegionCapture,
-        build_windows_macro_runtime, enable_per_monitor_dpi_awareness,
+        build_windows_macro_runtime, enable_per_monitor_dpi_awareness, preferred_window_placement,
         record_mouse_movement_profile, resolve_target_from_selection, select_macro_capture,
         select_screen_rect,
     },
@@ -50,6 +51,7 @@ use crate::macro_ui::{
     MacroPageState, RunDefinitionSnapshot, SavedMacroIdentity, WizardAuthoringKind,
     WizardAuthoringOutcome, WizardAuthoringRequest, WizardAuthoringResult, WizardDetector,
 };
+use crate::ui_state::UiStateStore;
 use eframe::{
     App, CreationContext,
     egui::{
@@ -71,8 +73,10 @@ use windows::{
     core::{HSTRING, w},
 };
 
-const APP_WIDTH: f32 = 600.0;
-const APP_HEIGHT: f32 = 760.0;
+const APP_WIDTH: f32 = 900.0;
+const APP_HEIGHT: f32 = 1080.0;
+const MIN_APP_WIDTH: f32 = 720.0;
+const MIN_APP_HEIGHT: f32 = 680.0;
 const CALIBRATION_BUTTON_WIDTH: f32 = 138.0;
 const ACTION_BUTTON_HEIGHT: f32 = 38.0;
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\BoBoCompanion.SingleInstance.v1";
@@ -183,10 +187,22 @@ fn main() -> eframe::Result<()> {
         }
     };
 
+    let (ui_state_store, ui_state_warning) = UiStateStore::open(ui_state_path());
+    let placement = preferred_window_placement([APP_WIDTH, APP_HEIGHT]);
+    let always_on_top = ui_state_store.state.always_on_top;
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("BoBo Companion")
-        .with_inner_size([APP_WIDTH, APP_HEIGHT])
-        .with_min_inner_size([APP_WIDTH, 680.0]);
+        .with_inner_size(placement.inner_size)
+        .with_min_inner_size([
+            MIN_APP_WIDTH.min(placement.inner_size[0]),
+            MIN_APP_HEIGHT.min(placement.inner_size[1]),
+        ])
+        .with_position(placement.outer_position)
+        .with_window_level(if always_on_top {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        });
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -199,7 +215,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "BoBo Companion",
         options,
-        Box::new(|cc| Box::new(NativeApp::new(cc))),
+        Box::new(move |cc| Box::new(NativeApp::new(cc, ui_state_store, ui_state_warning))),
     )
 }
 
@@ -528,6 +544,8 @@ struct NativeApp {
     macro_state: MacroPageState,
     config: NativeConfig,
     config_path: PathBuf,
+    ui_state_store: UiStateStore,
+    ui_state_warning: Option<String>,
     egui_ctx: Context,
     tx: Sender<UiEvent>,
     rx: Receiver<UiEvent>,
@@ -549,7 +567,11 @@ struct NativeApp {
 }
 
 impl NativeApp {
-    fn new(cc: &CreationContext<'_>) -> Self {
+    fn new(
+        cc: &CreationContext<'_>,
+        ui_state_store: UiStateStore,
+        ui_state_warning: Option<String>,
+    ) -> Self {
         ui_theme::apply(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         let config_path = config_path();
@@ -560,6 +582,8 @@ impl NativeApp {
             macro_state: MacroPageState::default(),
             config,
             config_path,
+            ui_state_store,
+            ui_state_warning,
             egui_ctx: cc.egui_ctx.clone(),
             tx,
             rx,
@@ -605,6 +629,12 @@ impl NativeApp {
                 self.status = BotState::Error;
                 self.status_message = format!("Failed to save config: {error}");
             }
+        }
+    }
+
+    fn save_ui_state_if_dirty(&mut self) {
+        if let Err(error) = self.ui_state_store.save_if_dirty() {
+            self.ui_state_warning = Some(format!("Could not save UI preferences: {error}"));
         }
     }
 
@@ -1889,6 +1919,7 @@ impl App for NativeApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll_events(ctx);
         self.save_if_dirty();
+        self.save_ui_state_if_dirty();
         self.sync_macro_runtime();
         if self.page == AppPage::Macro {
             self.refresh_macro_library();
@@ -1917,7 +1948,30 @@ impl App for NativeApp {
                     {
                         self.page = AppPage::Macro;
                     }
+                    if let Some(warning) = &self.ui_state_warning {
+                        ui.label(
+                            RichText::new("Preferences warning")
+                                .size(ui_theme::text::META)
+                                .color(Color32::from_rgb(255, 184, 94)),
+                        )
+                        .on_hover_text(warning);
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .toggle_value(
+                                &mut self.ui_state_store.state.always_on_top,
+                                "Always on top",
+                            )
+                            .changed()
+                        {
+                            let level = if self.ui_state_store.state.always_on_top {
+                                egui::WindowLevel::AlwaysOnTop
+                            } else {
+                                egui::WindowLevel::Normal
+                            };
+                            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                            self.ui_state_store.mark_dirty();
+                        }
                         if self.page == AppPage::Enchant {
                             status_pill(ui, self.status, self.status.label());
                         } else {
@@ -3437,6 +3491,14 @@ fn open_macro_authoring_store() -> Option<Arc<MacroStore>> {
 
 fn config_path() -> PathBuf {
     exe_root_dir().join("enchant_config_native.json")
+}
+
+fn ui_state_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("BoBo Companion")
+        .join("ui-state.json")
 }
 
 fn exe_root_dir() -> PathBuf {

@@ -7,6 +7,8 @@ use crate::engine::macro_engine::{
 };
 use crate::ui_theme::text;
 
+const EMPTY_INSPECTOR_PROMPT: &str = "Select a canonical canvas block.";
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InspectorIntent {
     TestOcr {
@@ -510,7 +512,7 @@ pub fn show(
                     .strong()
                     .color(Color32::from_gray(204)),
             );
-            ui.label("Select a canonical timeline row.");
+            ui.label(EMPTY_INSPECTOR_PROMPT);
         }
         InspectorProjection::Text(p) => {
             heading(ui, "TEXT DETECTOR", &p.mode);
@@ -1364,5 +1366,10 @@ mod tests {
                 timeout_outcome: TimeoutOutcome::RunBody { ref body },
             } if body[0].id == "fallback"
         ));
+    }
+
+    #[test]
+    fn empty_inspector_prompt_refers_to_a_canvas_block() {
+        assert_eq!(EMPTY_INSPECTOR_PROMPT, "Select a canonical canvas block.");
     }
 }

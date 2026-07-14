@@ -141,7 +141,12 @@ impl CanvasViewport {
             return;
         }
         let world = self.world_from_screen(canvas, pointer);
-        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let next_zoom = valid_persisted_zoom(self.zoom * factor);
+        self.zoom = if self.zoom >= MIN_ZOOM {
+            next_zoom.max(MIN_ZOOM)
+        } else {
+            next_zoom
+        };
         self.canvas_size = sane_size([canvas.width(), canvas.height()]);
         self.pan = pointer - canvas.min - world.to_vec2() * self.zoom;
     }
@@ -207,11 +212,7 @@ pub fn reconcile_layout(
     if !saved.pan.iter().all(|value| value.is_finite()) {
         saved.pan = [0.0, 0.0];
     }
-    saved.zoom = if saved.zoom.is_finite() {
-        saved.zoom.clamp(MIN_ZOOM, MAX_ZOOM)
-    } else {
-        1.0
-    };
+    saved.zoom = valid_persisted_zoom(saved.zoom);
     saved
 }
 
@@ -408,6 +409,33 @@ mod tests {
                 viewport.screen_from_world(canvas, world.max),
             ))
         }));
+    }
+
+    #[test]
+    fn reconcile_keeps_a_valid_positive_subminimum_fit_zoom() {
+        let graph = project_canvas(&fixture_large_definition());
+        let mut saved = auto_arrange(&graph);
+        saved.zoom = 0.01;
+
+        assert_eq!(reconcile_layout(&graph, saved).zoom, 0.01);
+    }
+
+    #[test]
+    fn manual_zoom_from_fitted_subminimum_scale_is_continuous() {
+        let graph = project_canvas(&fixture_large_definition());
+        let layout = auto_arrange(&graph);
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let mut viewport = fit_view(
+            [canvas.width(), canvas.height()],
+            graph_bounds(&graph, &layout),
+        );
+        let before = viewport.zoom;
+        assert!(before < MIN_ZOOM);
+
+        viewport.zoom_around(canvas, canvas.center(), 1.1);
+
+        assert!((viewport.zoom - before * 1.1).abs() < f32::EPSILON);
+        assert!(viewport.zoom < MIN_ZOOM);
     }
 
     #[test]

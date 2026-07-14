@@ -1,6 +1,8 @@
 use eframe::egui::{self, Color32, Id, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
 
-use crate::macro_ui::canvas_layout::{CanvasViewport, LayoutEdit, node_rect, visible_nodes};
+use crate::macro_ui::canvas_layout::{
+    CanvasViewport, LayoutEdit, node_rect, reveal_node, visible_nodes,
+};
 use crate::macro_ui::canvas_model::{
     CanvasConnectionError, CanvasEdgeKind, CanvasProjection, CanvasSelection, OutputPort,
     connection_command, insertion_target_for_port,
@@ -238,6 +240,9 @@ pub fn show(
     let painter = ui.painter().with_clip_rect(canvas_rect);
     let mut viewport =
         CanvasViewport::from_layout(layout, [canvas_rect.width(), canvas_rect.height()]);
+    if let Some(active_node) = active_block.and_then(|id| graph.node(id)) {
+        let _ = reveal_node(&mut viewport, canvas_rect, node_rect(active_node, layout));
+    }
     let pointer = response.hover_pos();
     let hit = pointer
         .map(|point| hit_test(graph, layout, &viewport, canvas_rect, point))

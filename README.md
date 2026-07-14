@@ -54,6 +54,8 @@ Run Live -> Pause -> Resume -> Stop -> ESC -> history -> export -> delete -> imp
 local image re-verification
 ```
 
+Before completing the route, verify the monitor shows the active block and its owning loop while the run advances, the latest observation result, action state, and final stop reason. Confirm that an active node is brought into view when it begins offscreen without changing the saved canvas layout.
+
 Record the display resolution, Windows scaling, whether the full window remained reachable, any text that still felt too small, and any canvas gesture conflict. The Enchant path above is a regression check: its capture, OCR, configuration, and Start/Stop behavior must remain unchanged.
 
 ## Build

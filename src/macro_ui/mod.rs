@@ -33,7 +33,7 @@ use history::HistoryError;
 
 pub use canvas_layout::{
     CanvasLayoutEngine, CanvasLayoutError, CanvasViewport, LayoutEdit, auto_arrange, fit_view,
-    graph_bounds, node_rect, reconcile_layout, visible_nodes,
+    graph_bounds, node_rect, reconcile_layout, reveal_node, visible_nodes,
 };
 pub use history::{EditDomain, LayoutHistory, UiEditHistory};
 use monitor::{

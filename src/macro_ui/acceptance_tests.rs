@@ -1,19 +1,20 @@
 use crate::engine::macro_engine::{
-    Block, BlockKind, Limit, PassiveCondition, RunMode, TimeoutOutcome, WatchGroup, WatchLane,
-    validate_macro,
+    Block, BlockKind, Limit, PassiveCondition, RunEvent, RunMode, SavedRevision, TimeoutOutcome,
+    WatchGroup, WatchLane, validate_macro,
 };
 use crate::macro_ui::canvas::{CanvasHit, finish_connection};
 use crate::macro_ui::canvas_model::{
     CanvasConnectionError, CanvasEdgeKind, CanvasGroupKind, OutputPort, connection_command,
     project_canvas,
 };
+use crate::macro_ui::monitor::{RunDefinitionSnapshot, project_monitor};
 use crate::macro_ui::test_support::{
     corrupt_layout, fixture_continuous_with_observe_and_action, fixture_definition,
     fixture_nested_loop_draft, fixture_ready_state, fixture_with_pinned_run,
 };
 use crate::macro_ui::{
-    MacroIntent, MacroPageState, SavedMacroIdentity, reconcile_layout, run_control_availability,
-    select_canvas,
+    CanvasViewport, MacroIntent, MacroPageState, SavedMacroIdentity, node_rect, reconcile_layout,
+    reveal_node, run_control_availability, select_canvas, visible_nodes,
 };
 use crate::ui_state::UiStateStore;
 
@@ -93,11 +94,15 @@ fn stop_replaces_oldest_non_stop_intent_when_queue_is_full() {
     state.push_intent(MacroIntent::Stop);
 
     assert_eq!(state.pending_intent_count(), 64);
-    assert!(
-        state
-            .drain_intents()
-            .any(|intent| matches!(intent, MacroIntent::Stop))
-    );
+    let intents = state.drain_intents().collect::<Vec<_>>();
+    assert!(matches!(intents.last(), Some(MacroIntent::Stop)));
+    assert_eq!(intents.len(), 64);
+    for (expected, intent) in (1..64).zip(&intents[..63]) {
+        assert!(matches!(
+            intent,
+            MacroIntent::Rename { name, .. } if name == &format!("name-{expected}")
+        ));
+    }
 }
 
 #[test]
@@ -175,6 +180,64 @@ fn fit_view_and_active_node_reveal_are_presentation_only() {
     assert!(state.canvas_layout.is_finite());
     assert_eq!(state.selected_block_id.as_deref(), Some("observe"));
     assert_eq!(state.canvas_layout, layout_after_fit);
+}
+
+#[test]
+fn monitor_active_block_reveals_an_offscreen_node_without_mutating_saved_layout() {
+    let definition = fixture_continuous_with_observe_and_action();
+    let graph = project_canvas(&definition);
+    let mut layout = reconcile_layout(&graph, Default::default());
+    layout
+        .node_positions
+        .insert("observe".into(), [4_000.0, 2_500.0]);
+    let saved_layout = layout.clone();
+    let canvas = eframe::egui::Rect::from_min_size(
+        eframe::egui::Pos2::ZERO,
+        eframe::egui::Vec2::new(900.0, 430.0),
+    );
+    let mut viewport = CanvasViewport::from_layout(&layout, [canvas.width(), canvas.height()]);
+    let snapshot = RunDefinitionSnapshot::from_saved(
+        "run-1",
+        SavedRevision {
+            definition: definition.clone(),
+            definition_hash: "fixture-hash".into(),
+            pinned_assets: vec![],
+        },
+    );
+    let events = vec![
+        RunEvent::RunStarted {
+            sequence: 1,
+            elapsed_ms: 0,
+            run_id: "run-1".into(),
+            macro_id: definition.id.clone(),
+            revision: definition.revision,
+            definition_hash: "fixture-hash".into(),
+            mode: RunMode::ObservationOnly,
+        },
+        RunEvent::BlockEntered {
+            sequence: 2,
+            elapsed_ms: 20,
+            run_id: "run-1".into(),
+            block_id: "observe".into(),
+        },
+    ];
+    let monitor = project_monitor(Some(&definition.id), Some(&snapshot), &events);
+    let active = monitor.active_block.as_deref().unwrap();
+    let node = graph.node(active).unwrap();
+
+    assert_eq!(monitor.active_loop.as_deref(), Some("loop"));
+    assert!(
+        !visible_nodes(&graph, &layout, &viewport, canvas)
+            .iter()
+            .any(|node| node.id == active)
+    );
+    assert!(reveal_node(&mut viewport, canvas, node_rect(node, &layout)));
+    assert!(
+        visible_nodes(&graph, &layout, &viewport, canvas)
+            .iter()
+            .any(|node| node.id == active)
+    );
+    assert_eq!(layout, saved_layout);
 }
 
 #[test]

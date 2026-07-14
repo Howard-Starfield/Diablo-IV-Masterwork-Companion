@@ -162,6 +162,20 @@ impl CanvasViewport {
     }
 }
 
+/// Centers an offscreen node for the current canvas frame without writing the ephemeral reveal
+/// back to persisted layout state. User pan and zoom remain the only viewport changes that save.
+pub fn reveal_node(viewport: &mut CanvasViewport, canvas: Rect, world: Rect) -> bool {
+    if viewport.visible_world_rect().contains_rect(world) {
+        return false;
+    }
+    let pan = canvas.center() - canvas.min - world.center().to_vec2() * viewport.zoom;
+    if viewport.pan == pan {
+        return false;
+    }
+    viewport.pan = pan;
+    true
+}
+
 pub fn auto_arrange(graph: &CanvasProjection) -> MacroCanvasLayout {
     let depths = node_depths(graph);
     let mut per_layer = BTreeMap::<usize, Vec<&CanvasNode>>::new();

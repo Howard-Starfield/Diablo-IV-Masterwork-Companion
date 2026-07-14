@@ -7,11 +7,26 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::{
+    ffi::OsStrExt,
+    io::{AsRawHandle, FromRawHandle},
+};
+#[cfg(windows)]
+use windows::Wdk::{
+    Foundation::OBJECT_ATTRIBUTES,
+    Storage::FileSystem::{
+        FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT, NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
+    },
+};
 #[cfg(windows)]
 use windows::Win32::{
-    Foundation::HANDLE,
-    Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+    Foundation::{HANDLE, OBJ_CASE_INSENSITIVE, UNICODE_STRING},
+    Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GetFileInformationByHandle,
+    },
+    System::IO::IO_STATUS_BLOCK,
 };
 
 #[cfg(test)]
@@ -2790,12 +2805,16 @@ fn shared_store_activity(root: &Path) -> Result<Arc<StoreActivity>> {
     Ok(activity)
 }
 
-fn package_file(root: &Path, relative: &Path) -> Result<PathBuf> {
-    validate_package_relative(relative)?;
-    Ok(root.join(relative))
+struct OpenedPackageRoot {
+    #[cfg(windows)]
+    handle: File,
+    #[cfg(windows)]
+    identity: (u32, u32, u32),
+    #[cfg(not(windows))]
+    path: PathBuf,
 }
 
-fn open_package_root(package_root: &Path) -> Result<PathBuf> {
+fn open_package_root(package_root: &Path) -> Result<OpenedPackageRoot> {
     let file = open_nofollow(package_root)
         .with_context(|| format!("package folder does not exist: {}", package_root.display()))?;
     let metadata = file
@@ -2805,26 +2824,55 @@ fn open_package_root(package_root: &Path) -> Result<PathBuf> {
     if !metadata.is_dir() {
         bail!("package path is not a folder");
     }
-    let canonical = package_root.canonicalize()?;
-    if !canonical.is_dir() || !opened_file_matches_path(&file, &canonical)? {
-        bail!("package folder changed while opening");
+    #[cfg(windows)]
+    {
+        return Ok(OpenedPackageRoot {
+            identity: file_identity(&file)?,
+            handle: file,
+        });
     }
-    Ok(canonical)
+    #[cfg(not(windows))]
+    {
+        let canonical = package_root.canonicalize()?;
+        if !canonical.is_dir() || !opened_file_matches_path(&file, &canonical)? {
+            bail!("package folder changed while opening");
+        }
+        Ok(OpenedPackageRoot { path: canonical })
+    }
 }
 
 fn read_bounded_package_file(
-    root: &Path,
+    root: &OpenedPackageRoot,
     relative: &Path,
     maximum: u64,
     label: &str,
 ) -> Result<Vec<u8>> {
-    let path = package_file(root, relative)?;
-    let file = match open_nofollow(&path) {
+    validate_package_relative(relative)?;
+    #[cfg(windows)]
+    let file = match open_package_relative_nofollow(root, relative) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             bail!("missing package file: {}", relative.display())
         }
-        Err(error) => return Err(error).with_context(|| format!("could not open {label}")),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not open package file from verified root: {}",
+                    relative.display()
+                )
+            });
+        }
+    };
+    #[cfg(not(windows))]
+    let file = {
+        let path = root.path.join(relative);
+        match open_nofollow(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                bail!("missing package file: {}", relative.display())
+            }
+            Err(error) => return Err(error).with_context(|| format!("could not open {label}")),
+        }
     };
     let metadata = file
         .metadata()
@@ -2832,12 +2880,6 @@ fn read_bounded_package_file(
     reject_reparse_point(&metadata, label)?;
     if !metadata.is_file() {
         bail!("{label} is not a regular file");
-    }
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("missing package file: {}", relative.display()))?;
-    if !canonical.starts_with(root) || !opened_file_matches_path(&file, &canonical)? {
-        bail!("{label} changed or escaped the package while opening");
     }
     let mut bytes = Vec::new();
     file.take(maximum.saturating_add(1))
@@ -2847,6 +2889,110 @@ fn read_bounded_package_file(
         bail!("{label} bytes exceed maximum {maximum}");
     }
     Ok(bytes)
+}
+
+#[cfg(windows)]
+fn open_package_relative_nofollow(root: &OpenedPackageRoot, relative: &Path) -> io::Result<File> {
+    if root.identity != file_identity(&root.handle)? {
+        return Err(io::Error::other(
+            "verified package root handle identity changed",
+        ));
+    }
+    let components = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut parent = root.handle.try_clone()?;
+    for (index, component) in components.iter().enumerate() {
+        let is_leaf = index + 1 == components.len();
+        let opened = open_relative_component_nofollow(&parent, component, !is_leaf)?;
+        let metadata = opened.metadata()?;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            return Err(io::Error::other(
+                "package path component is a reparse point",
+            ));
+        }
+        if !is_leaf && !metadata.is_dir() {
+            return Err(io::Error::other(
+                "package path component is not a directory",
+            ));
+        }
+        parent = opened;
+    }
+    Ok(parent)
+}
+
+#[cfg(windows)]
+fn open_relative_component_nofollow(
+    parent: &File,
+    component: &std::ffi::OsStr,
+    directory: bool,
+) -> io::Result<File> {
+    let mut wide = component.encode_wide().collect::<Vec<_>>();
+    let byte_len = wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "package component is too long")
+        })?;
+    let object_name = UNICODE_STRING {
+        Length: byte_len,
+        MaximumLength: byte_len,
+        Buffer: windows::core::PWSTR(wide.as_mut_ptr()),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>())
+            .expect("object attributes size fits u32"),
+        RootDirectory: HANDLE(parent.as_raw_handle() as _),
+        ObjectName: &object_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let create_options = NTCREATEFILE_CREATE_OPTIONS(
+        FILE_OPEN_REPARSE_POINT.0
+            | FILE_SYNCHRONOUS_IO_NONALERT.0
+            | if directory {
+                FILE_DIRECTORY_FILE.0
+            } else {
+                FILE_NON_DIRECTORY_FILE.0
+            },
+    );
+    let mut handle = HANDLE::default();
+    let mut status = IO_STATUS_BLOCK::default();
+    let result = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_GENERIC_READ,
+            &attributes,
+            &mut status,
+            None,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            create_options,
+            None,
+            0,
+        )
+    };
+    if result.0 < 0 {
+        let kind = match result.0 as u32 {
+            0xC000_0034 | 0xC000_003A => io::ErrorKind::NotFound,
+            _ => io::ErrorKind::Other,
+        };
+        return Err(io::Error::new(
+            kind,
+            format!(
+                "relative package component open failed with NTSTATUS {:#x}",
+                result.0
+            ),
+        ));
+    }
+    Ok(unsafe { File::from_raw_handle(handle.0 as _) })
 }
 
 fn open_nofollow(path: &Path) -> io::Result<File> {
@@ -2870,24 +3016,19 @@ fn reject_reparse_point(metadata: &fs::Metadata, label: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn opened_file_matches_path(opened: &File, path: &Path) -> Result<bool> {
-    #[cfg(windows)]
-    {
-        return Ok(file_identity(opened)? == file_identity(&open_nofollow(path)?)?);
-    }
-    #[cfg(not(windows))]
-    {
-        let current = fs::metadata(path)?;
-        let opened = opened.metadata()?;
-        Ok(opened.len() == current.len() && opened.is_file() == current.is_file())
-    }
+    let current = fs::metadata(path)?;
+    let opened = opened.metadata()?;
+    Ok(opened.len() == current.len() && opened.is_file() == current.is_file())
 }
 
 #[cfg(windows)]
-fn file_identity(file: &File) -> Result<(u32, u32, u32)> {
+fn file_identity(file: &File) -> io::Result<(u32, u32, u32)> {
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
     unsafe {
-        GetFileInformationByHandle(HANDLE(file.as_raw_handle() as _), &mut information)?;
+        GetFileInformationByHandle(HANDLE(file.as_raw_handle() as _), &mut information)
+            .map_err(|error| io::Error::other(error.to_string()))?;
     }
     Ok((
         information.dwVolumeSerialNumber,
@@ -5366,7 +5507,83 @@ mod tests {
 
         let error = MacroStore::validate_package(&package).unwrap_err();
 
-        assert!(error.to_string().contains("reparse"));
+        assert!(format!("{error:#}").contains("reparse"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_reads_stay_bound_to_verified_root_after_root_path_is_replaced() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let (template, bytes) = fixture_png(7);
+        let asset = source.assets().put_png(&bytes).unwrap();
+        source
+            .save_validated(compilable_image_definition(asset, &template, None))
+            .unwrap();
+        let package = source_temp.path().join("package");
+        source
+            .export_current_package("macro-one", &package)
+            .unwrap();
+        let root = open_package_root(&package).unwrap();
+        let manifest: PackageManifest = serde_json::from_slice(
+            &read_bounded_package_file(
+                &root,
+                Path::new("manifest.json"),
+                MAX_PACKAGE_MANIFEST_BYTES,
+                "package manifest",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let relative_asset = manifest.assets[0].path.clone();
+
+        let original = source_temp.path().join("original-package");
+        fs::rename(&package, &original).unwrap();
+        fs::create_dir_all(package.join(relative_asset.parent().unwrap())).unwrap();
+        fs::write(package.join(&relative_asset), b"replacement-package-asset").unwrap();
+
+        let read = read_bounded_package_file(
+            &root,
+            &relative_asset,
+            MAX_PACKAGE_ASSET_BYTES,
+            "package asset",
+        )
+        .unwrap();
+
+        assert_eq!(read, bytes);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_rejects_intermediate_assets_junction_inside_verified_root() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let (template, bytes) = fixture_png(7);
+        let asset = source.assets().put_png(&bytes).unwrap();
+        source
+            .save_validated(compilable_image_definition(asset, &template, None))
+            .unwrap();
+        let package = source_temp.path().join("package");
+        source
+            .export_current_package("macro-one", &package)
+            .unwrap();
+        let assets = package.join("assets");
+        let real_assets = package.join("real-assets");
+        fs::rename(&assets, &real_assets).unwrap();
+        let command = format!(
+            "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
+            assets.display(),
+            real_assets.display(),
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not create assets junction fixture");
+
+        let error = MacroStore::validate_package(&package).unwrap_err();
+
+        assert!(format!("{error:#}").contains("reparse"));
     }
 
     #[test]

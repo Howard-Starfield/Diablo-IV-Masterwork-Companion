@@ -102,7 +102,6 @@ pub struct CanvasViewport {
     pub pan: Vec2,
     pub zoom: f32,
     canvas_size: [f32; 2],
-    fitted_bounds: Option<Rect>,
 }
 
 impl Default for CanvasViewport {
@@ -111,7 +110,6 @@ impl Default for CanvasViewport {
             pan: Vec2::ZERO,
             zoom: 1.0,
             canvas_size: [1.0, 1.0],
-            fitted_bounds: None,
         }
     }
 }
@@ -120,15 +118,14 @@ impl CanvasViewport {
     pub fn from_layout(layout: &MacroCanvasLayout, canvas_size: [f32; 2]) -> Self {
         Self {
             pan: Vec2::new(layout.pan[0], layout.pan[1]),
-            zoom: layout.zoom.clamp(MIN_ZOOM, MAX_ZOOM),
+            zoom: valid_persisted_zoom(layout.zoom),
             canvas_size: sane_size(canvas_size),
-            fitted_bounds: None,
         }
     }
 
     pub fn write_to_layout(&self, layout: &mut MacroCanvasLayout) {
         layout.pan = [self.pan.x, self.pan.y];
-        layout.zoom = self.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        layout.zoom = valid_persisted_zoom(self.zoom);
     }
 
     pub fn screen_from_world(&self, canvas: Rect, world: Pos2) -> Pos2 {
@@ -147,13 +144,9 @@ impl CanvasViewport {
         self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         self.canvas_size = sane_size([canvas.width(), canvas.height()]);
         self.pan = pointer - canvas.min - world.to_vec2() * self.zoom;
-        self.fitted_bounds = None;
     }
 
     pub fn visible_world_rect(&self) -> Rect {
-        if let Some(bounds) = self.fitted_bounds {
-            return bounds;
-        }
         let size = sane_size(self.canvas_size);
         let zoom = self.zoom.max(f32::MIN_POSITIVE);
         Rect::from_min_size(
@@ -251,7 +244,7 @@ pub fn fit_view(canvas_size: [f32; 2], world_bounds: Rect) -> CanvasViewport {
     );
     let requested_zoom = (available.x / world_bounds.width().max(1.0))
         .min(available.y / world_bounds.height().max(1.0));
-    let zoom = requested_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+    let zoom = valid_persisted_zoom(requested_zoom);
     CanvasViewport {
         pan: Vec2::new(
             (canvas_size[0] - world_bounds.width() * zoom) / 2.0 - world_bounds.min.x * zoom,
@@ -259,7 +252,6 @@ pub fn fit_view(canvas_size: [f32; 2], world_bounds: Rect) -> CanvasViewport {
         ),
         zoom,
         canvas_size,
-        fitted_bounds: (requested_zoom < MIN_ZOOM).then_some(world_bounds),
     }
 }
 
@@ -358,6 +350,14 @@ fn sane_size(size: [f32; 2]) -> [f32; 2] {
     ]
 }
 
+fn valid_persisted_zoom(zoom: f32) -> f32 {
+    if zoom.is_finite() && zoom > 0.0 {
+        zoom.min(MAX_ZOOM)
+    } else {
+        1.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +389,24 @@ mod tests {
             viewport
                 .visible_world_rect()
                 .contains_rect(node_rect(node, &layout))
+        }));
+    }
+
+    #[test]
+    fn fit_view_transform_places_large_graph_inside_canvas() {
+        let graph = project_canvas(&fixture_large_definition());
+        let layout = auto_arrange(&graph);
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let viewport = fit_view(
+            [canvas.width(), canvas.height()],
+            graph_bounds(&graph, &layout),
+        );
+        assert!(graph.nodes.iter().all(|node| {
+            let world = node_rect(node, &layout);
+            canvas.contains_rect(Rect::from_two_pos(
+                viewport.screen_from_world(canvas, world.min),
+                viewport.screen_from_world(canvas, world.max),
+            ))
         }));
     }
 

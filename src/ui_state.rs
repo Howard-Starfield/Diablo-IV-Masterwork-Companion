@@ -71,8 +71,8 @@ impl MacroCanvasLayout {
             self.pan = [0.0, 0.0];
             changed = true;
         }
-        let zoom = if self.zoom.is_finite() {
-            self.zoom.clamp(0.5, 1.75)
+        let zoom = if self.zoom.is_finite() && self.zoom > 0.0 {
+            self.zoom.min(1.75)
         } else {
             1.0
         };
@@ -147,6 +147,18 @@ impl UiStateStore {
     /// Returns the selected macro's non-executable presentation state, creating only a bounded
     /// default entry when the caller is already editing that macro.
     pub fn macro_layout_mut(&mut self, macro_id: &str) -> &mut MacroCanvasLayout {
+        if !self.state.macro_layouts.contains_key(macro_id)
+            && self.state.macro_layouts.len() >= MAX_LAYOUT_MACROS
+        {
+            let evicted = self
+                .state
+                .macro_layouts
+                .keys()
+                .next()
+                .cloned()
+                .expect("layout count established an entry exists");
+            self.state.macro_layouts.remove(&evicted);
+        }
         self.state
             .macro_layouts
             .entry(macro_id.to_owned())
@@ -267,5 +279,20 @@ mod tests {
         let (reopened, warning) = UiStateStore::open(path);
         assert!(warning.is_none());
         assert!(reopened.state.always_on_top);
+    }
+
+    #[test]
+    fn inserting_a_layout_evicts_the_first_existing_macro_before_exceeding_the_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, _) = UiStateStore::open(temp.path().join("ui-state.json"));
+        store.state.macro_layouts = (0..MAX_LAYOUT_MACROS)
+            .map(|index| (format!("macro-{index:03}"), MacroCanvasLayout::default()))
+            .collect();
+
+        store.macro_layout_mut("new-macro").zoom = 1.25;
+
+        assert_eq!(store.state.macro_layouts.len(), MAX_LAYOUT_MACROS);
+        assert!(!store.state.macro_layouts.contains_key("macro-000"));
+        assert_eq!(store.state.macro_layouts["new-macro"].zoom, 1.25);
     }
 }

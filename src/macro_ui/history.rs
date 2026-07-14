@@ -59,8 +59,23 @@ pub struct UiEditHistory {
 }
 
 impl UiEditHistory {
-    pub fn record_definition(&mut self) {
+    pub fn record_definition(&mut self, editor_undo_len: usize) {
         self.record_domain(EditDomain::Definition);
+        let mut excess = self
+            .undo_domains
+            .iter()
+            .filter(|domain| **domain == EditDomain::Definition)
+            .count()
+            .saturating_sub(editor_undo_len);
+        while excess > 0 {
+            let index = self
+                .undo_domains
+                .iter()
+                .position(|domain| *domain == EditDomain::Definition)
+                .expect("definition count established an entry exists");
+            self.undo_domains.remove(index);
+            excess -= 1;
+        }
     }
 
     pub fn record_layout(&mut self, edit: LayoutEdit) {
@@ -151,5 +166,12 @@ mod tests {
         assert!(!layout.node_positions.contains_key("observe"));
         history.redo(&mut layout).unwrap();
         assert_eq!(layout.node_positions["observe"], [20.0, 40.0]);
+    }
+
+    #[test]
+    fn definition_domains_are_pruned_to_editor_undo_capacity() {
+        let mut history = UiEditHistory::default();
+        history.record_definition(0);
+        assert_eq!(history.undo_len(), 0);
     }
 }

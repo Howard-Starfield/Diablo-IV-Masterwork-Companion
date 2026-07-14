@@ -489,17 +489,35 @@ impl MacroPageState {
     }
 
     fn undo_ui_edit(&mut self) -> Result<EditDomain, HistoryError> {
-        let draft = self.draft.as_mut().ok_or(HistoryError::NothingToUndo)?;
-        let result = self.ui_edit_history.undo(draft, &mut self.canvas_layout)?;
+        let result = {
+            let draft = self.draft.as_mut().ok_or(HistoryError::NothingToUndo)?;
+            self.ui_edit_history.undo(draft, &mut self.canvas_layout)?
+        };
+        if result == EditDomain::Definition {
+            self.reconcile_canvas_layout();
+        }
         self.canvas_layout_dirty |= result == EditDomain::Layout;
         Ok(result)
     }
 
     fn redo_ui_edit(&mut self) -> Result<EditDomain, HistoryError> {
-        let draft = self.draft.as_mut().ok_or(HistoryError::NothingToRedo)?;
-        let result = self.ui_edit_history.redo(draft, &mut self.canvas_layout)?;
+        let result = {
+            let draft = self.draft.as_mut().ok_or(HistoryError::NothingToRedo)?;
+            self.ui_edit_history.redo(draft, &mut self.canvas_layout)?
+        };
+        if result == EditDomain::Definition {
+            self.reconcile_canvas_layout();
+        }
         self.canvas_layout_dirty |= result == EditDomain::Layout;
         Ok(result)
+    }
+
+    fn reconcile_canvas_layout(&mut self) {
+        if let Some(draft) = &self.draft {
+            self.canvas_layout =
+                reconcile_layout(&project_canvas(draft), self.canvas_layout.clone());
+            self.canvas_layout_dirty = true;
+        }
     }
 
     pub fn validate_draft(&mut self) {
@@ -1788,7 +1806,13 @@ fn dispatch_editor_command(
         state.editor_image_negative_samples.clear();
     }
     if matches!(result, Ok(EditOutcome::Changed)) {
-        state.ui_edit_history.record_definition();
+        let editor_undo_len = state
+            .draft
+            .as_ref()
+            .map(EditorDraft::undo_len)
+            .unwrap_or_default();
+        state.ui_edit_history.record_definition(editor_undo_len);
+        state.reconcile_canvas_layout();
     }
     state.editor_feedback = Some(match &result {
         Ok(EditOutcome::Changed) => "Draft updated; validation required.".into(),
@@ -3425,6 +3449,43 @@ mod tests {
         assert!(state.draft.is_none());
         assert!(state.runtime_events.is_empty());
         assert!(state.enabled);
+    }
+
+    #[test]
+    fn structural_edit_reconciles_canvas_layout_without_recording_layout_history() {
+        let mut state = MacroPageState {
+            draft: Some(fixture()),
+            ..MacroPageState::default()
+        };
+        state
+            .canvas_layout
+            .node_positions
+            .insert("stale".into(), [1.0, 2.0]);
+        let block = Block {
+            id: "added".into(),
+            enabled: true,
+            kind: BlockKind::Comment {
+                text: "Added".into(),
+            },
+        };
+
+        assert_eq!(
+            dispatch_editor_command(
+                &mut state,
+                EditorCommand::InsertBlock {
+                    target: InsertionTarget {
+                        container: ContainerPath::Root,
+                        index: 1,
+                    },
+                    block,
+                },
+            ),
+            Ok(EditOutcome::Changed)
+        );
+
+        assert!(!state.canvas_layout.node_positions.contains_key("stale"));
+        assert!(state.canvas_layout.node_positions.contains_key("added"));
+        assert_eq!(state.ui_edit_history.undo_len(), 1);
     }
 
     #[test]

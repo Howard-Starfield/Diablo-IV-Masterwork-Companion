@@ -573,6 +573,12 @@ struct EnchantDiagnosticsState {
     open: bool,
 }
 
+impl EnchantDiagnosticsState {
+    fn toggle(&mut self) {
+        self.open = !self.open;
+    }
+}
+
 struct NativeApp {
     page: AppPage,
     macro_state: MacroPageState,
@@ -2366,14 +2372,19 @@ impl NativeApp {
     }
 
     fn diagnostics(&mut self, ui: &mut Ui) {
-        let open = self.enchant_diagnostics.open;
-        let response = egui::CollapsingHeader::new("Diagnostics")
-            .id_source("enchant_diagnostics")
-            .default_open(false)
-            .open(Some(open))
-            .show(ui, |ui| self.show_enchant_diagnostics(ui));
-        if response.header_response.clicked() {
-            self.enchant_diagnostics.open = !open;
+        let label = if self.enchant_diagnostics.open {
+            "▾ Diagnostics"
+        } else {
+            "▸ Diagnostics"
+        };
+        if ui
+            .add(Button::new(RichText::new(label).size(ui_theme::text::SUPPORTING)).frame(false))
+            .clicked()
+        {
+            self.enchant_diagnostics.toggle();
+        }
+        if self.enchant_diagnostics.open {
+            self.show_enchant_diagnostics(ui);
         }
     }
 
@@ -2525,7 +2536,6 @@ fn panel(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
         .rounding(8.0)
         .inner_margin(egui::Margin::same(14.0))
         .show(ui, |ui| {
-            ui.set_min_height(204.0);
             ui.label(
                 RichText::new(title)
                     .strong()
@@ -3693,6 +3703,16 @@ mod routing_tests {
         diagnostics.open = !diagnostics.open;
         assert!(diagnostics.open);
         assert_eq!(serde_json::to_vec(&config).unwrap(), before);
+    }
+
+    #[test]
+    fn diagnostics_state_toggles_on_each_activation() {
+        let mut diagnostics = EnchantDiagnosticsState::default();
+        assert!(!diagnostics.open);
+        diagnostics.toggle();
+        assert!(diagnostics.open);
+        diagnostics.toggle();
+        assert!(!diagnostics.open);
     }
 
     #[test]

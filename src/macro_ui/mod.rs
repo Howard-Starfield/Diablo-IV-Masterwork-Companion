@@ -119,27 +119,63 @@ pub struct SavedMacroIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MacroIntent {
-    Select { macro_id: String },
+    Select {
+        macro_id: String,
+    },
     Validate,
     Save,
-    DryRun,
-    RunOnce,
-    Run,
-    RunLive,
+    DryRun {
+        saved: SavedMacroIdentity,
+    },
+    RunOnce {
+        saved: SavedMacroIdentity,
+    },
+    Run {
+        saved: SavedMacroIdentity,
+    },
+    RunLive {
+        saved: SavedMacroIdentity,
+    },
     Pause,
     Resume,
     Stop,
-    Rename { name: String },
-    Duplicate { macro_id: String, name: String },
-    SetEnabled { enabled: bool },
-    Delete,
+    Rename {
+        saved: SavedMacroIdentity,
+        name: String,
+    },
+    Duplicate {
+        source: SavedMacroIdentity,
+        macro_id: String,
+        name: String,
+    },
+    SetEnabled {
+        saved: SavedMacroIdentity,
+        enabled: bool,
+    },
+    Delete {
+        saved: SavedMacroIdentity,
+    },
     ShowHistory,
-    DeleteHistory { run_id: String },
-    Export { package_root: String },
-    ImportPackage { package_root: String },
+    DeleteHistory {
+        run_id: String,
+    },
+    Export {
+        package_root: String,
+    },
+    ImportPackage {
+        package_root: String,
+    },
     ContinueImagePackageReverification,
     CancelImagePackageReverification,
     CleanupOrphans,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacroRunIntent {
+    DryRun,
+    RunOnce,
+    ContinuousObservation,
+    ContinuousLive,
 }
 
 /// Public composition vocabulary. The native shell translates these bounded UI-only values into
@@ -360,10 +396,32 @@ impl MacroPageState {
         self.enabled = enabled;
     }
 
+    /// Applies a persisted enablement result only while the same saved macro remains selected.
+    pub fn apply_enabled_if_selected(&mut self, saved: &SavedMacroIdentity, enabled: bool) {
+        if self.selected_saved.as_ref() == Some(saved) {
+            self.set_enabled(enabled);
+        }
+    }
+
     /// Request durable lifecycle state through NativeApp. The displayed value changes only when
     /// the store accepts the intent, so a persistence failure naturally leaves it unchanged.
     pub fn request_enabled(&mut self, enabled: bool) {
-        self.enqueue_intent(MacroIntent::SetEnabled { enabled });
+        if let Some(saved) = self.selected_saved.clone() {
+            self.enqueue_intent(MacroIntent::SetEnabled { saved, enabled });
+        }
+    }
+
+    pub fn request_run(&mut self, run: MacroRunIntent) {
+        let Some(saved) = self.selected_saved.clone() else {
+            return;
+        };
+        let intent = match run {
+            MacroRunIntent::DryRun => MacroIntent::DryRun { saved },
+            MacroRunIntent::RunOnce => MacroIntent::RunOnce { saved },
+            MacroRunIntent::ContinuousObservation => MacroIntent::Run { saved },
+            MacroRunIntent::ContinuousLive => MacroIntent::RunLive { saved },
+        };
+        self.enqueue_intent(intent);
     }
 
     pub fn clear_selected_saved(&mut self) {
@@ -1372,9 +1430,13 @@ fn project_library_rows(
     last_completion: Option<&monitor::StopOutcome>,
 ) -> Vec<MacroLibraryRow> {
     let mut rows = state.library_rows.clone();
-    let Some(definition) = state.draft.as_ref() else {
+    let (Some(definition), Some(saved)) = (state.draft.as_ref(), state.selected_saved.as_ref())
+    else {
         return rows;
     };
+    if definition.id != saved.macro_id || state.saved_revision != Some(saved.revision) {
+        return rows;
+    }
     let projected = project_definition(
         definition,
         state.saved_revision,
@@ -1642,7 +1704,7 @@ fn run_controls(ui: &mut Ui, state: &mut MacroPageState, controls: &RunControlAv
                 "Save and select a validated macro before running.",
                 true,
             ) {
-                state.enqueue_intent(MacroIntent::DryRun);
+                state.request_run(MacroRunIntent::DryRun);
             }
             if disabled_action(
                 ui,
@@ -1652,7 +1714,7 @@ fn run_controls(ui: &mut Ui, state: &mut MacroPageState, controls: &RunControlAv
                 "Save and select a validated macro before running.",
                 true,
             ) {
-                state.enqueue_intent(MacroIntent::RunOnce);
+                state.request_run(MacroRunIntent::RunOnce);
             }
             if disabled_action(
                 ui,
@@ -1662,7 +1724,7 @@ fn run_controls(ui: &mut Ui, state: &mut MacroPageState, controls: &RunControlAv
                 "Save and select a validated macro before running.",
                 true,
             ) {
-                state.enqueue_intent(MacroIntent::Run);
+                state.request_run(MacroRunIntent::ContinuousObservation);
             }
             if disabled_action(
                 ui,
@@ -1676,7 +1738,7 @@ fn run_controls(ui: &mut Ui, state: &mut MacroPageState, controls: &RunControlAv
                 "Save and select a validated macro before running.",
                 true,
             ) {
-                state.enqueue_intent(MacroIntent::RunLive);
+                state.request_run(MacroRunIntent::ContinuousLive);
             }
             if disabled_action(
                 ui,
@@ -1992,15 +2054,15 @@ fn library_pane(ui: &mut Ui, state: &mut MacroPageState, rows: &[MacroLibraryRow
                     )
                     .clicked()
                 {
+                    let Some(saved) = state.selected_saved.clone() else {
+                        return;
+                    };
                     state.enqueue_intent(MacroIntent::Rename {
+                        saved,
                         name: state.library_rename.trim().to_owned(),
                     });
                 }
-                if let Some(macro_id) = state
-                    .selected_saved
-                    .as_ref()
-                    .map(|selected| selected.macro_id.clone())
-                {
+                if let Some(source) = state.selected_saved.as_ref().cloned() {
                     if ui
                         .add_enabled(
                             !state.library_rename.trim().is_empty(),
@@ -2009,7 +2071,8 @@ fn library_pane(ui: &mut Ui, state: &mut MacroPageState, rows: &[MacroLibraryRow
                         .clicked()
                     {
                         state.enqueue_intent(MacroIntent::Duplicate {
-                            macro_id,
+                            macro_id: source.macro_id.clone(),
+                            source,
                             name: state.library_rename.trim().to_owned(),
                         });
                     }
@@ -2046,7 +2109,9 @@ fn library_pane(ui: &mut Ui, state: &mut MacroPageState, rows: &[MacroLibraryRow
                         .add_enabled(state.confirm_library_delete, Button::new("Delete selected"))
                         .clicked()
                     {
-                        state.enqueue_intent(MacroIntent::Delete);
+                        if let Some(saved) = state.selected_saved.clone() {
+                            state.enqueue_intent(MacroIntent::Delete { saved });
+                        }
                         state.confirm_library_delete = false;
                     }
                 }
@@ -3863,6 +3928,14 @@ mod tests {
         })
     }
 
+    fn saved_identity() -> SavedMacroIdentity {
+        SavedMacroIdentity {
+            macro_id: "macro".into(),
+            revision: 1,
+            definition_hash: "saved-hash".into(),
+        }
+    }
+
     #[test]
     fn empty_macro_page_has_no_runtime_or_input_authority() {
         let state = MacroPageState::default();
@@ -3985,8 +4058,27 @@ mod tests {
     }
 
     #[test]
+    fn unbound_draft_is_not_appended_to_the_saved_library() {
+        let state = MacroPageState {
+            draft: Some(fixture()),
+            library_rows: vec![],
+            ..MacroPageState::default()
+        };
+
+        let rows = project_library_rows(&state, &MonitorProjection::default(), &[], None);
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
     fn enablement_request_leaves_displayed_state_unchanged_until_native_persistence_succeeds() {
         let mut state = MacroPageState::default();
+        let saved = SavedMacroIdentity {
+            macro_id: "macro".into(),
+            revision: 1,
+            definition_hash: "hash".into(),
+        };
+        state.set_selected_saved(saved.clone());
         state.set_enabled(true);
 
         state.request_enabled(false);
@@ -3994,8 +4086,52 @@ mod tests {
         assert!(state.enabled);
         assert_eq!(
             state.take_intent(),
-            Some(MacroIntent::SetEnabled { enabled: false })
+            Some(MacroIntent::SetEnabled {
+                saved,
+                enabled: false
+            })
         );
+    }
+
+    #[test]
+    fn enablement_completion_does_not_update_a_newly_selected_macro() {
+        let first = SavedMacroIdentity {
+            macro_id: "first".into(),
+            revision: 1,
+            definition_hash: "first-hash".into(),
+        };
+        let second = SavedMacroIdentity {
+            macro_id: "second".into(),
+            revision: 1,
+            definition_hash: "second-hash".into(),
+        };
+        let mut state = MacroPageState::default();
+        state.set_selected_saved(second);
+        state.set_enabled(true);
+
+        state.apply_enabled_if_selected(&first, false);
+
+        assert!(state.enabled);
+    }
+
+    #[test]
+    fn run_request_keeps_the_saved_identity_captured_at_click_time() {
+        let first = SavedMacroIdentity {
+            macro_id: "first".into(),
+            revision: 1,
+            definition_hash: "first-hash".into(),
+        };
+        let second = SavedMacroIdentity {
+            macro_id: "second".into(),
+            revision: 2,
+            definition_hash: "second-hash".into(),
+        };
+        let mut state = MacroPageState::default();
+        state.set_selected_saved(first.clone());
+        state.request_run(MacroRunIntent::ContinuousObservation);
+        state.set_selected_saved(second);
+
+        assert_eq!(state.take_intent(), Some(MacroIntent::Run { saved: first }));
     }
 
     #[test]
@@ -4041,20 +4177,21 @@ mod tests {
             draft: Some(fixture()),
             ..MacroPageState::default()
         };
-        state.set_selected_saved(SavedMacroIdentity {
-            macro_id: "macro".into(),
-            revision: 1,
-            definition_hash: "saved-hash".into(),
-        });
+        state.set_selected_saved(saved_identity());
 
         state.draft.as_mut().unwrap().definition.name = "Unsaved edit".into();
-        state.enqueue_intent(MacroIntent::Run);
+        state.request_run(MacroRunIntent::ContinuousObservation);
 
         assert_eq!(
             state.selected_saved.as_ref().unwrap().definition_hash,
             "saved-hash"
         );
-        assert_eq!(state.take_intent(), Some(MacroIntent::Run));
+        assert_eq!(
+            state.take_intent(),
+            Some(MacroIntent::Run {
+                saved: saved_identity()
+            })
+        );
         assert_eq!(state.selected_saved_macro_id(), Some("macro"));
     }
 
@@ -4064,11 +4201,18 @@ mod tests {
         intents.push(MacroIntent::Select {
             macro_id: "one".into(),
         });
-        intents.push(MacroIntent::Run);
+        intents.push(MacroIntent::Run {
+            saved: saved_identity(),
+        });
         intents.push(MacroIntent::Stop);
 
         assert_eq!(intents.len(), 2);
-        assert_eq!(intents.pop(), Some(MacroIntent::Run));
+        assert_eq!(
+            intents.pop(),
+            Some(MacroIntent::Run {
+                saved: saved_identity()
+            })
+        );
         assert_eq!(intents.pop(), Some(MacroIntent::Stop));
     }
 
@@ -4080,7 +4224,9 @@ mod tests {
                 macro_id: format!("macro-{index}"),
             });
         }
-        intents.push(MacroIntent::Run);
+        intents.push(MacroIntent::Run {
+            saved: saved_identity(),
+        });
 
         assert_eq!(MacroIntentQueue::DEFAULT_CAPACITY, 64);
         assert_eq!(intents.pending(), 64);

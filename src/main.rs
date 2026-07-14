@@ -81,12 +81,23 @@ const CALIBRATION_BUTTON_WIDTH: f32 = 138.0;
 const ACTION_BUTTON_HEIGHT: f32 = 38.0;
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\BoBoCompanion.SingleInstance.v1";
 
-fn macro_run_request(intent: &MacroIntent) -> Option<ControllerRunRequest> {
+fn macro_run_request(intent: &MacroIntent) -> Option<(SavedMacroIdentity, ControllerRunRequest)> {
     match intent {
-        MacroIntent::DryRun => Some(ControllerRunRequest::once(RunMode::DryRun)),
-        MacroIntent::RunOnce => Some(ControllerRunRequest::once(RunMode::ObservationOnly)),
-        MacroIntent::Run => Some(ControllerRunRequest::continuous(RunMode::ObservationOnly)),
-        MacroIntent::RunLive => Some(ControllerRunRequest::continuous(RunMode::Live)),
+        MacroIntent::DryRun { saved } => {
+            Some((saved.clone(), ControllerRunRequest::once(RunMode::DryRun)))
+        }
+        MacroIntent::RunOnce { saved } => Some((
+            saved.clone(),
+            ControllerRunRequest::once(RunMode::ObservationOnly),
+        )),
+        MacroIntent::Run { saved } => Some((
+            saved.clone(),
+            ControllerRunRequest::continuous(RunMode::ObservationOnly),
+        )),
+        MacroIntent::RunLive { saved } => Some((
+            saved.clone(),
+            ControllerRunRequest::continuous(RunMode::Live),
+        )),
         _ => None,
     }
 }
@@ -778,7 +789,7 @@ impl NativeApp {
         }
     }
 
-    fn start_saved_macro(&mut self, request: ControllerRunRequest) {
+    fn start_saved_macro(&mut self, selected: SavedMacroIdentity, request: ControllerRunRequest) {
         if self.macro_controller.is_some() {
             self.macro_state.editor_feedback = Some("A macro run is already active.".into());
             return;
@@ -787,24 +798,6 @@ impl NativeApp {
             self.macro_state.editor_feedback = Some("Macro store is unavailable.".into());
             return;
         };
-        let Some(selected) = self.macro_state.selected_saved.clone() else {
-            self.macro_state.editor_feedback =
-                Some("Select a saved revision before running.".into());
-            return;
-        };
-        let Some(native_selected) = self.selected_saved_revision.as_ref() else {
-            self.macro_state.editor_feedback =
-                Some("Reload the saved revision before running.".into());
-            return;
-        };
-        if native_selected.definition.id != selected.macro_id
-            || native_selected.definition.revision != selected.revision
-            || native_selected.definition_hash != selected.definition_hash
-        {
-            self.macro_state.editor_feedback =
-                Some("Saved selection changed; reload it before running.".into());
-            return;
-        }
         let Ok(saved) = store.load_current(&selected.macro_id) else {
             self.macro_state.editor_feedback =
                 Some("Selected saved revision is unavailable.".into());
@@ -817,12 +810,10 @@ impl NativeApp {
                 Some("Saved revision changed; reload it before running.".into());
             return;
         }
-        self.selected_saved_revision = Some(saved.clone());
         let binding = self
-            .macro_state
-            .active_draft_session()
-            .and_then(|session| self.macro_authoring_targets.get(&session))
-            .filter(|binding| binding_matches_target_profile(binding, &saved.definition.target));
+            .macro_authoring_targets
+            .values()
+            .find(|binding| binding_matches_target_profile(binding, &saved.definition.target));
         let Some(binding) = binding else {
             self.macro_state.editor_feedback =
                 Some("Capture the exact saved target before running this revision.".into());
@@ -1151,18 +1142,18 @@ impl NativeApp {
             self.selected_saved_revision = None;
         }
         while let Some(intent) = self.macro_state.take_intent() {
-            if let Some(request) = macro_run_request(&intent) {
-                self.start_saved_macro(request);
+            if let Some((saved, request)) = macro_run_request(&intent) {
+                self.start_saved_macro(saved, request);
                 continue;
             }
             match intent {
                 MacroIntent::Select { macro_id } => self.select_saved_macro(macro_id),
                 MacroIntent::Validate => self.macro_state.validate_draft(),
                 MacroIntent::Save => self.save_macro_draft(),
-                MacroIntent::DryRun
-                | MacroIntent::RunOnce
-                | MacroIntent::Run
-                | MacroIntent::RunLive => unreachable!("run intents are handled above"),
+                MacroIntent::DryRun { .. }
+                | MacroIntent::RunOnce { .. }
+                | MacroIntent::Run { .. }
+                | MacroIntent::RunLive { .. } => unreachable!("run intents are handled above"),
                 MacroIntent::Pause => {
                     if let Some(controller) = self.macro_controller.as_ref() {
                         controller.pause();
@@ -1181,29 +1172,25 @@ impl NativeApp {
                         controller.stop();
                     }
                 }
-                MacroIntent::SetEnabled { enabled } => {
-                    if let (Some(store), Some(saved)) = (
-                        self.macro_store.as_ref(),
-                        self.macro_state.selected_saved.as_ref(),
-                    ) {
+                MacroIntent::SetEnabled { saved, enabled } => {
+                    if let Some(store) = self.macro_store.as_ref() {
                         if let Err(error) = store.set_macro_enabled(&saved.macro_id, enabled) {
                             self.macro_state.editor_feedback =
                                 Some(format!("Enablement failed: {error}"));
                         } else {
-                            self.macro_state.set_enabled(enabled);
+                            self.macro_state.apply_enabled_if_selected(&saved, enabled);
                             self.refresh_macro_library();
                         }
                     }
                 }
-                MacroIntent::Delete => {
-                    if let (Some(store), Some(saved)) = (
-                        self.macro_store.as_ref(),
-                        self.macro_state.selected_saved.clone(),
-                    ) {
+                MacroIntent::Delete { saved } => {
+                    if let Some(store) = self.macro_store.as_ref() {
                         match store.delete_macro(&saved.macro_id) {
                             Ok(()) => {
-                                self.macro_state.clear_selected_saved();
-                                self.selected_saved_revision = None;
+                                if self.macro_state.selected_saved.as_ref() == Some(&saved) {
+                                    self.macro_state.clear_selected_saved();
+                                    self.selected_saved_revision = None;
+                                }
                                 self.refresh_macro_library();
                             }
                             Err(error) => {
@@ -1213,25 +1200,24 @@ impl NativeApp {
                         }
                     }
                 }
-                MacroIntent::Rename { name } => {
-                    if let (Some(store), Some(saved)) = (
-                        self.macro_store.as_ref(),
-                        self.macro_state.selected_saved.clone(),
-                    ) {
+                MacroIntent::Rename { saved, name } => {
+                    if let Some(store) = self.macro_store.as_ref() {
                         match store.rename_macro(&saved.macro_id, &saved.definition_hash, &name) {
-                            Ok(saved) => {
-                                self.selected_saved_revision = Some(saved.clone());
-                                let revision = saved.definition.revision;
-                                let macro_id = saved.definition.id.clone();
-                                let definition_hash = saved.definition_hash;
-                                self.macro_state.load_saved_draft(
-                                    saved.definition,
-                                    SavedMacroIdentity {
-                                        macro_id,
-                                        revision,
-                                        definition_hash,
-                                    },
-                                );
+                            Ok(renamed) => {
+                                if self.macro_state.selected_saved.as_ref() == Some(&saved) {
+                                    self.selected_saved_revision = Some(renamed.clone());
+                                    let revision = renamed.definition.revision;
+                                    let macro_id = renamed.definition.id.clone();
+                                    let definition_hash = renamed.definition_hash;
+                                    self.macro_state.load_saved_draft(
+                                        renamed.definition,
+                                        SavedMacroIdentity {
+                                            macro_id,
+                                            revision,
+                                            definition_hash,
+                                        },
+                                    );
+                                }
                                 self.refresh_macro_library();
                             }
                             Err(error) => {
@@ -1241,23 +1227,26 @@ impl NativeApp {
                         }
                     }
                 }
-                MacroIntent::Duplicate { macro_id, name } => {
-                    if let (Some(store), Some(saved)) = (
-                        self.macro_store.as_ref(),
-                        self.macro_state.selected_saved.as_ref(),
-                    ) {
-                        match store.duplicate_macro(&saved.macro_id, &macro_id, &name) {
-                            Ok(saved) => {
-                                self.selected_saved_revision = Some(saved.clone());
-                                let revision = saved.definition.revision;
-                                self.macro_state.load_saved_draft(
-                                    saved.definition,
-                                    SavedMacroIdentity {
-                                        macro_id,
-                                        revision,
-                                        definition_hash: saved.definition_hash,
-                                    },
-                                );
+                MacroIntent::Duplicate {
+                    source,
+                    macro_id,
+                    name,
+                } => {
+                    if let Some(store) = self.macro_store.as_ref() {
+                        match store.duplicate_macro(&source.macro_id, &macro_id, &name) {
+                            Ok(duplicated) => {
+                                if self.macro_state.selected_saved.as_ref() == Some(&source) {
+                                    self.selected_saved_revision = Some(duplicated.clone());
+                                    let revision = duplicated.definition.revision;
+                                    self.macro_state.load_saved_draft(
+                                        duplicated.definition,
+                                        SavedMacroIdentity {
+                                            macro_id,
+                                            revision,
+                                            definition_hash: duplicated.definition_hash,
+                                        },
+                                    );
+                                }
                                 self.refresh_macro_library();
                             }
                             Err(error) => {
@@ -3852,21 +3841,43 @@ mod routing_tests {
 
     #[test]
     fn macro_run_intents_map_to_the_controller_modes_without_live_input() {
+        let saved = SavedMacroIdentity {
+            macro_id: "macro".into(),
+            revision: 1,
+            definition_hash: "hash".into(),
+        };
         assert_eq!(
-            macro_run_request(&MacroIntent::DryRun),
-            Some(ControllerRunRequest::once(RunMode::DryRun))
+            macro_run_request(&MacroIntent::DryRun {
+                saved: saved.clone()
+            }),
+            Some((saved.clone(), ControllerRunRequest::once(RunMode::DryRun)))
         );
         assert_eq!(
-            macro_run_request(&MacroIntent::RunOnce),
-            Some(ControllerRunRequest::once(RunMode::ObservationOnly))
+            macro_run_request(&MacroIntent::RunOnce {
+                saved: saved.clone()
+            }),
+            Some((
+                saved.clone(),
+                ControllerRunRequest::once(RunMode::ObservationOnly)
+            ))
         );
         assert_eq!(
-            macro_run_request(&MacroIntent::Run),
-            Some(ControllerRunRequest::continuous(RunMode::ObservationOnly))
+            macro_run_request(&MacroIntent::Run {
+                saved: saved.clone()
+            }),
+            Some((
+                saved.clone(),
+                ControllerRunRequest::continuous(RunMode::ObservationOnly)
+            ))
         );
         assert_eq!(
-            macro_run_request(&MacroIntent::RunLive),
-            Some(ControllerRunRequest::continuous(RunMode::Live))
+            macro_run_request(&MacroIntent::RunLive {
+                saved: saved.clone()
+            }),
+            Some((
+                saved.clone(),
+                ControllerRunRequest::continuous(RunMode::Live)
+            ))
         );
         assert_eq!(macro_run_request(&MacroIntent::Stop), None);
     }

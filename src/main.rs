@@ -392,8 +392,8 @@ struct PendingImagePackageReverification {
     active_rule_index: usize,
     evidence: Option<LocalImagePackageEvidence>,
     completions: Vec<LocalImageRuleReverification>,
-    in_flight_request_id: Option<u64>,
     next_request_id: u64,
+    guard: ImagePackageReverificationSessionGuard,
 }
 
 #[derive(Debug)]
@@ -406,8 +406,30 @@ struct LocalImagePackageEvidence {
 
 #[derive(Debug, Clone)]
 struct ImagePackageReverificationRequest {
-    id: u64,
+    token: ImagePackageReverificationToken,
     step: ImagePackageReverificationStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImagePackageReverificationToken {
+    generation: u64,
+    request_id: u64,
+    expected_stage: ImagePackageReverificationStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImagePackageReverificationSessionGuard {
+    generation: u64,
+    stage: ImagePackageReverificationStage,
+    in_flight_request_id: Option<u64>,
+}
+
+impl ImagePackageReverificationSessionGuard {
+    fn accepts(self, token: &ImagePackageReverificationToken) -> bool {
+        self.generation == token.generation
+            && self.stage == token.expected_stage
+            && self.in_flight_request_id == Some(token.request_id)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -522,6 +544,7 @@ struct NativeApp {
     macro_controller: Option<MacroController>,
     active_macro_bundle: Option<WindowsMacroRuntimeBundle>,
     pending_image_package_reverification: Option<PendingImagePackageReverification>,
+    next_image_package_reverification_generation: u64,
 }
 
 impl NativeApp {
@@ -561,6 +584,7 @@ impl NativeApp {
             macro_controller: None,
             active_macro_bundle: None,
             pending_image_package_reverification: None,
+            next_image_package_reverification_generation: 1,
         }
     }
 
@@ -827,6 +851,11 @@ impl NativeApp {
             return;
         }
         let rule_ids = pending.image_rule_ids().to_vec();
+        let generation = self.next_image_package_reverification_generation;
+        self.next_image_package_reverification_generation = self
+            .next_image_package_reverification_generation
+            .checked_add(1)
+            .expect("image package re-verification generation overflow");
         self.macro_state
             .begin_image_package_reverification(rule_ids);
         self.macro_state.editor_feedback = Some(
@@ -839,8 +868,12 @@ impl NativeApp {
             active_rule_index: 0,
             evidence: None,
             completions: Vec::new(),
-            in_flight_request_id: None,
             next_request_id: 1,
+            guard: ImagePackageReverificationSessionGuard {
+                generation,
+                stage: ImagePackageReverificationStage::CaptureTarget,
+                in_flight_request_id: None,
+            },
         });
     }
 
@@ -857,7 +890,7 @@ impl NativeApp {
                     Some("No local image-package import is awaiting re-verification.".into());
                 return;
             };
-            if session.in_flight_request_id.is_some() {
+            if session.guard.in_flight_request_id.is_some() {
                 return;
             }
             let id = session.next_request_id;
@@ -927,8 +960,13 @@ impl NativeApp {
                     return;
                 }
             };
-            session.in_flight_request_id = Some(id);
-            ImagePackageReverificationRequest { id, step }
+            let token = ImagePackageReverificationToken {
+                generation: session.guard.generation,
+                request_id: id,
+                expected_stage: session.guard.stage,
+            };
+            session.guard.in_flight_request_id = Some(id);
+            ImagePackageReverificationRequest { token, step }
         };
         let tx = self.tx.clone();
         let repaint = self.egui_ctx.clone();
@@ -950,17 +988,18 @@ impl NativeApp {
         let Some(mut session) = self.pending_image_package_reverification.take() else {
             return;
         };
-        if session.in_flight_request_id != Some(request.id) {
+        if !session.guard.accepts(&request.token) {
             self.pending_image_package_reverification = Some(session);
             self.macro_state.editor_feedback =
                 Some("Discarded stale local image-package capture result.".into());
             return;
         }
-        session.in_flight_request_id = None;
+        session.guard.in_flight_request_id = None;
 
         match outcome {
             NativeImagePackageReverificationOutcome::CapturedTarget(binding) => {
                 session.binding = Some(binding);
+                session.guard.stage = ImagePackageReverificationStage::CaptureRegion;
                 self.macro_state.set_image_package_reverification_stage(
                     session.active_rule_index,
                     ImagePackageReverificationStage::CaptureRegion,
@@ -974,6 +1013,7 @@ impl NativeApp {
                     target_region_png: None,
                     negative_pngs: Vec::new(),
                 });
+                session.guard.stage = ImagePackageReverificationStage::CaptureTemplate;
                 self.macro_state.set_image_package_reverification_stage(
                     session.active_rule_index,
                     ImagePackageReverificationStage::CaptureTemplate,
@@ -992,6 +1032,7 @@ impl NativeApp {
                 };
                 evidence.template_png = Some(template_png);
                 evidence.target_region_png = Some(target_region_png);
+                session.guard.stage = ImagePackageReverificationStage::CaptureNegative;
                 self.macro_state.set_image_package_reverification_stage(
                     session.active_rule_index,
                     ImagePackageReverificationStage::CaptureNegative,
@@ -1017,6 +1058,7 @@ impl NativeApp {
                 session.active_rule_index += 1;
                 session.evidence = None;
                 if session.active_rule_index < session.pending.image_rule_ids().len() {
+                    session.guard.stage = ImagePackageReverificationStage::CaptureRegion;
                     self.macro_state.set_image_package_reverification_stage(
                         session.active_rule_index,
                         ImagePackageReverificationStage::CaptureRegion,
@@ -2655,7 +2697,7 @@ fn run_image_package_reverification_request(
             } => {
                 let target = binding.prepare_client_rect()?;
                 let response = select_macro_capture(MacroCaptureRequest {
-                    id: CaptureRequestId(request.id),
+                    id: CaptureRequestId(request.token.request_id),
                     kind: MacroCaptureKind::ImageSearchRegion,
                     target_client: target,
                     min_size: 4,
@@ -2675,7 +2717,7 @@ fn run_image_package_reverification_request(
             ImagePackageReverificationStep::CaptureTemplate { binding, region } => {
                 let target = binding.prepare_client_rect()?;
                 let response = select_macro_capture(MacroCaptureRequest {
-                    id: CaptureRequestId(request.id),
+                    id: CaptureRequestId(request.token.request_id),
                     kind: MacroCaptureKind::TemplateCrop,
                     target_client: target,
                     min_size: 4,
@@ -3807,5 +3849,45 @@ mod routing_tests {
 
         assert!(selected.matched);
         assert_eq!(selected.clusters.len(), 1);
+    }
+
+    #[test]
+    fn stale_image_package_result_from_cancelled_session_cannot_match_new_session() {
+        let stale = ImagePackageReverificationToken {
+            generation: 7,
+            request_id: 1,
+            expected_stage: ImagePackageReverificationStage::CaptureTarget,
+        };
+        let replacement = ImagePackageReverificationSessionGuard {
+            generation: 8,
+            stage: ImagePackageReverificationStage::CaptureTarget,
+            in_flight_request_id: Some(1),
+        };
+
+        assert!(!replacement.accepts(&stale));
+        assert!(
+            !ImagePackageReverificationSessionGuard {
+                generation: 8,
+                stage: ImagePackageReverificationStage::CaptureRegion,
+                in_flight_request_id: Some(1),
+            }
+            .accepts(&ImagePackageReverificationToken {
+                generation: 8,
+                request_id: 1,
+                expected_stage: ImagePackageReverificationStage::CaptureTarget,
+            })
+        );
+        assert!(
+            !ImagePackageReverificationSessionGuard {
+                generation: 8,
+                stage: ImagePackageReverificationStage::CaptureTarget,
+                in_flight_request_id: Some(2),
+            }
+            .accepts(&ImagePackageReverificationToken {
+                generation: 8,
+                request_id: 1,
+                expected_stage: ImagePackageReverificationStage::CaptureTarget,
+            })
+        );
     }
 }

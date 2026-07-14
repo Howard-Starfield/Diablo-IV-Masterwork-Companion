@@ -1,7 +1,10 @@
+mod canvas_model;
 mod editor;
 mod inspector;
 mod library;
 mod monitor;
+#[cfg(test)]
+mod test_support;
 mod timeline;
 mod wizard;
 

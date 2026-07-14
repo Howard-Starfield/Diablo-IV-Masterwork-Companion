@@ -37,6 +37,7 @@ pub struct EditorDraft {
     invalidated_source_ids: BTreeSet<String>,
     detector_test_failures: BTreeMap<String, DetectorTestFailure>,
     undo: VecDeque<UndoEntry>,
+    redo: VecDeque<UndoEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,7 @@ impl EditorDraft {
             invalidated_source_ids: BTreeSet::new(),
             detector_test_failures: BTreeMap::new(),
             undo: VecDeque::new(),
+            redo: VecDeque::new(),
         }
     }
 
@@ -74,6 +76,10 @@ impl EditorDraft {
 
     pub fn undo_len(&self) -> usize {
         self.undo.len()
+    }
+
+    pub fn redo_len(&self) -> usize {
+        self.redo.len()
     }
 
     pub fn record_detector_test_failure(
@@ -341,6 +347,7 @@ pub enum EditorCommand {
     },
     MarkValidated,
     Undo,
+    Redo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +375,7 @@ pub enum EditorError {
     ReplacementIdMismatch,
     ValidationFailed,
     NothingToUndo,
+    NothingToRedo,
 }
 
 pub fn preview_conversion(block: &Block, target: BlockFamily) -> ConversionPreview {
@@ -458,11 +466,41 @@ pub fn apply_editor_command(
         let Some(previous) = draft.undo.pop_back() else {
             return Err(EditorError::NothingToUndo);
         };
+        push_history_entry(
+            &mut draft.redo,
+            UndoEntry {
+                definition: draft.definition.clone(),
+                invalidated_source_ids: draft.invalidated_source_ids.clone(),
+                detector_test_failures: draft.detector_test_failures.clone(),
+            },
+        );
         let revision = draft.definition.revision.saturating_add(1);
         draft.definition = previous.definition;
         draft.definition.revision = revision;
         draft.invalidated_source_ids = previous.invalidated_source_ids;
         draft.detector_test_failures = previous.detector_test_failures;
+        draft.prune_superseded_detector_test_failures();
+        draft.status = DraftStatus::NeedsValidation;
+        return Ok(EditOutcome::Changed);
+    }
+
+    if command == EditorCommand::Redo {
+        let Some(next) = draft.redo.pop_back() else {
+            return Err(EditorError::NothingToRedo);
+        };
+        push_history_entry(
+            &mut draft.undo,
+            UndoEntry {
+                definition: draft.definition.clone(),
+                invalidated_source_ids: draft.invalidated_source_ids.clone(),
+                detector_test_failures: draft.detector_test_failures.clone(),
+            },
+        );
+        let revision = draft.definition.revision.saturating_add(1);
+        draft.definition = next.definition;
+        draft.definition.revision = revision;
+        draft.invalidated_source_ids = next.invalidated_source_ids;
+        draft.detector_test_failures = next.detector_test_failures;
         draft.prune_superseded_detector_test_failures();
         draft.status = DraftStatus::NeedsValidation;
         return Ok(EditOutcome::Changed);
@@ -491,10 +529,8 @@ pub fn apply_editor_command(
     }
 
     candidate.revision = before.definition.revision.saturating_add(1);
-    if draft.undo.len() == EDITOR_UNDO_LIMIT {
-        draft.undo.pop_front();
-    }
-    draft.undo.push_back(before);
+    push_history_entry(&mut draft.undo, before);
+    draft.redo.clear();
     draft.definition = candidate;
     draft.invalidated_source_ids = invalidated;
     if target_rebind {
@@ -504,6 +540,13 @@ pub fn apply_editor_command(
     }
     draft.status = DraftStatus::NeedsValidation;
     Ok(EditOutcome::Changed)
+}
+
+fn push_history_entry(history: &mut VecDeque<UndoEntry>, entry: UndoEntry) {
+    if history.len() == EDITOR_UNDO_LIMIT {
+        history.pop_front();
+    }
+    history.push_back(entry);
 }
 
 fn action_dependency_problems(
@@ -990,7 +1033,7 @@ fn apply_to_definition(
             rule.verification = None;
             invalidated.extend(source_ids_for_rule(&definition.blocks, &rule_id));
         }
-        EditorCommand::MarkValidated | EditorCommand::Undo => unreachable!(),
+        EditorCommand::MarkValidated | EditorCommand::Undo | EditorCommand::Redo => unreachable!(),
     }
     Ok(())
 }
@@ -3602,5 +3645,68 @@ mod tests {
             vec!["c", "a", "b"]
         );
         assert_eq!(draft.definition.revision, 5);
+    }
+
+    #[test]
+    fn undo_then_redo_restores_structure_with_a_new_revision() {
+        let mut draft = EditorDraft::new(def(vec![comment("first")]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+                block: comment("second"),
+            },
+        )
+        .unwrap();
+        let edited_revision = draft.definition.revision;
+        assert_eq!(draft.definition.blocks.len(), 2);
+
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        let undone_revision = draft.definition.revision;
+        assert_eq!(draft.definition.blocks.len(), 1);
+
+        apply_editor_command(&mut draft, EditorCommand::Redo).unwrap();
+        assert_eq!(draft.definition.blocks.len(), 2);
+        assert!(draft.definition.revision > undone_revision);
+        assert_ne!(draft.definition.revision, edited_revision);
+        assert_eq!(draft.status, DraftStatus::NeedsValidation);
+    }
+
+    #[test]
+    fn non_history_edit_after_undo_clears_redo() {
+        let mut draft = EditorDraft::new(def(vec![comment("first")]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+                block: comment("second"),
+            },
+        )
+        .unwrap();
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        assert_eq!(draft.redo_len(), 1);
+
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+                block: comment("replacement"),
+            },
+        )
+        .unwrap();
+        assert_eq!(draft.redo_len(), 0);
+        assert_eq!(
+            apply_editor_command(&mut draft, EditorCommand::Redo),
+            Err(EditorError::NothingToRedo)
+        );
     }
 }

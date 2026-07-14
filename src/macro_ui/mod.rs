@@ -5,7 +5,6 @@ mod library;
 mod monitor;
 #[cfg(test)]
 mod test_support;
-mod timeline;
 mod wizard;
 
 pub use editor::*;
@@ -23,12 +22,12 @@ use crate::engine::macro_engine::{
 };
 use crate::ui_theme::text;
 
+use canvas_model::{CanvasProjection, CanvasSelection, project_canvas};
 use monitor::{
     MonitorProjection, project_last_completion,
     project_last_completion_with_controller_projections, project_monitor,
     project_monitor_with_controller_projections,
 };
-use timeline::{TimelineRow, TimelineSelection, project_timeline};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EditorAuthoringRequestId(pub u64);
@@ -263,7 +262,7 @@ pub struct MacroPageState {
     pub image_package_reverification: Option<ImagePackageReverificationProgress>,
     intents: MacroIntentQueue,
     pub selected_block_id: Option<String>,
-    selected_timeline: Option<TimelineSelection>,
+    selected_canvas: Option<CanvasSelection>,
     pub pending_inspector_intent: Option<inspector::InspectorIntent>,
     pub editor_feedback: Option<String>,
     pending_conversion: Option<PendingConversion>,
@@ -297,7 +296,7 @@ impl Default for MacroPageState {
             image_package_reverification: None,
             intents: MacroIntentQueue::with_capacity(MacroIntentQueue::DEFAULT_CAPACITY),
             selected_block_id: None,
-            selected_timeline: None,
+            selected_canvas: None,
             pending_inspector_intent: None,
             editor_feedback: None,
             pending_conversion: None,
@@ -370,7 +369,7 @@ impl MacroPageState {
         self.draft = Some(EditorDraft::new(definition));
         self.set_selected_saved(saved);
         self.selected_block_id = None;
-        self.selected_timeline = None;
+        self.selected_canvas = None;
         self.editor_feedback = None;
     }
 
@@ -977,11 +976,15 @@ impl MacroPage {
         } else {
             state.library_rows.clone()
         };
-        let timeline_rows = state
+        let canvas = state
             .draft
             .as_ref()
-            .map(|definition| project_timeline(&definition.blocks))
-            .unwrap_or_default();
+            .map(|definition| project_canvas(definition))
+            .unwrap_or(CanvasProjection {
+                nodes: Vec::new(),
+                groups: Vec::new(),
+                edges: Vec::new(),
+            });
 
         ui.set_width(ui.available_width());
         ui.vertical(|ui| {
@@ -1000,18 +1003,12 @@ impl MacroPage {
                 ui.add_space(8.0);
             }
             if let Some(target) = status_strip(ui, state, &monitor, &problems) {
-                select_timeline(state, TimelineSelection::Identity(target));
+                select_canvas(state, CanvasSelection::Block(target));
             }
             ui.add_space(8.0);
-            if let Some(target) = workspace(
-                ui,
-                state,
-                &library_rows,
-                &timeline_rows,
-                &monitor,
-                &problems,
-            ) {
-                select_timeline(state, target);
+            if let Some(target) = workspace(ui, state, &library_rows, &canvas, &monitor, &problems)
+            {
+                select_canvas(state, target);
             }
         });
     }
@@ -1103,12 +1100,13 @@ fn last_completion_from_runtime_state(
     }
 }
 
-fn select_timeline(state: &mut MacroPageState, selection: TimelineSelection) {
+fn select_canvas(state: &mut MacroPageState, selection: CanvasSelection) {
     state.selected_block_id = match &selection {
-        TimelineSelection::Identity(id) => Some(id.clone()),
-        TimelineSelection::TimeoutBody { .. } => None,
+        CanvasSelection::Block(id) => Some(id.clone()),
+        CanvasSelection::Lane { lane_id, .. } => Some(lane_id.clone()),
+        CanvasSelection::TimeoutBody { .. } => None,
     };
-    state.selected_timeline = Some(selection);
+    state.selected_canvas = Some(selection);
 }
 
 fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAction) {
@@ -1132,7 +1130,7 @@ fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAc
             state.draft_session = Some(generated_session);
             state.clear_selected_saved();
             state.selected_block_id = selected.clone();
-            state.selected_timeline = selected.map(TimelineSelection::Identity);
+            state.selected_canvas = selected.map(CanvasSelection::Block);
             state.wizard = None;
             state.cancel_wizard_authoring();
             state.editor_feedback = Some(
@@ -1185,12 +1183,21 @@ fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAc
     }
 }
 
-fn current_timeline_selection(state: &MacroPageState) -> Option<TimelineSelection> {
-    match (&state.selected_block_id, &state.selected_timeline) {
-        (Some(id), _) => Some(TimelineSelection::Identity(id.clone())),
-        (None, Some(selection @ TimelineSelection::TimeoutBody { .. })) => Some(selection.clone()),
-        _ => None,
+fn current_canvas_selection(state: &MacroPageState) -> Option<CanvasSelection> {
+    if let Some(id) = &state.selected_block_id {
+        if let Some((group_id, _, _, _)) = state
+            .draft
+            .as_ref()
+            .and_then(|draft| locate_watch_lane(draft, id))
+        {
+            return Some(CanvasSelection::Lane {
+                group_id,
+                lane_id: id.clone(),
+            });
+        }
+        return Some(CanvasSelection::Block(id.clone()));
     }
+    state.selected_canvas.clone()
 }
 
 fn title(ui: &mut Ui) {
@@ -1290,7 +1297,7 @@ fn status_strip(
                     state.begin_draft_session();
                     state.draft = Some(EditorDraft::new(starter_macro_definition()));
                     state.selected_block_id = Some("observe-1".into());
-                    state.selected_timeline = Some(TimelineSelection::Identity("observe-1".into()));
+                    state.selected_canvas = Some(CanvasSelection::Block("observe-1".into()));
                     state.editor_feedback =
                         Some("Created an unsaved starter draft for editor authoring.".into());
                 }
@@ -1506,14 +1513,14 @@ fn workspace(
     ui: &mut Ui,
     state: &mut MacroPageState,
     library_rows: &[MacroLibraryRow],
-    timeline_rows: &[TimelineRow],
+    canvas: &CanvasProjection,
     monitor: &MonitorProjection,
     problems: &[ValidationProblem],
-) -> Option<TimelineSelection> {
+) -> Option<CanvasSelection> {
     let mut selection = None;
     let selected_owned = state.selected_block_id.clone();
     let selected = selected_owned.as_deref();
-    let selected_timeline = current_timeline_selection(state);
+    let selected_canvas = current_canvas_selection(state);
     let projection = state
         .draft
         .as_ref()
@@ -1531,13 +1538,13 @@ fn workspace(
                     state.enqueue_intent(intent);
                 }
             });
-            section(&mut columns[1], "EVENT TIMELINE", |ui| {
+            section(&mut columns[1], "CANONICAL CANVAS", |ui| {
                 editor_toolbar(ui, state);
-                selection = timeline::show(
+                selection = show_canvas_projection(
                     ui,
-                    timeline_rows,
+                    canvas,
                     monitor.active_block.as_deref(),
-                    selected_timeline.as_ref(),
+                    selected_canvas.as_ref(),
                 );
             });
             section(&mut columns[2], "INSPECTOR", |ui| {
@@ -1553,13 +1560,13 @@ fn workspace(
             }
         });
         ui.add_space(8.0);
-        section(ui, "EVENT TIMELINE", |ui| {
+        section(ui, "CANONICAL CANVAS", |ui| {
             editor_toolbar(ui, state);
-            selection = timeline::show(
+            selection = show_canvas_projection(
                 ui,
-                timeline_rows,
+                canvas,
                 monitor.active_block.as_deref(),
-                selected_timeline.as_ref(),
+                selected_canvas.as_ref(),
             );
         });
         ui.add_space(8.0);
@@ -1570,6 +1577,33 @@ fn workspace(
         });
     }
     selection
+}
+
+/// Transitional canvas surface for the pure projection. The later canvas renderer owns pan,
+/// zoom, and connector gestures; this surface intentionally exposes no independent graph state.
+fn show_canvas_projection(
+    ui: &mut Ui,
+    canvas: &CanvasProjection,
+    active_block: Option<&str>,
+    current_selection: Option<&CanvasSelection>,
+) -> Option<CanvasSelection> {
+    if canvas.nodes.is_empty() {
+        ui.label("Create or select a macro to inspect its canonical blocks.");
+        return None;
+    }
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        for node in &canvas.nodes {
+            let selected = current_selection == Some(&node.selection)
+                || active_block.is_some_and(|id| id == node.id);
+            let response =
+                ui.selectable_label(selected, format!("{}: {}", node.title, node.summary));
+            if response.clicked() {
+                clicked = Some(node.selection.clone());
+            }
+        }
+    });
+    clicked
 }
 
 fn dispatch_editor_command(
@@ -1724,7 +1758,7 @@ fn inspector_editor_command(
 fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
     let editable = state.editor_mutations_allowed();
     let selected = state.selected_block_id.clone();
-    let selected_timeline = current_timeline_selection(state);
+    let selected_canvas = current_canvas_selection(state);
     if let Some(feedback) = &state.editor_feedback {
         ui.label(
             RichText::new(feedback)
@@ -1782,7 +1816,7 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                     .as_ref()
                     .ok_or_else(|| "No draft is open.".to_string())
                     .and_then(|draft| {
-                        palette_command_for_selection(draft, selected_timeline.as_ref(), kind)
+                        palette_command_for_selection(draft, selected_canvas.as_ref(), kind)
                     });
                 match command {
                     Ok(command) => {
@@ -2775,13 +2809,13 @@ fn palette_command(
     selected_id: Option<&str>,
     kind: PaletteKind,
 ) -> Result<EditorCommand, String> {
-    let selection = selected_id.map(|id| TimelineSelection::Identity(id.to_string()));
+    let selection = selected_id.map(|id| CanvasSelection::Block(id.to_string()));
     palette_command_for_selection(draft, selection.as_ref(), kind)
 }
 
 fn palette_command_for_selection(
     draft: &EditorDraft,
-    selected: Option<&TimelineSelection>,
+    selected: Option<&CanvasSelection>,
     kind: PaletteKind,
 ) -> Result<EditorCommand, String> {
     use crate::engine::macro_engine::{
@@ -2791,8 +2825,9 @@ fn palette_command_for_selection(
 
     let target = insertion_target(draft, selected);
     let selected_id = selected.and_then(|selection| match selection {
-        TimelineSelection::Identity(id) => Some(id.as_str()),
-        TimelineSelection::TimeoutBody { .. } => None,
+        CanvasSelection::Block(id) => Some(id.as_str()),
+        CanvasSelection::Lane { lane_id, .. } => Some(lane_id.as_str()),
+        CanvasSelection::TimeoutBody { .. } => None,
     });
     let id = next_unique_id(
         draft,
@@ -2901,14 +2936,14 @@ fn palette_command_for_selection(
     })
 }
 
-fn insertion_target(draft: &EditorDraft, selected: Option<&TimelineSelection>) -> InsertionTarget {
+fn insertion_target(draft: &EditorDraft, selected: Option<&CanvasSelection>) -> InsertionTarget {
     let Some(selected) = selected else {
         return InsertionTarget {
             container: ContainerPath::Root,
             index: draft.blocks.len(),
         };
     };
-    if let TimelineSelection::TimeoutBody { owner_id } = selected {
+    if let CanvasSelection::TimeoutBody { owner_id } = selected {
         let container = ContainerPath::TimeoutBody {
             owner_id: owner_id.clone(),
         };
@@ -2916,20 +2951,20 @@ fn insertion_target(draft: &EditorDraft, selected: Option<&TimelineSelection>) -
             return InsertionTarget { container, index };
         }
     }
-    let TimelineSelection::Identity(selected_id) = selected else {
+    if let CanvasSelection::Lane { group_id, lane_id } = selected {
+        let container = ContainerPath::WatchLaneBody {
+            watch_id: group_id.clone(),
+            lane_id: lane_id.clone(),
+        };
+        let index = container_len(draft, &container).unwrap_or(0);
+        return InsertionTarget { container, index };
+    }
+    let CanvasSelection::Block(selected_id) = selected else {
         return InsertionTarget {
             container: ContainerPath::Root,
             index: draft.blocks.len(),
         };
     };
-    if let Some((watch_id, _, _, _)) = locate_watch_lane(draft, selected_id) {
-        let container = ContainerPath::WatchLaneBody {
-            watch_id,
-            lane_id: selected_id.into(),
-        };
-        let index = container_len(draft, &container).unwrap_or(0);
-        return InsertionTarget { container, index };
-    }
     let Some(path) = locate_block_path(draft, selected_id) else {
         return InsertionTarget {
             container: ContainerPath::Root,
@@ -3340,7 +3375,7 @@ mod tests {
             timeout_ms: Limit::Finite(100),
             timeout_outcome: TimeoutOutcome::RunBody { body: vec![] },
         };
-        let timeout = TimelineSelection::TimeoutBody {
+        let timeout = CanvasSelection::TimeoutBody {
             owner_id: "observe-1".into(),
         };
         let EditorCommand::InsertBlock { target, .. } =

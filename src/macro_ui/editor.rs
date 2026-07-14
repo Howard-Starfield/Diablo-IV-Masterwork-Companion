@@ -458,6 +458,7 @@ pub fn apply_editor_command(
             return Ok(EditOutcome::NoChange);
         }
         draft.invalidated_source_ids.clear();
+        draft.redo.clear();
         draft.status = DraftStatus::Ready;
         return Ok(EditOutcome::Validated);
     }
@@ -3703,6 +3704,34 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(draft.redo_len(), 0);
+        assert_eq!(
+            apply_editor_command(&mut draft, EditorCommand::Redo),
+            Err(EditorError::NothingToRedo)
+        );
+    }
+
+    #[test]
+    fn successful_validation_after_undo_clears_redo() {
+        let mut draft = EditorDraft::new(def(vec![comment("first")]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+                block: comment("second"),
+            },
+        )
+        .unwrap();
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        assert_eq!(draft.redo_len(), 1);
+
+        assert_eq!(
+            apply_editor_command(&mut draft, EditorCommand::MarkValidated),
+            Ok(EditOutcome::Validated)
+        );
         assert_eq!(draft.redo_len(), 0);
         assert_eq!(
             apply_editor_command(&mut draft, EditorCommand::Redo),

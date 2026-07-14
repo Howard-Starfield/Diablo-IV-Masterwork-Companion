@@ -36,6 +36,8 @@ pub struct CanvasGroup {
     pub id: CanvasGroupId,
     pub label: &'static str,
     pub member_ids: Vec<String>,
+    pub selection: Option<CanvasSelection>,
+    pub lane_priority: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -92,8 +94,13 @@ pub enum OutputPort {
     IfThen(String),
     IfElse(String),
     LoopBody(String),
-    WatchLane { group_id: String, lane_id: String },
+    WatchLane {
+        group_id: String,
+        lane_id: String,
+    },
     TimeoutBody(String),
+    /// A generated visual port for the return edge; never an editable insertion target.
+    LoopReturn(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +208,7 @@ pub fn insertion_target_for_port(
             },
             has_timeout_body,
         ),
+        OutputPort::LoopReturn(_) => Err(CanvasConnectionError::InvalidPort),
     }
 }
 
@@ -266,7 +274,8 @@ fn port_owner_id(port: &OutputPort) -> &str {
         | OutputPort::IfThen(id)
         | OutputPort::IfElse(id)
         | OutputPort::LoopBody(id)
-        | OutputPort::TimeoutBody(id) => id,
+        | OutputPort::TimeoutBody(id)
+        | OutputPort::LoopReturn(id) => id,
         OutputPort::WatchLane { group_id, .. } => group_id,
     }
 }
@@ -369,7 +378,7 @@ fn append_owned_containers(
             append_condition_timeout(block, condition, parent_groups, projection);
         }
         BlockKind::WatchGroup { group } => {
-            for lane in &group.lanes {
+            for (index, lane) in group.lanes.iter().enumerate() {
                 let group_id = CanvasGroupId {
                     owner_id: format!("{}:{}", block.id, lane.id),
                     kind: CanvasGroupKind::WatchLaneThen,
@@ -385,6 +394,11 @@ fn append_owned_containers(
                         lane_id: lane.id.clone(),
                     },
                     CanvasEdgeKind::WatchLane,
+                    Some(CanvasSelection::Lane {
+                        group_id: block.id.clone(),
+                        lane_id: lane.id.clone(),
+                    }),
+                    Some(index + 1),
                 );
             }
             if let TimeoutOutcome::RunBody { body } = &group.timeout_outcome {
@@ -426,13 +440,11 @@ fn append_loop_group(
         projection,
         OutputPort::LoopBody(block.id.clone()),
         CanvasEdgeKind::Sequence,
+        None,
+        None,
     );
-    let from = body
-        .last()
-        .map(|last| OutputPort::Next(last.id.clone()))
-        .unwrap_or_else(|| OutputPort::LoopBody(block.id.clone()));
     projection.edges.push(CanvasEdge {
-        from,
+        from: OutputPort::LoopReturn(block.id.clone()),
         to: block.id.clone(),
         kind: CanvasEdgeKind::LoopReturn,
         editable: false,
@@ -481,6 +493,16 @@ fn append_group(
         projection,
         output,
         edge_kind,
+        match kind {
+            CanvasGroupKind::TimeoutBody => Some(CanvasSelection::TimeoutBody {
+                owner_id: owner.id.clone(),
+            }),
+            CanvasGroupKind::IfThen
+            | CanvasGroupKind::IfElse
+            | CanvasGroupKind::LoopBody
+            | CanvasGroupKind::WatchLaneThen => None,
+        },
+        None,
     );
 }
 
@@ -493,11 +515,15 @@ fn append_group_with_id(
     projection: &mut CanvasProjection,
     output: OutputPort,
     edge_kind: CanvasEdgeKind,
+    selection: Option<CanvasSelection>,
+    lane_priority: Option<usize>,
 ) {
     projection.groups.push(CanvasGroup {
         id: id.clone(),
         label,
         member_ids: body.iter().map(|block| block.id.clone()).collect(),
+        selection,
+        lane_priority,
     });
     if let Some(first) = body.first() {
         projection.edges.push(CanvasEdge {
@@ -517,18 +543,27 @@ fn output_ports(block: &Block) -> Vec<OutputPort> {
         BlockKind::If { .. } => vec![
             OutputPort::IfThen(block.id.clone()),
             OutputPort::IfElse(block.id.clone()),
+            OutputPort::Next(block.id.clone()),
         ],
         BlockKind::RepeatN { .. }
         | BlockKind::RepeatUntil { .. }
-        | BlockKind::Continuous { .. } => vec![OutputPort::LoopBody(block.id.clone())],
-        BlockKind::WatchGroup { group } => group
-            .lanes
-            .iter()
-            .map(|lane| OutputPort::WatchLane {
-                group_id: block.id.clone(),
-                lane_id: lane.id.clone(),
-            })
-            .collect(),
+        | BlockKind::Continuous { .. } => vec![
+            OutputPort::LoopBody(block.id.clone()),
+            OutputPort::Next(block.id.clone()),
+            OutputPort::LoopReturn(block.id.clone()),
+        ],
+        BlockKind::WatchGroup { group } => {
+            let mut ports = group
+                .lanes
+                .iter()
+                .map(|lane| OutputPort::WatchLane {
+                    group_id: block.id.clone(),
+                    lane_id: lane.id.clone(),
+                })
+                .collect::<Vec<_>>();
+            ports.push(OutputPort::Next(block.id.clone()));
+            ports
+        }
         BlockKind::StopSuccess | BlockKind::StopError { .. } => Vec::new(),
         BlockKind::Observe { .. }
         | BlockKind::Action { .. }
@@ -763,7 +798,211 @@ mod tests {
             vec![
                 OutputPort::IfThen("if-1".into()),
                 OutputPort::IfElse("if-1".into()),
+                OutputPort::Next("if-1".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn control_blocks_keep_structural_continuations_and_loop_return_port() {
+        use crate::engine::macro_engine::{
+            Block, BlockKind, Limit, PassiveCondition, WatchGroup, WatchLane,
+        };
+
+        let mut definition = fixture_continuous_with_observe_and_action();
+        definition.blocks.push(Block {
+            id: "after-loop".into(),
+            enabled: true,
+            kind: BlockKind::Comment {
+                text: "after".into(),
+            },
+        });
+        definition.blocks.push(Block {
+            id: "watch".into(),
+            enabled: true,
+            kind: BlockKind::WatchGroup {
+                group: WatchGroup {
+                    lanes: vec![WatchLane {
+                        id: "lane-1".into(),
+                        enabled: true,
+                        condition: PassiveCondition::Text {
+                            source_block_id: "observe".into(),
+                            rule_id: "rule".into(),
+                        },
+                        then_body: vec![],
+                    }],
+                    timeout_ms: Limit::Unlimited,
+                    timeout_outcome: TimeoutOutcome::Continue,
+                    cooldown_ms: 1,
+                },
+            },
+        });
+        definition.blocks.push(Block {
+            id: "after-watch".into(),
+            enabled: true,
+            kind: BlockKind::Comment {
+                text: "after".into(),
+            },
+        });
+
+        let graph = project_canvas(&definition);
+        let loop_node = graph.node("loop").unwrap();
+        assert!(loop_node.outputs.contains(&OutputPort::Next("loop".into())));
+        assert!(
+            loop_node
+                .outputs
+                .contains(&OutputPort::LoopReturn("loop".into()))
+        );
+        assert!(
+            graph
+                .node("watch")
+                .unwrap()
+                .outputs
+                .contains(&OutputPort::Next("watch".into()))
+        );
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == OutputPort::Next("loop".into())
+                && edge.to == "after-loop"
+                && edge.kind == CanvasEdgeKind::Sequence
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == OutputPort::Next("watch".into())
+                && edge.to == "after-watch"
+                && edge.kind == CanvasEdgeKind::Sequence
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == OutputPort::LoopReturn("loop".into())
+                && edge.to == "loop"
+                && edge.kind == CanvasEdgeKind::LoopReturn
+                && !edge.editable
+        }));
+    }
+
+    #[test]
+    fn if_next_port_derives_the_following_sibling_edge() {
+        use crate::engine::macro_engine::{Block, BlockKind};
+
+        let mut definition = fixture_if();
+        definition.blocks.push(Block {
+            id: "after-if".into(),
+            enabled: true,
+            kind: BlockKind::Comment {
+                text: "after".into(),
+            },
+        });
+        let graph = project_canvas(&definition);
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == OutputPort::Next("if-1".into())
+                && edge.to == "after-if"
+                && edge.kind == CanvasEdgeKind::Sequence
+                && edge.editable
+        }));
+    }
+
+    #[test]
+    fn watch_lane_groups_preserve_vector_priority_and_typed_selection() {
+        use crate::engine::macro_engine::{
+            Block, BlockKind, Limit, PassiveCondition, WatchGroup, WatchLane,
+        };
+
+        let lane = |id: &str| WatchLane {
+            id: id.into(),
+            enabled: true,
+            condition: PassiveCondition::Text {
+                source_block_id: "observe".into(),
+                rule_id: "rule".into(),
+            },
+            then_body: vec![],
+        };
+        let mut definition = fixture_if();
+        definition.blocks = vec![Block {
+            id: "watch".into(),
+            enabled: true,
+            kind: BlockKind::WatchGroup {
+                group: WatchGroup {
+                    lanes: vec![lane("first"), lane("second"), lane("third")],
+                    timeout_ms: Limit::Unlimited,
+                    timeout_outcome: TimeoutOutcome::Continue,
+                    cooldown_ms: 1,
+                },
+            },
+        }];
+
+        let graph = project_canvas(&definition);
+        let lanes = graph
+            .groups
+            .iter()
+            .filter(|group| group.id.kind == CanvasGroupKind::WatchLaneThen)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lanes
+                .iter()
+                .map(|group| group.lane_priority)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(
+            lanes[1].selection,
+            Some(CanvasSelection::Lane {
+                group_id: "watch".into(),
+                lane_id: "second".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn timeout_bodies_project_as_owned_typed_groups_without_id_collisions() {
+        use crate::engine::macro_engine::{Block, BlockKind, Condition, Limit, ObserveMode};
+
+        let timeout_condition = |owner: &str, child: &str| Condition::Text {
+            source_block_id: owner.into(),
+            rule_id: "rule".into(),
+            mode: ObserveMode::WaitForTrue {
+                timeout_ms: Limit::Finite(100),
+                timeout_outcome: TimeoutOutcome::RunBody {
+                    body: vec![Block {
+                        id: child.into(),
+                        enabled: true,
+                        kind: BlockKind::Comment {
+                            text: "fallback".into(),
+                        },
+                    }],
+                },
+            },
+        };
+        let mut definition = fixture_if();
+        definition.blocks = vec![
+            Block {
+                id: "owner".into(),
+                enabled: true,
+                kind: BlockKind::Observe {
+                    condition: timeout_condition("owner", "timeout-child"),
+                },
+            },
+            Block {
+                id: "owner-timeout".into(),
+                enabled: true,
+                kind: BlockKind::Comment {
+                    text: "real block".into(),
+                },
+            },
+        ];
+
+        let graph = project_canvas(&definition);
+        assert!(graph.groups.iter().any(|group| group.selection
+            == Some(CanvasSelection::TimeoutBody {
+                owner_id: "owner".into(),
+            })));
+        assert_eq!(
+            graph.node("timeout-child").unwrap().groups,
+            vec![CanvasGroupId {
+                owner_id: "owner".into(),
+                kind: CanvasGroupKind::TimeoutBody,
+            }]
+        );
+        assert_eq!(
+            graph.node("owner-timeout").unwrap().selection,
+            CanvasSelection::Block("owner-timeout".into())
         );
     }
 

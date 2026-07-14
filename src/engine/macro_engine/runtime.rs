@@ -830,11 +830,20 @@ pub enum InputDispatchOutcome {
     Committed(CommittedInputOutcome),
 }
 
+/// Runtime-owned fence that permits exactly one synchronous input boundary while the runtime is
+/// neither paused nor stopped. Live adapters must route every `SendInput` call through it.
+pub(crate) trait LiveInputGate: Send + Sync {
+    fn dispatch_if_permitted(
+        &self,
+        dispatch: &mut dyn FnMut() -> InputDispatchOutcome,
+    ) -> InputDispatchOutcome;
+}
+
 /// Granular live-input boundary used only by `ActionCommitter`.
 ///
 /// `MacroRuntime` deliberately does not own this trait in v1's observation-only modes, so merely
 /// constructing the runtime cannot inject input.
-pub trait LiveActionInput: Send + Sync {
+pub(crate) trait LiveActionInput: Send + Sync {
     fn reset_manual_baseline(&self) -> Result<()>;
     fn manual_takeover_detected(&self) -> Result<bool>;
     /// Performs final stop/takeover checks, commits the attempt, and immediately issues the
@@ -845,6 +854,7 @@ pub trait LiveActionInput: Send + Sync {
         button: MouseButton,
         movement: Option<&MouseMovementProfile>,
         stop: &dyn StopSource,
+        input_gate: &dyn LiveInputGate,
         commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
         validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
     ) -> InputDispatchOutcome;
@@ -1513,16 +1523,15 @@ impl ActionCommitter {
             Ok(())
         };
 
-        let dispatch = self.session.control.dispatch_while_input_permitted(|| {
-            self.session.input.dispatch_action(
-                authorization.destination,
-                authorization.button,
-                request.movement.as_ref(),
-                stop,
-                &mut commit_boundary,
-                &mut validate_after_movement,
-            )
-        });
+        let dispatch = self.session.input.dispatch_action(
+            authorization.destination,
+            authorization.button,
+            request.movement.as_ref(),
+            stop,
+            &self.session.control,
+            &mut commit_boundary,
+            &mut validate_after_movement,
+        );
         drop(commit_boundary);
         match (committed.get(), dispatch) {
             (false, InputDispatchOutcome::PreCommitBlocked(block_reason)) => {
@@ -2736,7 +2745,7 @@ impl RuntimeControlHandle {
 
     fn dispatch_while_input_permitted(
         &self,
-        dispatch: impl FnOnce() -> InputDispatchOutcome,
+        dispatch: &mut dyn FnMut() -> InputDispatchOutcome,
     ) -> InputDispatchOutcome {
         let _input_gate = self.input_gate.lock().expect("runtime input gate poisoned");
         if !self.input_gate_open() {
@@ -2762,6 +2771,15 @@ impl RuntimeControlHandle {
             .lock()
             .expect("runtime control poisoned")
             .paused
+    }
+}
+
+impl LiveInputGate for RuntimeControlHandle {
+    fn dispatch_if_permitted(
+        &self,
+        dispatch: &mut dyn FnMut() -> InputDispatchOutcome,
+    ) -> InputDispatchOutcome {
+        self.dispatch_while_input_permitted(dispatch)
     }
 }
 
@@ -2845,7 +2863,7 @@ impl MacroRuntime {
         }
     }
 
-    pub fn with_live_input(
+    pub(crate) fn with_live_input(
         mut self,
         target: Arc<dyn TargetGuard + Send + Sync>,
         input: Arc<dyn LiveActionInput>,
@@ -6246,20 +6264,26 @@ mod tests {
             _button: MouseButton,
             _movement: Option<&MouseMovementProfile>,
             _stop: &dyn StopSource,
+            input_gate: &dyn LiveInputGate,
             commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
             validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
         ) -> InputDispatchOutcome {
-            if let Err(reason) = commit() {
-                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit {
-                    reason,
-                });
-            }
-            if let Err(reason) = validate_after_movement() {
-                return InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
-                    failure: InputDispatchFailure::Validation { reason },
-                });
-            }
-            InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+            let mut dispatch = || {
+                if let Err(reason) = commit() {
+                    return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit {
+                        reason,
+                    });
+                }
+                if let Err(reason) = validate_after_movement() {
+                    return InputDispatchOutcome::Committed(
+                        CommittedInputOutcome::UncertainDispatch {
+                            failure: InputDispatchFailure::Validation { reason },
+                        },
+                    );
+                }
+                InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+            };
+            input_gate.dispatch_if_permitted(&mut dispatch)
         }
     }
 
@@ -6280,6 +6304,39 @@ mod tests {
         sends: AtomicU64,
     }
 
+    struct ReentrantPauseInput {
+        control: RuntimeControlHandle,
+        sends: AtomicU64,
+    }
+
+    impl LiveActionInput for ReentrantPauseInput {
+        fn reset_manual_baseline(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn manual_takeover_detected(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn dispatch_action(
+            &self,
+            _point: Point,
+            _button: MouseButton,
+            _movement: Option<&MouseMovementProfile>,
+            _stop: &dyn StopSource,
+            input_gate: &dyn LiveInputGate,
+            _commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+            _validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+        ) -> InputDispatchOutcome {
+            self.control.pause();
+            let mut send = || {
+                self.sends.fetch_add(1, Ordering::AcqRel);
+                InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+            };
+            input_gate.dispatch_if_permitted(&mut send)
+        }
+    }
+
     impl LiveActionInput for PauseFenceInput {
         fn reset_manual_baseline(&self) -> Result<()> {
             Ok(())
@@ -6295,27 +6352,33 @@ mod tests {
             _button: MouseButton,
             _movement: Option<&MouseMovementProfile>,
             _stop: &dyn StopSource,
+            input_gate: &dyn LiveInputGate,
             commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
             validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
         ) -> InputDispatchOutcome {
-            if let Err(reason) = commit() {
-                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit {
-                    reason,
-                });
-            }
-            self.committed.send(()).expect("test must receive commit");
-            self.allow_first_input
-                .lock()
-                .expect("test input gate poisoned")
-                .recv()
-                .expect("test must allow the first input");
-            self.sends.fetch_add(1, Ordering::AcqRel);
-            if let Err(reason) = validate_after_movement() {
-                return InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
-                    failure: InputDispatchFailure::Validation { reason },
-                });
-            }
-            InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+            let mut dispatch = || {
+                if let Err(reason) = commit() {
+                    return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit {
+                        reason,
+                    });
+                }
+                self.committed.send(()).expect("test must receive commit");
+                self.allow_first_input
+                    .lock()
+                    .expect("test input gate poisoned")
+                    .recv()
+                    .expect("test must allow the first input");
+                self.sends.fetch_add(1, Ordering::AcqRel);
+                if let Err(reason) = validate_after_movement() {
+                    return InputDispatchOutcome::Committed(
+                        CommittedInputOutcome::UncertainDispatch {
+                            failure: InputDispatchFailure::Validation { reason },
+                        },
+                    );
+                }
+                InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+            };
+            input_gate.dispatch_if_permitted(&mut dispatch)
         }
     }
 
@@ -6334,17 +6397,21 @@ mod tests {
             _button: MouseButton,
             _movement: Option<&MouseMovementProfile>,
             _stop: &dyn StopSource,
+            input_gate: &dyn LiveInputGate,
             commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
             validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
         ) -> InputDispatchOutcome {
-            commit().unwrap();
-            assert_eq!(
-                self.observed.lock().unwrap().last(),
-                Some(&ActionState::Committed),
-                "Committed must be observed before the first input boundary returns"
-            );
-            validate_after_movement().unwrap();
-            InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+            let mut dispatch = || {
+                commit().unwrap();
+                assert_eq!(
+                    self.observed.lock().unwrap().last(),
+                    Some(&ActionState::Committed),
+                    "Committed must be observed before the first input boundary returns"
+                );
+                validate_after_movement().unwrap();
+                InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+            };
+            input_gate.dispatch_if_permitted(&mut dispatch)
         }
     }
 
@@ -6363,25 +6430,31 @@ mod tests {
             button: MouseButton,
             _movement: Option<&MouseMovementProfile>,
             stop: &dyn StopSource,
+            input_gate: &dyn LiveInputGate,
             commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
             validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
         ) -> InputDispatchOutcome {
-            if stop.is_stopped() {
-                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped);
-            }
-            if let Err(reason) = commit() {
-                return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit {
-                    reason,
-                });
-            }
-            self.dispatches.fetch_add(1, Ordering::AcqRel);
-            self.destinations.lock().unwrap().push((point, button));
-            if let Err(reason) = validate_after_movement() {
-                return InputDispatchOutcome::Committed(CommittedInputOutcome::UncertainDispatch {
-                    failure: InputDispatchFailure::Validation { reason },
-                });
-            }
-            InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+            let mut dispatch = || {
+                if stop.is_stopped() {
+                    return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped);
+                }
+                if let Err(reason) = commit() {
+                    return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit {
+                        reason,
+                    });
+                }
+                self.dispatches.fetch_add(1, Ordering::AcqRel);
+                self.destinations.lock().unwrap().push((point, button));
+                if let Err(reason) = validate_after_movement() {
+                    return InputDispatchOutcome::Committed(
+                        CommittedInputOutcome::UncertainDispatch {
+                            failure: InputDispatchFailure::Validation { reason },
+                        },
+                    );
+                }
+                InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
+            };
+            input_gate.dispatch_if_permitted(&mut dispatch)
         }
     }
 
@@ -7211,6 +7284,80 @@ mod tests {
             .expect("pause must return after the in-flight input exits its fence");
         pause_thread.join().unwrap();
         assert_eq!(input.sends.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn live_input_reentrant_pause_completes_without_post_pause_input() {
+        let runtime = fixture_runtime();
+        let control = runtime.control_handle();
+        let input = Arc::new(ReentrantPauseInput {
+            control: control.clone(),
+            sends: AtomicU64::new(0),
+        });
+        let target = live_target();
+        let session = LiveActionSession::new_for_runtime(
+            Arc::new(StableLiveTarget(target.clone())),
+            input.clone(),
+            control,
+        );
+        let resume = session.resume().unwrap();
+        let compiled = CompiledMacro::compile(fixture_click_macro()).unwrap();
+        let action = Action::ClickPoint {
+            point_id: "point".to_string(),
+            button: MouseButton::Left,
+        };
+        let authorization = compiled
+            .authorize_action(
+                "reentrant-pause-run",
+                1,
+                1,
+                "click",
+                &action,
+                None,
+                &resume,
+                Point::new(960, 540),
+                1,
+            )
+            .unwrap();
+        let committer = ActionCommitter::new(
+            session,
+            Arc::new(FrozenClock),
+            "reentrant-pause-run",
+            Limit::Finite(1),
+            4,
+        )
+        .unwrap();
+        let prepared = committer
+            .prepare(ActionPrepareRequest::new(
+                authorization,
+                None,
+                1,
+                TakeoverPolicy::Pause,
+                resume,
+            ))
+            .unwrap();
+        let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            outcome_tx
+                .send(committer.commit(
+                    prepared,
+                    &NeverStop,
+                    CommitContext::new("reentrant-pause-run", 1, None),
+                ))
+                .unwrap();
+        });
+
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("reentrant pause must not deadlock the live input callback");
+        assert!(matches!(
+            outcome,
+            ActionOutcome::Blocked {
+                reason: BlockReason::Paused,
+                ..
+            }
+        ));
+        assert_eq!(input.sends.load(Ordering::Acquire), 0);
     }
 
     #[test]

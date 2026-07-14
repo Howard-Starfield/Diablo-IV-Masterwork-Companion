@@ -573,12 +573,16 @@ fn scale_stability(monitor: &MonitorProjection) -> Option<String> {
 }
 
 fn action_state(monitor: &MonitorProjection) -> Option<String> {
-    monitor
-        .action_state
-        .map(|state| match &monitor.action_block_id {
+    monitor.action_state.map(|state| {
+        let mut summary = match &monitor.action_block_id {
             Some(block_id) => format!("{state:?} · {block_id}"),
             None => format!("{state:?}"),
-        })
+        };
+        if let Some(attempt_id) = &monitor.action_attempt_id {
+            summary.push_str(&format!(" · {attempt_id:?}"));
+        }
+        summary
+    })
 }
 
 fn status_color(status: RunStatus) -> Color32 {
@@ -790,6 +794,22 @@ mod tests {
             })
         );
         assert_eq!(monitor.elapsed_ms, 30);
+    }
+
+    #[test]
+    fn action_summary_includes_a_blocked_attempt_identifier() {
+        let monitor = MonitorProjection {
+            action_state: Some(ActionState::Blocked),
+            action_block_id: Some("repeat-click".to_string()),
+            action_attempt_id: Some(ActionAttemptId::for_test("run-1", 2)),
+            ..MonitorProjection::default()
+        };
+
+        assert!(
+            action_state(&monitor)
+                .expect("blocked action must render a summary")
+                .contains("ActionAttemptId")
+        );
     }
 
     #[test]

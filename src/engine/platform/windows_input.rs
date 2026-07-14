@@ -25,7 +25,7 @@ use crate::engine::{
     config::MouseMovementProfile,
     macro_engine::{
         BlockReason, CommittedInputOutcome, InputDispatchFailure, InputDispatchOutcome,
-        LiveActionInput, PreCommitInputBlock, SendInputFailure,
+        LiveActionInput, LiveInputGate, PreCommitInputBlock, SendInputFailure,
     },
     types::Point,
 };
@@ -115,6 +115,7 @@ impl WindowsInputSink {
         button: MouseButton,
         movement: Option<&MouseMovementProfile>,
         stop: &dyn StopSource,
+        input_gate: &dyn LiveInputGate,
         commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
         validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
     ) -> InputDispatchOutcome {
@@ -148,12 +149,13 @@ impl WindowsInputSink {
             marked_mouse_input(up, self.marker),
         ];
         let mut manual_takeover = || self.monitor.manual_takeover_detected();
-        dispatch_planned_action(
+        dispatch_planned_action_gated(
             api,
             &movement_inputs,
             segment_delay,
             &click_inputs,
             stop,
+            Some(input_gate),
             &mut manual_takeover,
             commit,
             validate_after_movement,
@@ -176,6 +178,7 @@ impl LiveActionInput for WindowsInputSink {
         button: MouseButton,
         movement: Option<&MouseMovementProfile>,
         stop: &dyn StopSource,
+        input_gate: &dyn LiveInputGate,
         commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
         validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
     ) -> InputDispatchOutcome {
@@ -185,6 +188,7 @@ impl LiveActionInput for WindowsInputSink {
             button,
             movement,
             stop,
+            input_gate,
             commit,
             validate_after_movement,
         )
@@ -273,12 +277,37 @@ fn marked_move_input_for_screen(
     input
 }
 
+#[cfg(test)]
 fn dispatch_planned_action(
     api: &dyn SendInputApi,
     movement_inputs: &[INPUT],
     segment_delay: Duration,
     click_inputs: &[INPUT],
     stop: &dyn StopSource,
+    manual_takeover: &mut dyn FnMut() -> Result<bool>,
+    commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+    validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+) -> InputDispatchOutcome {
+    dispatch_planned_action_gated(
+        api,
+        movement_inputs,
+        segment_delay,
+        click_inputs,
+        stop,
+        None,
+        manual_takeover,
+        commit,
+        validate_after_movement,
+    )
+}
+
+fn dispatch_planned_action_gated(
+    api: &dyn SendInputApi,
+    movement_inputs: &[INPUT],
+    segment_delay: Duration,
+    click_inputs: &[INPUT],
+    stop: &dyn StopSource,
+    input_gate: Option<&dyn LiveInputGate>,
     manual_takeover: &mut dyn FnMut() -> Result<bool>,
     commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
     validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
@@ -301,12 +330,18 @@ fn dispatch_planned_action(
     if stop.is_stopped() {
         return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Stopped);
     }
-    if let Err(reason) = commit() {
-        return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit { reason });
-    }
-
-    if let Err(failure) = dispatch_inputs(api, first_movement) {
-        return uncertain(InputDispatchFailure::SendInput(failure));
+    let mut commit_and_first_input = || {
+        if let Err(reason) = commit() {
+            return InputDispatchOutcome::PreCommitBlocked(PreCommitInputBlock::Commit { reason });
+        }
+        match dispatch_inputs(api, first_movement) {
+            Ok(()) => InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched),
+            Err(failure) => uncertain(InputDispatchFailure::SendInput(failure)),
+        }
+    };
+    match dispatch_with_gate(input_gate, &mut commit_and_first_input) {
+        InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched) => {}
+        outcome => return outcome,
     }
     for input in &movement_inputs[1..] {
         if !segment_delay.is_zero() {
@@ -324,8 +359,13 @@ fn dispatch_planned_action(
                 });
             }
         }
-        if let Err(failure) = dispatch_inputs(api, std::slice::from_ref(input)) {
-            return uncertain(InputDispatchFailure::SendInput(failure));
+        let mut next_movement_input = || match dispatch_inputs(api, std::slice::from_ref(input)) {
+            Ok(()) => InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched),
+            Err(failure) => uncertain(InputDispatchFailure::SendInput(failure)),
+        };
+        match dispatch_with_gate(input_gate, &mut next_movement_input) {
+            InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched) => {}
+            outcome => return outcome,
         }
     }
     if stop.is_stopped() {
@@ -355,8 +395,12 @@ fn dispatch_planned_action(
             });
         }
     }
-    match dispatch_inputs(api, click_inputs) {
-        Ok(()) => {
+    let mut click_input = || match dispatch_inputs(api, click_inputs) {
+        Ok(()) => InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched),
+        Err(failure) => uncertain(InputDispatchFailure::SendInput(failure)),
+    };
+    match dispatch_with_gate(input_gate, &mut click_input) {
+        InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched) => {
             if stop.is_stopped() {
                 return uncertain(InputDispatchFailure::Stopped);
             }
@@ -374,7 +418,17 @@ fn dispatch_planned_action(
             }
             InputDispatchOutcome::Committed(CommittedInputOutcome::Dispatched)
         }
-        Err(failure) => uncertain(InputDispatchFailure::SendInput(failure)),
+        outcome => outcome,
+    }
+}
+
+fn dispatch_with_gate(
+    input_gate: Option<&dyn LiveInputGate>,
+    dispatch: &mut dyn FnMut() -> InputDispatchOutcome,
+) -> InputDispatchOutcome {
+    match input_gate {
+        Some(gate) => gate.dispatch_if_permitted(dispatch),
+        None => dispatch(),
     }
 }
 
@@ -475,7 +529,7 @@ mod tests {
             ActionAttemptId, ActionAuthorization, ActionCommitter, ActionCommitterCreateError,
             ActionOutcome, ActionPrepareRequest, ActionState, BlockReason, CommitContext,
             CommittedInputOutcome, InputDispatchFailure, InputDispatchOutcome, Limit,
-            LiveActionInput, LiveActionSession, MovementOutcome, ObservationToken,
+            LiveActionInput, LiveActionSession, LiveInputGate, MovementOutcome, ObservationToken,
             PreCommitInputBlock, ResumeAuthorization, SendInputFailure, TakeoverPolicy,
         },
         types::{Point, Rect},
@@ -581,6 +635,7 @@ mod tests {
             _button: MouseButton,
             _movement: Option<&crate::engine::config::MouseMovementProfile>,
             stop: &dyn StopSource,
+            _input_gate: &dyn LiveInputGate,
             commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
             validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
         ) -> InputDispatchOutcome {

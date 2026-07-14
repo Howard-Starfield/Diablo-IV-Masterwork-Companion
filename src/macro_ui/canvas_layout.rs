@@ -6,6 +6,7 @@ use crate::macro_ui::canvas_model::{CanvasEdgeKind, CanvasNode, CanvasProjection
 use crate::ui_state::MacroCanvasLayout;
 
 pub const MIN_ZOOM: f32 = 0.5;
+pub const MIN_FIT_ZOOM: f32 = 0.001;
 pub const MAX_ZOOM: f32 = 1.75;
 pub const NODE_WIDTH: f32 = 280.0;
 pub const NODE_HEIGHT: f32 = 88.0;
@@ -353,7 +354,7 @@ fn sane_size(size: [f32; 2]) -> [f32; 2] {
 
 fn valid_persisted_zoom(zoom: f32) -> f32 {
     if zoom.is_finite() && zoom > 0.0 {
-        zoom.min(MAX_ZOOM)
+        zoom.clamp(MIN_FIT_ZOOM, MAX_ZOOM)
     } else {
         1.0
     }
@@ -436,6 +437,25 @@ mod tests {
 
         assert!((viewport.zoom - before * 1.1).abs() < f32::EPSILON);
         assert!(viewport.zoom < MIN_ZOOM);
+    }
+
+    #[test]
+    fn repeated_zoom_out_from_a_fitted_scale_stops_at_the_safe_floor() {
+        let graph = project_canvas(&fixture_large_definition());
+        let layout = auto_arrange(&graph);
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let mut viewport = fit_view(
+            [canvas.width(), canvas.height()],
+            graph_bounds(&graph, &layout),
+        );
+
+        for _ in 0..64 {
+            viewport.zoom_around(canvas, canvas.center(), 0.5);
+        }
+
+        assert_eq!(viewport.zoom, MIN_FIT_ZOOM);
+        viewport.zoom_around(canvas, canvas.center(), 1.1);
+        assert!((viewport.zoom - MIN_FIT_ZOOM * 1.1).abs() < f32::EPSILON);
     }
 
     #[test]

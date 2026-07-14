@@ -18,6 +18,7 @@ use crate::engine::macro_engine::{
     ControllerLifecycleProjection, ControllerSemanticProjection, RunEvent, RunStatus,
     ValidationProblem,
 };
+use crate::ui_theme::text;
 
 use monitor::{
     MonitorProjection, project_last_completion,
@@ -1033,7 +1034,7 @@ fn image_package_reverification(ui: &mut Ui, state: &mut MacroPageState) {
             ui.label(
                 RichText::new("LOCAL IMAGE PACKAGE RE-VERIFICATION")
                     .strong()
-                    .size(11.0)
+                    .size(text::SUPPORTING)
                     .color(Color32::from_rgb(225, 174, 108)),
             );
             ui.label(
@@ -1043,12 +1044,12 @@ fn image_package_reverification(ui: &mut Ui, state: &mut MacroPageState) {
                     progress.rule_ids.len()
                 ))
                 .monospace()
-                .size(10.0)
+                .size(text::META)
                 .color(Color32::from_gray(180)),
             );
             ui.label(
                 RichText::new(progress.stage.instruction())
-                    .size(11.0)
+                    .size(text::SUPPORTING)
                     .color(Color32::from_gray(210)),
             );
             ui.horizontal(|ui| {
@@ -1201,7 +1202,7 @@ fn title(ui: &mut Ui) {
                     ui.label(
                         RichText::new("MACRO FORGE")
                             .monospace()
-                            .size(21.0)
+                            .size(text::PAGE_TITLE)
                             .strong()
                             .color(Color32::from_rgb(224, 119, 53)),
                     );
@@ -1209,7 +1210,7 @@ fn title(ui: &mut Ui) {
                         RichText::new(
                             "Observe, arbitrate, then act - one immutable revision at a time",
                         )
-                        .size(12.0)
+                        .size(text::SUPPORTING)
                         .color(Color32::from_gray(138)),
                     );
                 });
@@ -1217,7 +1218,7 @@ fn title(ui: &mut Ui) {
                     ui.label(
                         RichText::new("STRUCTURED EDITOR")
                             .monospace()
-                            .size(10.0)
+                            .size(text::META)
                             .strong()
                             .color(Color32::from_rgb(174, 142, 102)),
                     );
@@ -1468,13 +1469,13 @@ fn status_fact(ui: &mut Ui, label: &str, value: &str) {
         ui.label(
             RichText::new(label)
                 .monospace()
-                .size(9.0)
+                .size(text::META)
                 .strong()
                 .color(Color32::from_rgb(164, 127, 88)),
         );
         ui.label(
             RichText::new(value)
-                .size(11.0)
+                .size(text::SUPPORTING)
                 .color(Color32::from_gray(202)),
         );
     });
@@ -1724,7 +1725,7 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
     if let Some(feedback) = &state.editor_feedback {
         ui.label(
             RichText::new(feedback)
-                .size(10.0)
+                .size(text::SUPPORTING)
                 .color(Color32::from_rgb(196, 154, 106)),
         );
     }
@@ -1732,7 +1733,7 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!("Pending observation intent: {intent:?}"))
-                    .size(10.0)
+                    .size(text::SUPPORTING)
                     .color(Color32::from_gray(150)),
             );
             if ui.small_button("Clear").clicked() {
@@ -3130,7 +3131,7 @@ fn section(ui: &mut Ui, label: &str, contents: impl FnOnce(&mut Ui)) {
             ui.label(
                 RichText::new(label)
                     .monospace()
-                    .size(10.0)
+                    .size(text::SECTION_TITLE)
                     .strong()
                     .color(Color32::from_rgb(186, 143, 96)),
             );

@@ -19,6 +19,7 @@ use std::{
 
 mod engine;
 mod macro_ui;
+mod ui_theme;
 
 use crate::engine::{
     config::{EnchantConfig, MouseMovementProfile, default_mouse_movement_profile},
@@ -549,7 +550,7 @@ struct NativeApp {
 
 impl NativeApp {
     fn new(cc: &CreationContext<'_>) -> Self {
-        configure_style(&cc.egui_ctx);
+        ui_theme::apply(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         let config_path = config_path();
         let (config, migrated_config) = load_native_config(&config_path);
@@ -1898,7 +1899,11 @@ impl App for NativeApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(8.0);
-                    ui.label(RichText::new("BoBo Companion").strong().size(15.0));
+                    ui.label(
+                        RichText::new("BoBo Companion")
+                            .strong()
+                            .size(ui_theme::text::SECTION_TITLE),
+                    );
                     ui.separator();
                     if ui
                         .selectable_label(self.page == AppPage::Enchant, "Enchant")
@@ -1918,7 +1923,7 @@ impl App for NativeApp {
                         } else {
                             ui.label(
                                 RichText::new("Macro workspace")
-                                    .size(12.0)
+                                    .size(ui_theme::text::SUPPORTING)
                                     .color(Color32::from_rgb(194, 143, 94)),
                             );
                         }
@@ -2006,7 +2011,11 @@ impl NativeApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Occultist Affix Reroll").size(22.0).strong());
+                    ui.label(
+                        RichText::new("Occultist Affix Reroll")
+                            .size(ui_theme::text::PAGE_TITLE)
+                            .strong(),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new("Native Rust OCR").color(Color32::from_rgb(255, 145, 55)),
@@ -2036,7 +2045,11 @@ impl NativeApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Live OCR Result").strong().size(15.0));
+                    ui.label(
+                        RichText::new("Live OCR Result")
+                            .strong()
+                            .size(ui_theme::text::SECTION_TITLE),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(if matched { "MATCH" } else { "NO MATCH" })
@@ -2065,7 +2078,7 @@ impl NativeApp {
                         ui.vertical_centered(|ui| {
                             ui.label(
                                 RichText::new(raw_display)
-                                    .size(20.0)
+                                    .size(ui_theme::text::BODY)
                                     .strong()
                                     .color(Color32::from_rgb(255, 158, 58)),
                             );
@@ -2108,7 +2121,7 @@ impl NativeApp {
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(format!("Normalized: {}", result.result.normalized_text))
-                            .size(12.0)
+                            .size(ui_theme::text::META)
                             .color(Color32::from_gray(145)),
                     );
                     if result.capture_rect.width > 0 && result.capture_rect.height > 0 {
@@ -2117,7 +2130,7 @@ impl NativeApp {
                                 "Captured: {}",
                                 format_rect(Some(result.capture_rect))
                             ))
-                            .size(12.0)
+                            .size(ui_theme::text::META)
                             .color(Color32::from_gray(145)),
                         );
                     }
@@ -2128,7 +2141,7 @@ impl NativeApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("Target Affix")
-                            .size(15.0)
+                            .size(ui_theme::text::SECTION_TITLE)
                             .strong()
                             .color(Color32::from_gray(220)),
                     );
@@ -2300,7 +2313,7 @@ impl NativeApp {
                 RichText::new(
                     "Enchant -> OCR scan -> stop on match -> Replace Affix -> Close -> repeat",
                 )
-                .size(12.0)
+                .size(ui_theme::text::SUPPORTING)
                 .color(Color32::from_gray(150)),
             );
         });
@@ -2359,16 +2372,6 @@ impl NativeApp {
     }
 }
 
-fn configure_style(ctx: &Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(9, 11, 13);
-    visuals.window_fill = Color32::from_rgb(13, 16, 19);
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(24, 28, 32);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(34, 39, 44);
-    visuals.selection.bg_fill = Color32::from_rgb(244, 119, 32);
-    ctx.set_visuals(visuals);
-}
-
 fn panel(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
     Frame::none()
         .fill(Color32::from_rgb(17, 20, 23))
@@ -2377,7 +2380,11 @@ fn panel(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
         .inner_margin(egui::Margin::same(14.0))
         .show(ui, |ui| {
             ui.set_min_height(204.0);
-            ui.label(RichText::new(title).strong().size(15.0));
+            ui.label(
+                RichText::new(title)
+                    .strong()
+                    .size(ui_theme::text::SECTION_TITLE),
+            );
             ui.add_space(10.0);
             add_contents(ui);
         });
@@ -2395,7 +2402,7 @@ fn step_button(ui: &mut Ui, width: f32, step: &str, label: &str, complete: bool)
         Stroke::new(1.0, Color32::from_rgb(48, 55, 62))
     };
     let text = RichText::new(format!("{step}  {label}"))
-        .size(13.0)
+        .size(ui_theme::text::BODY)
         .strong()
         .color(if complete {
             Color32::from_rgb(205, 255, 218)
@@ -2411,12 +2418,20 @@ fn metric(ui: &mut Ui, label: &str, value: &str, color: Color32) {
         ui.add(
             egui::Label::new(
                 RichText::new(label)
-                    .size(12.0)
+                    .size(ui_theme::text::META)
                     .color(Color32::from_gray(145)),
             )
             .wrap(false),
         );
-        ui.add(egui::Label::new(RichText::new(value).size(14.0).strong().color(color)).wrap(false));
+        ui.add(
+            egui::Label::new(
+                RichText::new(value)
+                    .size(ui_theme::text::SUPPORTING)
+                    .strong()
+                    .color(color),
+            )
+            .wrap(false),
+        );
     });
 }
 
@@ -2440,7 +2455,7 @@ fn status_pill(ui: &mut Ui, status: BotState, label: &str) {
                 ui.painter().circle_filled(rect.center(), 4.0, color);
                 ui.label(
                     RichText::new(label)
-                        .size(12.0)
+                        .size(ui_theme::text::META)
                         .color(Color32::from_gray(210)),
                 );
             });

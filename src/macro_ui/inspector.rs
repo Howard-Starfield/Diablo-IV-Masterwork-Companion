@@ -5,6 +5,7 @@ use crate::engine::macro_engine::{
     ObserveMode, PassiveCondition, PreprocessProfile, TextMatchMode, TextRule, TimeoutOutcome,
     ValidationProblem,
 };
+use crate::ui_theme::text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InspectorIntent {
@@ -662,7 +663,7 @@ fn field(ui: &mut Ui, label: &str, value: &str) {
         ui.label(
             RichText::new(label)
                 .monospace()
-                .size(10.0)
+                .size(text::META)
                 .color(Color32::from_rgb(174, 142, 102)),
         );
         ui.label(value);
@@ -1062,7 +1063,7 @@ fn actions(
     });
     ui.label(
         RichText::new("Tests observe only; they never inject input.")
-            .size(10.0)
+            .size(text::SUPPORTING)
             .color(Color32::from_gray(112)),
     );
 }

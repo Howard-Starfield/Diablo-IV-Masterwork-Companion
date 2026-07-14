@@ -3,6 +3,7 @@ use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui};
 use crate::engine::macro_engine::{
     Action, Block, BlockKind, Condition, Limit, ObserveMode, PassiveCondition, TimeoutOutcome,
 };
+use crate::ui_theme::text;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineSelection {
@@ -296,7 +297,7 @@ pub fn show(
                 );
                 ui.label(
                     RichText::new("Create or select a macro to inspect its canonical blocks.")
-                        .size(12.0)
+                        .size(text::SUPPORTING)
                         .color(Color32::from_gray(132)),
                 );
             });
@@ -332,7 +333,7 @@ pub fn show(
                             ui.label(
                                 RichText::new(&row.label)
                                     .monospace()
-                                    .size(10.0)
+                                    .size(text::META)
                                     .strong()
                                     .color(if active {
                                         Color32::from_rgb(255, 172, 102)

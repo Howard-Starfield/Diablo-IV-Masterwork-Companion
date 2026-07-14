@@ -1,9 +1,10 @@
 use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui};
 
 use crate::engine::macro_engine::{MacroDefinition, RunStatus, ValidationProblem};
+use crate::ui_theme::text;
 
-use super::monitor::{MonitorProjection, StopOutcome};
 use super::MacroIntent;
+use super::monitor::{MonitorProjection, StopOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacroLibraryStatus {
@@ -106,7 +107,7 @@ pub fn show(
                 );
                 ui.label(
                     RichText::new("The guided creator arrives in the next phase.")
-                        .size(11.0)
+                        .size(text::SUPPORTING)
                         .color(Color32::from_gray(120)),
                 );
             });
@@ -149,24 +150,24 @@ pub fn show(
                     ui.label(
                         RichText::new(row.status.label())
                             .monospace()
-                            .size(10.0)
+                            .size(text::META)
                             .color(status_color(row.status)),
                     );
                     ui.label(
                         RichText::new(format!("REV {}", row.revision))
                             .monospace()
-                            .size(10.0)
+                            .size(text::META)
                             .color(Color32::from_gray(108)),
                     );
                 });
                 ui.label(
                     RichText::new(format!("{} · {} DPI", row.target, row.dpi))
-                        .size(11.0)
+                        .size(text::META)
                         .color(Color32::from_gray(135)),
                 );
                 ui.label(
                     RichText::new(format!("{} · {}", row.last_validation, row.last_run))
-                        .size(10.0)
+                        .size(text::META)
                         .color(Color32::from_gray(105)),
                 );
             });
@@ -189,7 +190,7 @@ fn status_color(status: MacroLibraryStatus) -> Color32 {
 #[cfg(test)]
 mod tests {
     use crate::engine::macro_engine::{
-        FocusLossPolicy, Limit, SafetyPolicy, StopReason, TargetProfile, MACRO_SCHEMA_VERSION,
+        FocusLossPolicy, Limit, MACRO_SCHEMA_VERSION, SafetyPolicy, StopReason, TargetProfile,
     };
 
     use super::*;

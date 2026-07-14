@@ -7,6 +7,7 @@ use crate::engine::macro_engine::{
     ControllerSemanticProjection, MacroDefinition, RunEvent, RunMode, RunStatus, SavedRevision,
     StopReason,
 };
+use crate::ui_theme::text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MonitorProjection {
@@ -549,7 +550,7 @@ pub fn show(ui: &mut Ui, monitor: &MonitorProjection) {
                     RichText::new("RUN MONITOR")
                         .monospace()
                         .strong()
-                        .size(11.0)
+                        .size(text::META)
                         .color(Color32::from_rgb(196, 147, 91)),
                 );
                 ui.label(
@@ -606,7 +607,7 @@ pub fn show(ui: &mut Ui, monitor: &MonitorProjection) {
                         .or_else(|| monitor.error.clone())
                         .unwrap_or_else(|| "No stop reason reported".to_string()),
                 )
-                .size(12.0)
+                .size(text::SUPPORTING)
                 .color(
                     if monitor.stop_outcome.is_some() || monitor.error.is_some() {
                         Color32::from_rgb(231, 137, 102)
@@ -622,12 +623,12 @@ fn monitor_cell(ui: &mut Ui, label: &str, value: Option<&str>) {
     ui.vertical(|ui| {
         ui.label(
             RichText::new(label)
-                .size(10.0)
+                .size(text::META)
                 .color(Color32::from_gray(112)),
         );
         ui.label(
             RichText::new(value.unwrap_or("--"))
-                .size(12.0)
+                .size(text::SUPPORTING)
                 .color(Color32::from_gray(205)),
         );
     });

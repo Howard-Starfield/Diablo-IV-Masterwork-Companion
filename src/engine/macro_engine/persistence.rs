@@ -1242,6 +1242,7 @@ impl MacroStore {
     pub fn duplicate_macro(
         &self,
         source_macro_id: &str,
+        expected_current_hash: &str,
         new_macro_id: &str,
         new_name: &str,
     ) -> Result<SavedRevision> {
@@ -1251,7 +1252,11 @@ impl MacroStore {
         if self.root.join("definitions").join(new_macro_id).exists() {
             bail!("macro ID already exists: {new_macro_id}");
         }
-        let mut definition = self.load_current_locked(source_macro_id)?.definition;
+        let current = self.load_current_locked(source_macro_id)?;
+        if current.definition_hash != expected_current_hash {
+            bail!("macro changed since it was loaded");
+        }
+        let mut definition = current.definition;
         definition.id = new_macro_id.to_string();
         definition.name = new_name.trim().to_string();
         definition.revision = 1;
@@ -1658,6 +1663,24 @@ impl MacroStore {
     pub fn export_current_package(&self, macro_id: &str, package_root: &Path) -> Result<()> {
         let _guard = lock_store(&self.lock)?;
         let saved = self.load_current_locked(macro_id)?;
+        self.export_package_locked(&saved, package_root)
+    }
+
+    /// Exports a saved identity only when it is still the current immutable revision.
+    pub fn export_current_package_checked(
+        &self,
+        macro_id: &str,
+        expected_revision: u64,
+        expected_current_hash: &str,
+        package_root: &Path,
+    ) -> Result<()> {
+        let _guard = lock_store(&self.lock)?;
+        let saved = self.load_current_locked(macro_id)?;
+        if saved.definition.revision != expected_revision
+            || saved.definition_hash != expected_current_hash
+        {
+            bail!("macro changed since it was loaded");
+        }
         self.export_package_locked(&saved, package_root)
     }
 
@@ -4942,7 +4965,12 @@ mod tests {
         let store = MacroStore::open(temp.path()).unwrap();
         let original = store.save_validated(compilable_text_definition()).unwrap();
         let duplicate = store
-            .duplicate_macro(&original.definition.id, "macro-copy", "Macro copy")
+            .duplicate_macro(
+                &original.definition.id,
+                &original.definition_hash,
+                "macro-copy",
+                "Macro copy",
+            )
             .unwrap();
         assert_eq!(duplicate.definition.id, "macro-copy");
         assert_eq!(duplicate.definition.revision, 1);
@@ -4971,6 +4999,31 @@ mod tests {
         store.delete_macro("macro-copy").unwrap();
         assert!(store.load_current("macro-copy").is_err());
         assert!(store.load_current("macro-one").is_ok());
+    }
+
+    #[test]
+    fn duplicate_rejects_a_source_hash_that_changed_after_enqueue() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let first = store.save_validated(compilable_text_definition()).unwrap();
+        let mut revised = first.definition.clone();
+        revised.name = "Revised macro".into();
+        revised.revision = 2;
+        store.save_validated(revised).unwrap();
+
+        assert!(
+            store
+                .duplicate_macro(
+                    &first.definition.id,
+                    &first.definition_hash,
+                    "macro-copy",
+                    "Macro copy",
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("changed since it was loaded")
+        );
+        assert!(store.load_current("macro-copy").is_err());
     }
 
     #[test]
@@ -5080,6 +5133,30 @@ mod tests {
                 .is_err()
         );
         assert!(!temp.path().join("rejected-export").exists());
+    }
+
+    #[test]
+    fn checked_export_rejects_a_revision_that_changed_after_enqueue() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MacroStore::open(temp.path()).unwrap();
+        let first = store.save_validated(compilable_text_definition()).unwrap();
+        let mut revised = first.definition.clone();
+        revised.name = "Revised macro".into();
+        revised.revision = 2;
+        store.save_validated(revised).unwrap();
+        let package = temp.path().join("stale-export");
+
+        assert!(
+            store
+                .export_current_package_checked(
+                    &first.definition.id,
+                    first.definition.revision,
+                    &first.definition_hash,
+                    &package,
+                )
+                .is_err()
+        );
+        assert!(!package.exists());
     }
 
     #[test]

@@ -160,6 +160,7 @@ pub enum MacroIntent {
         run_id: String,
     },
     Export {
+        saved: SavedMacroIdentity,
         package_root: String,
     },
     ImportPackage {
@@ -422,6 +423,15 @@ impl MacroPageState {
             MacroRunIntent::ContinuousLive => MacroIntent::RunLive { saved },
         };
         self.enqueue_intent(intent);
+    }
+
+    pub fn request_export(&mut self, package_root: String) {
+        if let Some(saved) = self.selected_saved.clone() {
+            self.enqueue_intent(MacroIntent::Export {
+                saved,
+                package_root,
+            });
+        }
     }
 
     pub fn clear_selected_saved(&mut self) {
@@ -2100,9 +2110,7 @@ fn library_pane(ui: &mut Ui, state: &mut MacroPageState, rows: &[MacroLibraryRow
                         )
                         .clicked()
                     {
-                        state.enqueue_intent(MacroIntent::Export {
-                            package_root: state.library_package_path.trim().to_owned(),
-                        });
+                        state.request_export(state.library_package_path.trim().to_owned());
                     }
                     ui.checkbox(&mut state.confirm_library_delete, "Confirm delete");
                     if ui
@@ -4132,6 +4140,32 @@ mod tests {
         state.set_selected_saved(second);
 
         assert_eq!(state.take_intent(), Some(MacroIntent::Run { saved: first }));
+    }
+
+    #[test]
+    fn export_request_keeps_the_saved_identity_captured_at_click_time() {
+        let first = SavedMacroIdentity {
+            macro_id: "first".into(),
+            revision: 1,
+            definition_hash: "first-hash".into(),
+        };
+        let second = SavedMacroIdentity {
+            macro_id: "second".into(),
+            revision: 2,
+            definition_hash: "second-hash".into(),
+        };
+        let mut state = MacroPageState::default();
+        state.set_selected_saved(first.clone());
+        state.request_export("C:/packages/first".into());
+        state.set_selected_saved(second);
+
+        assert_eq!(
+            state.take_intent(),
+            Some(MacroIntent::Export {
+                saved: first,
+                package_root: "C:/packages/first".into(),
+            })
+        );
     }
 
     #[test]

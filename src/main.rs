@@ -810,10 +810,11 @@ impl NativeApp {
                 Some("Saved revision changed; reload it before running.".into());
             return;
         }
-        let binding = self
-            .macro_authoring_targets
-            .values()
-            .find(|binding| binding_matches_target_profile(binding, &saved.definition.target));
+        let binding = active_draft_target_for_session(
+            self.macro_state.active_draft_session(),
+            &self.macro_authoring_targets,
+            |binding| binding_matches_target_profile(binding, &saved.definition.target),
+        );
         let Some(binding) = binding else {
             self.macro_state.editor_feedback =
                 Some("Capture the exact saved target before running this revision.".into());
@@ -1233,7 +1234,12 @@ impl NativeApp {
                     name,
                 } => {
                     if let Some(store) = self.macro_store.as_ref() {
-                        match store.duplicate_macro(&source.macro_id, &macro_id, &name) {
+                        match store.duplicate_macro(
+                            &source.macro_id,
+                            &source.definition_hash,
+                            &macro_id,
+                            &name,
+                        ) {
                             Ok(duplicated) => {
                                 if self.macro_state.selected_saved.as_ref() == Some(&source) {
                                     self.selected_saved_revision = Some(duplicated.clone());
@@ -1281,14 +1287,17 @@ impl NativeApp {
                         }
                     }
                 }
-                MacroIntent::Export { package_root } => {
-                    if let (Some(store), Some(saved)) = (
-                        self.macro_store.as_ref(),
-                        self.macro_state.selected_saved.as_ref(),
-                    ) {
-                        if let Err(error) = store
-                            .export_current_package(&saved.macro_id, &PathBuf::from(package_root))
-                        {
+                MacroIntent::Export {
+                    saved,
+                    package_root,
+                } => {
+                    if let Some(store) = self.macro_store.as_ref() {
+                        if let Err(error) = store.export_current_package_checked(
+                            &saved.macro_id,
+                            saved.revision,
+                            &saved.definition_hash,
+                            &PathBuf::from(package_root),
+                        ) {
                             self.macro_state.editor_feedback =
                                 Some(format!("Export failed: {error}"));
                         }
@@ -2731,6 +2740,14 @@ fn authoring_target_for_session<'a, T>(
     targets.get(&session).filter(|target| accepts(target))
 }
 
+fn active_draft_target_for_session<'a, T>(
+    active_draft_session: Option<AuthoringSessionId>,
+    targets: &'a HashMap<AuthoringSessionId, T>,
+    accepts: impl FnOnce(&T) -> bool,
+) -> Option<&'a T> {
+    active_draft_session.and_then(|session| authoring_target_for_session(targets, session, accepts))
+}
+
 fn editor_request_requires_bound_target(kind: &EditorAuthoringKind) -> bool {
     !matches!(kind, EditorAuthoringKind::CaptureTarget)
 }
@@ -3903,6 +3920,20 @@ mod routing_tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets.get(&draft_a), Some(&"draft-a"));
         assert!(!targets.contains_key(&wizard_b));
+    }
+
+    #[test]
+    fn active_draft_target_routing_never_falls_back_to_another_session() {
+        let draft = AuthoringSessionId(10);
+        let stale = AuthoringSessionId(20);
+        let targets = HashMap::from([(draft, "draft"), (stale, "stale")]);
+
+        assert_eq!(
+            active_draft_target_for_session(Some(draft), &targets, |_| true),
+            Some(&"draft")
+        );
+        assert!(active_draft_target_for_session(None, &targets, |_| true).is_none());
+        assert!(active_draft_target_for_session(Some(draft), &targets, |_| false).is_none());
     }
 
     #[test]

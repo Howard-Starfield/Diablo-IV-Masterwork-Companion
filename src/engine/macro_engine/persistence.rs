@@ -1,8 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows::Win32::{
+    Foundation::HANDLE,
+    Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,9 +22,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    AssetRef, CandidateCluster, ImageRuleVerification, ImageRuleVerificationArtifact,
-    ImageRuleVerificationInput, MACRO_SCHEMA_VERSION, MacroDefinition, NegativeCorpusSample,
-    NegativeSampleEvaluationInputs,
+    AssetRef, ClusterPolicy, ImageMatchConfig, ImageMatcher, ImageRuleVerification,
+    ImageRuleVerificationArtifact, ImageRuleVerificationInput, MACRO_SCHEMA_VERSION,
+    MacroDefinition, NegativeCorpusSample, NegativeSampleEvaluationInputs, RegionDefinition,
+    TargetProfile, cluster_peaks,
 };
 
 static STORE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
@@ -196,24 +207,56 @@ impl PendingImageImport {
     }
 }
 
-/// Native composition supplies freshly captured PNG bytes and current target
-/// evidence. The store derives the exact rule geometry from the pending plan,
-/// runs the existing verifier, and returns a private-field completion token.
+/// Native composition supplies a local capture set. The store binds the
+/// replacement target and region to the pending rule and derives every score,
+/// hash, cluster, and proof field from the supplied capture bytes.
 pub struct LocalImageRuleVerificationInput<'a> {
-    pub rule_id: &'a str,
-    pub template_png: &'a [u8],
-    pub mask_png: Option<&'a [u8]>,
-    pub current_dpi: u32,
-    pub negative_samples: &'a [LocalNegativeSample],
-    pub observed_clusters: &'a [CandidateCluster],
-    pub maximum_score_cells: u64,
+    rule_id: &'a str,
+    template_png: &'a [u8],
+    mask_png: Option<&'a [u8]>,
+    target: TargetProfile,
+    region: RegionDefinition,
+    target_region_png: &'a [u8],
+    negative_samples: &'a [LocalNegativeImageSample<'a>],
+    maximum_score_cells: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct LocalNegativeSample {
-    pub stable_id: String,
-    pub content_sha256: String,
-    pub measured_score: f32,
+pub struct LocalNegativeImageSample<'a> {
+    stable_id: String,
+    png: &'a [u8],
+}
+
+impl<'a> LocalImageRuleVerificationInput<'a> {
+    /// This construction boundary is crate-private so only the native capture
+    /// composition can supply fresh local evidence to the persistence layer.
+    pub(crate) fn from_local_capture(
+        rule_id: &'a str,
+        template_png: &'a [u8],
+        mask_png: Option<&'a [u8]>,
+        target: TargetProfile,
+        region: RegionDefinition,
+        target_region_png: &'a [u8],
+        negative_samples: &'a [LocalNegativeImageSample<'a>],
+        maximum_score_cells: u64,
+    ) -> Self {
+        Self {
+            rule_id,
+            template_png,
+            mask_png,
+            target,
+            region,
+            target_region_png,
+            negative_samples,
+            maximum_score_cells,
+        }
+    }
+}
+
+impl<'a> LocalNegativeImageSample<'a> {
+    pub(crate) fn from_local_capture(stable_id: String, png: &'a [u8]) -> Self {
+        Self { stable_id, png }
+    }
 }
 
 #[derive(Debug)]
@@ -222,6 +265,8 @@ pub struct LocalImageRuleReverification {
     plan_fingerprint: String,
     destination_state_fingerprint: String,
     rule_id: String,
+    target: TargetProfile,
+    region: RegionDefinition,
     template: PackageAsset,
     mask: Option<PackageAsset>,
     artifact: ImageRuleVerificationArtifact,
@@ -1514,15 +1559,10 @@ impl MacroStore {
     }
 
     pub fn validate_package(package_root: &Path) -> Result<MacroPackage> {
-        let root = package_root.canonicalize().with_context(|| {
-            format!("package folder does not exist: {}", package_root.display())
-        })?;
-        if !root.is_dir() {
-            bail!("package path is not a folder");
-        }
-        let manifest_path = package_file(&root, Path::new("manifest.json"))?;
-        let manifest: PackageManifest = serde_json::from_slice(&read_bounded_file(
-            &manifest_path,
+        let root = open_package_root(package_root)?;
+        let manifest: PackageManifest = serde_json::from_slice(&read_bounded_package_file(
+            &root,
+            Path::new("manifest.json"),
             MAX_PACKAGE_MANIFEST_BYTES,
             "package manifest",
         )?)
@@ -1541,9 +1581,9 @@ impl MacroStore {
             validate_package_relative(&asset.path)?;
         }
 
-        let definition_path = package_file(&root, &manifest.definition)?;
-        let definition: MacroDefinition = serde_json::from_slice(&read_bounded_file(
-            &definition_path,
+        let definition: MacroDefinition = serde_json::from_slice(&read_bounded_package_file(
+            &root,
+            &manifest.definition,
             MAX_PACKAGE_DEFINITION_BYTES,
             "package definition",
         )?)
@@ -1562,8 +1602,12 @@ impl MacroStore {
             if !manifest_refs.insert(entry.asset.clone()) {
                 bail!("duplicate asset entry in package manifest");
             }
-            let path = package_file(&root, &entry.path)?;
-            let bytes = read_bounded_file(&path, MAX_PACKAGE_ASSET_BYTES, "package asset")?;
+            let bytes = read_bounded_package_file(
+                &root,
+                &entry.path,
+                MAX_PACKAGE_ASSET_BYTES,
+                "package asset",
+            )?;
             total_asset_bytes = total_asset_bytes
                 .checked_add(bytes.len() as u64)
                 .context("package asset byte total overflow")?;
@@ -1778,6 +1822,28 @@ impl MacroStore {
             .iter()
             .position(|rule| rule.id == input.rule_id)
             .with_context(|| format!("pending image rule '{}' does not exist", input.rule_id))?;
+        if input.target.captured_client_width == 0
+            || input.target.captured_client_height == 0
+            || input.target.captured_dpi == 0
+        {
+            bail!("local target capture must provide non-zero client dimensions and DPI");
+        }
+        if input.region.id != definition.image_rules[rule_index].region_id {
+            bail!("local image recapture must confirm the rule's region identity");
+        }
+        if !input.region.rect.x.is_finite()
+            || !input.region.rect.y.is_finite()
+            || !input.region.rect.width.is_finite()
+            || !input.region.rect.height.is_finite()
+            || input.region.rect.x < 0.0
+            || input.region.rect.y < 0.0
+            || input.region.rect.width <= 0.0
+            || input.region.rect.height <= 0.0
+            || input.region.rect.x + input.region.rect.width > 1.0
+            || input.region.rect.y + input.region.rect.height > 1.0
+        {
+            bail!("local image recapture has an invalid region geometry");
+        }
         if definition.image_rules[rule_index]
             .transparent_mask
             .is_some()
@@ -1811,6 +1877,13 @@ impl MacroStore {
             })
             .transpose()?;
 
+        definition.target = input.target.clone();
+        let region = definition
+            .regions
+            .iter_mut()
+            .find(|region| region.id == input.region.id)
+            .context("pending image rule region is missing")?;
+        *region = input.region.clone();
         {
             let rule = &mut definition.image_rules[rule_index];
             rule.template = template.asset.clone();
@@ -1835,31 +1908,63 @@ impl MacroStore {
             .as_ref()
             .map(|asset| ImageRuleVerification::decode_mask_png(&asset.bytes))
             .transpose()?;
+        let target_region = super::image_verification::decode_search_png(input.target_region_png)?;
+        if target_region.dimensions() != (search.width, search.height) {
+            bail!("local target capture dimensions do not match the confirmed region");
+        }
+        let matcher = ImageMatcher;
+        let match_config = ImageMatchConfig {
+            threshold: rule.threshold,
+            scales_percent: rule.scales_percent.clone(),
+        };
+        let observed_clusters = cluster_peaks(
+            matcher
+                .match_template_masked(
+                    &target_region,
+                    &template_image,
+                    mask_image.as_ref(),
+                    &match_config,
+                )?
+                .candidates,
+            ClusterPolicy::default(),
+        )?;
         let negative_samples = input
             .negative_samples
             .iter()
-            .map(|sample| NegativeCorpusSample {
-                stable_id: sample.stable_id.clone(),
-                content_sha256: sample.content_sha256.clone(),
-                measured_score: sample.measured_score,
-                evaluation: NegativeSampleEvaluationInputs::for_rule(
-                    rule,
-                    definition.target.captured_dpi,
-                    region.revision,
-                    (search.width, search.height),
-                ),
+            .map(|sample| -> Result<NegativeCorpusSample> {
+                let negative = super::image_verification::decode_search_png(sample.png)?;
+                let measured_score = matcher
+                    .match_template_masked(
+                        &negative,
+                        &template_image,
+                        mask_image.as_ref(),
+                        &match_config,
+                    )?
+                    .best
+                    .score;
+                Ok(NegativeCorpusSample {
+                    stable_id: sample.stable_id.clone(),
+                    content_sha256: sha256_hex(sample.png),
+                    measured_score,
+                    evaluation: NegativeSampleEvaluationInputs::for_rule(
+                        rule,
+                        definition.target.captured_dpi,
+                        region.revision,
+                        (search.width, search.height),
+                    ),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let verification = ImageRuleVerification::verify(ImageRuleVerificationInput {
             rule,
             template: &template_image,
             mask: mask_image.as_ref(),
             captured_dpi: definition.target.captured_dpi,
-            current_dpi: input.current_dpi,
+            current_dpi: definition.target.captured_dpi,
             region_revision: region.revision,
             search_dimensions: (search.width, search.height),
             negative_samples: &negative_samples,
-            observed_clusters: input.observed_clusters,
+            observed_clusters: &observed_clusters,
             maximum_score_cells: input.maximum_score_cells,
         })
         .map_err(anyhow::Error::new)?;
@@ -1873,6 +1978,8 @@ impl MacroStore {
             plan_fingerprint: pending.plan_fingerprint.clone(),
             destination_state_fingerprint: pending.destination_state_fingerprint.clone(),
             rule_id: input.rule_id.to_string(),
+            target: definition.target,
+            region: region.clone(),
             template,
             mask,
             artifact,
@@ -1906,6 +2013,8 @@ impl MacroStore {
         }
         let mut definition = pending.definition.clone();
         let mut local_assets = Vec::new();
+        let mut local_target = None;
+        let mut local_regions = HashMap::new();
         for rule in &mut definition.image_rules {
             let completion = by_rule
                 .remove(&rule.id)
@@ -1918,6 +2027,20 @@ impl MacroStore {
             {
                 bail!("portable image asset identity cannot satisfy local re-verification");
             }
+            if let Some(target) = &local_target {
+                if target != &completion.target {
+                    bail!("local image re-verifications must share one captured target");
+                }
+            } else {
+                local_target = Some(completion.target.clone());
+            }
+            if let Some(existing) =
+                local_regions.insert(completion.region.id.clone(), completion.region.clone())
+            {
+                if existing != completion.region {
+                    bail!("local image re-verifications disagree on confirmed region geometry");
+                }
+            }
             rule.template = completion.template.asset.clone();
             rule.transparent_mask = completion.mask.as_ref().map(|mask| mask.asset.clone());
             rule.verification = Some(completion.artifact);
@@ -1928,6 +2051,15 @@ impl MacroStore {
         }
         if !by_rule.is_empty() {
             bail!("local image re-verification references an unexpected rule");
+        }
+        definition.target = local_target.context("missing local target recapture")?;
+        for region in &mut definition.regions {
+            if let Some(local) = local_regions.remove(&region.id) {
+                *region = local;
+            }
+        }
+        if !local_regions.is_empty() {
+            bail!("local image re-verification references an unexpected region");
         }
         validate_identity_set(local_assets.iter().map(|asset| &asset.asset))?;
         let mut installed = Vec::new();
@@ -2660,29 +2792,108 @@ fn shared_store_activity(root: &Path) -> Result<Arc<StoreActivity>> {
 
 fn package_file(root: &Path, relative: &Path) -> Result<PathBuf> {
     validate_package_relative(relative)?;
-    let joined = root.join(relative);
-    let canonical = joined
-        .canonicalize()
-        .with_context(|| format!("missing package file: {}", relative.display()))?;
-    if !canonical.starts_with(root) {
-        bail!("reference points outside package");
+    Ok(root.join(relative))
+}
+
+fn open_package_root(package_root: &Path) -> Result<PathBuf> {
+    let file = open_nofollow(package_root)
+        .with_context(|| format!("package folder does not exist: {}", package_root.display()))?;
+    let metadata = file
+        .metadata()
+        .context("could not inspect package folder handle")?;
+    reject_reparse_point(&metadata, "package folder")?;
+    if !metadata.is_dir() {
+        bail!("package path is not a folder");
+    }
+    let canonical = package_root.canonicalize()?;
+    if !canonical.is_dir() || !opened_file_matches_path(&file, &canonical)? {
+        bail!("package folder changed while opening");
     }
     Ok(canonical)
 }
 
-fn read_bounded_file(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>> {
-    let metadata = fs::metadata(path).with_context(|| format!("could not inspect {label}"))?;
+fn read_bounded_package_file(
+    root: &Path,
+    relative: &Path,
+    maximum: u64,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let path = package_file(root, relative)?;
+    let file = match open_nofollow(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            bail!("missing package file: {}", relative.display())
+        }
+        Err(error) => return Err(error).with_context(|| format!("could not open {label}")),
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("could not inspect {label} handle"))?;
+    reject_reparse_point(&metadata, label)?;
     if !metadata.is_file() {
         bail!("{label} is not a regular file");
     }
-    if metadata.len() > maximum {
-        bail!("{label} bytes {} exceed maximum {maximum}", metadata.len());
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("missing package file: {}", relative.display()))?;
+    if !canonical.starts_with(root) || !opened_file_matches_path(&file, &canonical)? {
+        bail!("{label} changed or escaped the package while opening");
     }
-    let bytes = fs::read(path).with_context(|| format!("could not read {label}"))?;
+    let mut bytes = Vec::new();
+    file.take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read {label}"))?;
     if u64::try_from(bytes.len()).context("bounded file length overflow")? > maximum {
-        bail!("{label} grew beyond maximum {maximum} while reading");
+        bail!("{label} bytes exceed maximum {maximum}");
     }
     Ok(bytes)
+}
+
+fn open_nofollow(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+fn reject_reparse_point(metadata: &fs::Metadata, label: &str) -> Result<()> {
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x0000_0400 != 0 {
+        bail!("{label} is a reparse point");
+    }
+    let _ = (metadata, label);
+    Ok(())
+}
+
+fn opened_file_matches_path(opened: &File, path: &Path) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        return Ok(file_identity(opened)? == file_identity(&open_nofollow(path)?)?);
+    }
+    #[cfg(not(windows))]
+    {
+        let current = fs::metadata(path)?;
+        let opened = opened.metadata()?;
+        Ok(opened.len() == current.len() && opened.is_file() == current.is_file())
+    }
+}
+
+#[cfg(windows)]
+fn file_identity(file: &File) -> Result<(u32, u32, u32)> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(HANDLE(file.as_raw_handle() as _), &mut information)?;
+    }
+    Ok((
+        information.dwVolumeSerialNumber,
+        information.nFileIndexHigh,
+        information.nFileIndexLow,
+    ))
 }
 
 fn validate_package_relative(relative: &Path) -> Result<()> {
@@ -2882,6 +3093,43 @@ mod tests {
             .write_to(&mut bytes, ImageFormat::Png)
             .unwrap();
         (image, bytes.into_inner())
+    }
+
+    fn fixture_capture_png(width: u32, height: u32, seed: u8) -> Vec<u8> {
+        let image = GrayImage::from_fn(width, height, |x, y| {
+            Luma([seed
+                .wrapping_add((x * 17) as u8)
+                .wrapping_sub((y * 29) as u8)])
+        });
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageLuma8(image)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    fn local_target() -> TargetProfile {
+        TargetProfile {
+            process_path: "local-game.exe".to_string(),
+            window_class: "local-game".to_string(),
+            title_contains: "Local Diablo".to_string(),
+            captured_client_width: 64,
+            captured_client_height: 48,
+            captured_dpi: 96,
+        }
+    }
+
+    fn local_region() -> RegionDefinition {
+        RegionDefinition {
+            id: "region-one".to_string(),
+            revision: 99,
+            rect: RectRatio {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        }
     }
 
     fn compilable_image_definition(
@@ -4792,11 +5040,15 @@ mod tests {
         };
         fs::remove_dir_all(package_path).unwrap();
         let (_local_template, local_bytes) = fixture_png(91);
-        let negatives = vec![LocalNegativeSample {
+        let target_region = fixture_capture_png(40, 48, 22);
+        let negative_capture = fixture_capture_png(64, 48, 200);
+        let mut local_target = local_target();
+        local_target.captured_client_width = 80;
+        let mut local_region = local_region();
+        local_region.rect.width = 0.5;
+        let negatives = vec![LocalNegativeImageSample {
             stable_id: "local-negative/a".to_string(),
-            content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_string(),
-            measured_score: 0.80,
+            png: &negative_capture,
         }];
         let completion = destination
             .complete_local_image_reverification(
@@ -4805,9 +5057,10 @@ mod tests {
                     rule_id: "image-one",
                     template_png: &local_bytes,
                     mask_png: None,
-                    current_dpi: 96,
+                    target: local_target,
+                    region: local_region,
+                    target_region_png: &target_region,
                     negative_samples: &negatives,
-                    observed_clusters: &[],
                     maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
                 },
             )
@@ -4822,6 +5075,114 @@ mod tests {
         assert_ne!(local, &portable_asset);
         assert_eq!(destination.assets().read(local).unwrap(), local_bytes);
         assert!(CompiledMacro::compile(saved).is_ok());
+    }
+
+    #[test]
+    fn image_package_import_replaces_portable_target_and_region_with_local_capture() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let (portable_template, portable_bytes) = fixture_png(7);
+        let portable_asset = source.assets().put_png(&portable_bytes).unwrap();
+        source
+            .save_validated(compilable_image_definition(
+                portable_asset,
+                &portable_template,
+                None,
+            ))
+            .unwrap();
+        let package_path = source_temp.path().join("image-package");
+        source
+            .export_current_package("macro-one", &package_path)
+            .unwrap();
+
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+        let pending = match destination.prepare_package_import(&package_path).unwrap() {
+            PreparedPackageImport::Image(pending) => pending,
+            PreparedPackageImport::Text(_) => panic!("image package was misclassified"),
+        };
+        let (_local_template, local_bytes) = fixture_png(91);
+        let target_region = fixture_capture_png(40, 48, 22);
+        let negative_capture = fixture_capture_png(64, 48, 200);
+        let mut local_target = local_target();
+        local_target.captured_client_width = 80;
+        let mut local_region = local_region();
+        local_region.rect.width = 0.5;
+        let negatives = vec![LocalNegativeImageSample {
+            stable_id: "local-negative/a".to_string(),
+            png: &negative_capture,
+        }];
+        let completion = destination
+            .complete_local_image_reverification(
+                &pending,
+                LocalImageRuleVerificationInput {
+                    rule_id: "image-one",
+                    template_png: &local_bytes,
+                    mask_png: None,
+                    target: local_target,
+                    region: local_region,
+                    target_region_png: &target_region,
+                    negative_samples: &negatives,
+                    maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+                },
+            )
+            .unwrap();
+        let saved = destination
+            .commit_image_package_import(pending, vec![completion])
+            .unwrap();
+
+        assert_eq!(saved.definition.target.process_path, "local-game.exe");
+        assert_eq!(saved.definition.target.captured_client_width, 80);
+        assert_eq!(saved.definition.regions[0].revision, 99);
+        assert_eq!(saved.definition.regions[0].rect.width, 0.5);
+    }
+
+    #[test]
+    fn image_reverification_rejects_caller_asserted_negative_score_without_local_image_evidence() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        let (portable_template, portable_bytes) = fixture_png(7);
+        let portable_asset = source.assets().put_png(&portable_bytes).unwrap();
+        source
+            .save_validated(compilable_image_definition(
+                portable_asset,
+                &portable_template,
+                None,
+            ))
+            .unwrap();
+        let package_path = source_temp.path().join("image-package");
+        source
+            .export_current_package("macro-one", &package_path)
+            .unwrap();
+        let destination_temp = tempfile::tempdir().unwrap();
+        let destination = MacroStore::open(destination_temp.path()).unwrap();
+        let pending = match destination.prepare_package_import(&package_path).unwrap() {
+            PreparedPackageImport::Image(pending) => pending,
+            PreparedPackageImport::Text(_) => panic!("image package was misclassified"),
+        };
+        let (_local_template, local_bytes) = fixture_png(91);
+        let target_region = fixture_capture_png(64, 48, 22);
+        let positive_as_negative = local_bytes.clone();
+        let asserted_negatives = vec![LocalNegativeImageSample::from_local_capture(
+            "caller-asserted".to_string(),
+            &positive_as_negative,
+        )];
+
+        let result = destination.complete_local_image_reverification(
+            &pending,
+            LocalImageRuleVerificationInput::from_local_capture(
+                "image-one",
+                &local_bytes,
+                None,
+                local_target(),
+                local_region(),
+                &target_region,
+                &asserted_negatives,
+                DEFAULT_MAX_SCORE_CELLS,
+            ),
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -4848,11 +5209,11 @@ mod tests {
             PreparedPackageImport::Text(_) => panic!("image package was misclassified"),
         };
         let (_local_template, local_bytes) = fixture_png(91);
-        let negatives = vec![LocalNegativeSample {
+        let target_region = fixture_capture_png(64, 48, 22);
+        let negative_capture = fixture_capture_png(64, 48, 200);
+        let negatives = vec![LocalNegativeImageSample {
             stable_id: "local-negative/a".to_string(),
-            content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_string(),
-            measured_score: 0.80,
+            png: &negative_capture,
         }];
         let completion = destination
             .complete_local_image_reverification(
@@ -4861,9 +5222,10 @@ mod tests {
                     rule_id: "image-one",
                     template_png: &local_bytes,
                     mask_png: None,
-                    current_dpi: 96,
+                    target: local_target(),
+                    region: local_region(),
+                    target_region_png: &target_region,
                     negative_samples: &negatives,
-                    observed_clusters: &[],
                     maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
                 },
             )
@@ -4912,11 +5274,11 @@ mod tests {
             PreparedPackageImport::Text(_) => panic!("image package was misclassified"),
         };
         let (_local_template, local_bytes) = fixture_png(91);
-        let negatives = vec![LocalNegativeSample {
+        let target_region = fixture_capture_png(64, 48, 22);
+        let negative_capture = fixture_capture_png(64, 48, 200);
+        let negatives = vec![LocalNegativeImageSample {
             stable_id: "local-negative/a".to_string(),
-            content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_string(),
-            measured_score: 0.80,
+            png: &negative_capture,
         }];
         let completion = destination
             .complete_local_image_reverification(
@@ -4925,9 +5287,10 @@ mod tests {
                     rule_id: "image-one",
                     template_png: &local_bytes,
                     mask_png: None,
-                    current_dpi: 96,
+                    target: local_target(),
+                    region: local_region(),
+                    target_region_png: &target_region,
                     negative_samples: &negatives,
-                    observed_clusters: &[],
                     maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
                 },
             )
@@ -4982,6 +5345,28 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_rejects_reparse_point_even_when_its_target_stays_inside_package() {
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = MacroStore::open(source_temp.path()).unwrap();
+        source.save_validated(compilable_text_definition()).unwrap();
+        let package = source_temp.path().join("text-package");
+        source
+            .export_current_package("macro-one", &package)
+            .unwrap();
+        fs::rename(package.join("macro.json"), package.join("real-macro.json")).unwrap();
+        match std::os::windows::fs::symlink_file("real-macro.json", package.join("macro.json")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("could not create package reparse-point fixture: {error}"),
+        }
+
+        let error = MacroStore::validate_package(&package).unwrap_err();
+
+        assert!(error.to_string().contains("reparse"));
     }
 
     #[test]

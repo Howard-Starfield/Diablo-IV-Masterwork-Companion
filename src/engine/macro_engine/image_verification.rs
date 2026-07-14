@@ -11,8 +11,9 @@ use super::{
     AssetRef, IMAGE_RULE_VERIFICATION_VERSION, ImageRule, ImageRuleVerificationArtifact,
     ImageVerificationPreprocess, MacroDefinition,
     image_match::{
-        ImageResourceKind, ImageWorkPolicy, MIN_TEMPLATE_VARIANCE, template_variance,
-        validate_mask_reference, validated_scale_plan,
+        DEFAULT_MAX_SEARCH_BYTES, ImageResourceKind, ImageWorkPolicy, MIN_TEMPLATE_VARIANCE,
+        template_variance, validate_mask_reference, validate_search_dimensions,
+        validated_scale_plan,
     },
 };
 
@@ -81,14 +82,28 @@ pub(crate) fn decode_mask_png(bytes: &[u8]) -> Result<GrayImage> {
     }
 }
 
+/// Decodes a locally captured search image under the same bounded PNG policy
+/// used by live image matching.
+pub(crate) fn decode_search_png(bytes: &[u8]) -> Result<GrayImage> {
+    decode_bounded_png(bytes, ImageResourceKind::Search)
+        .context("local image capture cannot be decoded")
+        .map(|image| image.into_luma8())
+}
+
 fn decode_bounded_png(bytes: &[u8], resource: ImageResourceKind) -> Result<DynamicImage> {
     let (dimensions, decoded_bytes_per_pixel) = png_header_work(bytes, resource)?;
     let policy = ImageWorkPolicy::production();
-    policy.validate_asset_dimensions(dimensions, decoded_bytes_per_pixel, resource)?;
+    match resource {
+        ImageResourceKind::Search => validate_search_dimensions(dimensions, policy)?,
+        _ => policy.validate_asset_dimensions(dimensions, decoded_bytes_per_pixel, resource)?,
+    }
     let mut limits = Limits::default();
     limits.max_image_width = Some(dimensions.0);
     limits.max_image_height = Some(dimensions.1);
-    limits.max_alloc = policy.maximum_asset_bytes(resource);
+    limits.max_alloc = match resource {
+        ImageResourceKind::Search => Some(DEFAULT_MAX_SEARCH_BYTES),
+        _ => policy.maximum_asset_bytes(resource),
+    };
     let decoder = PngDecoder::with_limits(Cursor::new(bytes), limits)
         .map_err(|error| anyhow::anyhow!("image {resource:?} header cannot be decoded: {error}"))?;
     if decoder.dimensions() != dimensions {

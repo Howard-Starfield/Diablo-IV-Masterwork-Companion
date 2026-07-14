@@ -123,12 +123,74 @@ pub enum MacroIntent {
     DeleteHistory { run_id: String },
     Export { package_root: String },
     ImportPackage { package_root: String },
+    ContinueImagePackageReverification,
+    CancelImagePackageReverification,
     CleanupOrphans,
 }
 
 impl MacroIntent {
     fn is_stop(&self) -> bool {
         matches!(self, Self::Stop)
+    }
+}
+
+/// UI-only view of an image-package import. It deliberately carries no portable
+/// target, region, asset, or verification data: the composition root owns the
+/// pending package transaction and may advance it only with local capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImagePackageReverificationStage {
+    CaptureTarget,
+    CaptureRegion,
+    CaptureTemplate,
+    CaptureNegative,
+}
+
+impl ImagePackageReverificationStage {
+    pub fn instruction(self) -> &'static str {
+        match self {
+            Self::CaptureTarget => "Capture the local target window.",
+            Self::CaptureRegion => "Recapture this rule's local image search region.",
+            Self::CaptureTemplate => "Crop a fresh local template for this rule.",
+            Self::CaptureNegative => {
+                "Show a known-negative local frame, then capture its image evidence."
+            }
+        }
+    }
+
+    pub fn action_label(self) -> &'static str {
+        match self {
+            Self::CaptureTarget => "Capture local target",
+            Self::CaptureRegion => "Recapture local region",
+            Self::CaptureTemplate => "Capture local template",
+            Self::CaptureNegative => "Capture negative evidence",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePackageReverificationProgress {
+    pub rule_ids: Vec<String>,
+    pub active_rule_index: usize,
+    pub stage: ImagePackageReverificationStage,
+}
+
+impl ImagePackageReverificationProgress {
+    pub fn new(rule_ids: Vec<String>) -> Self {
+        assert!(
+            !rule_ids.is_empty(),
+            "image package re-verification requires at least one rule"
+        );
+        Self {
+            rule_ids,
+            active_rule_index: 0,
+            stage: ImagePackageReverificationStage::CaptureTarget,
+        }
+    }
+
+    pub fn active_rule_id(&self) -> Option<&str> {
+        self.rule_ids
+            .get(self.active_rule_index)
+            .map(String::as_str)
     }
 }
 
@@ -194,6 +256,7 @@ pub struct MacroPageState {
     pub controller_lifecycle: Option<ControllerLifecycleProjection>,
     pub controller_semantic: Option<ControllerSemanticProjection>,
     pub library_rows: Vec<MacroLibraryRow>,
+    pub image_package_reverification: Option<ImagePackageReverificationProgress>,
     intents: MacroIntentQueue,
     pub selected_block_id: Option<String>,
     selected_timeline: Option<TimelineSelection>,
@@ -227,6 +290,7 @@ impl Default for MacroPageState {
             controller_lifecycle: None,
             controller_semantic: None,
             library_rows: Vec::new(),
+            image_package_reverification: None,
             intents: MacroIntentQueue::with_capacity(MacroIntentQueue::DEFAULT_CAPACITY),
             selected_block_id: None,
             selected_timeline: None,
@@ -268,6 +332,25 @@ impl MacroPageState {
 
     pub fn enqueue_intent(&mut self, intent: MacroIntent) {
         self.intents.push(intent);
+    }
+
+    pub fn begin_image_package_reverification(&mut self, rule_ids: Vec<String>) {
+        self.image_package_reverification = Some(ImagePackageReverificationProgress::new(rule_ids));
+    }
+
+    pub fn set_image_package_reverification_stage(
+        &mut self,
+        active_rule_index: usize,
+        stage: ImagePackageReverificationStage,
+    ) {
+        if let Some(progress) = self.image_package_reverification.as_mut() {
+            progress.active_rule_index = active_rule_index;
+            progress.stage = stage;
+        }
+    }
+
+    pub fn clear_image_package_reverification(&mut self) {
+        self.image_package_reverification = None;
     }
 
     pub fn take_intent(&mut self) -> Option<MacroIntent> {
@@ -900,6 +983,7 @@ impl MacroPage {
         ui.vertical(|ui| {
             title(ui);
             ui.add_space(8.0);
+            image_package_reverification(ui, state);
             let wizard_pending = state.active_wizard_request.is_some();
             let wizard_action = state
                 .wizard
@@ -933,6 +1017,50 @@ impl MacroPage {
         let monitor = monitor_from_runtime_state(state, selected_macro_id);
         monitor::show(ui, &monitor);
     }
+}
+
+fn image_package_reverification(ui: &mut Ui, state: &mut MacroPageState) {
+    let Some(progress) = state.image_package_reverification.clone() else {
+        return;
+    };
+    let rule = progress.active_rule_id().unwrap_or("local image rule");
+    Frame::none()
+        .fill(Color32::from_rgb(35, 27, 19))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(174, 91, 43)))
+        .rounding(6.0)
+        .inner_margin(egui::Margin::same(10.0))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new("LOCAL IMAGE PACKAGE RE-VERIFICATION")
+                    .strong()
+                    .size(11.0)
+                    .color(Color32::from_rgb(225, 174, 108)),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Rule {}/{}: {rule}",
+                    progress.active_rule_index + 1,
+                    progress.rule_ids.len()
+                ))
+                .monospace()
+                .size(10.0)
+                .color(Color32::from_gray(180)),
+            );
+            ui.label(
+                RichText::new(progress.stage.instruction())
+                    .size(11.0)
+                    .color(Color32::from_gray(210)),
+            );
+            ui.horizontal(|ui| {
+                if ui.button(progress.stage.action_label()).clicked() {
+                    state.enqueue_intent(MacroIntent::ContinueImagePackageReverification);
+                }
+                if ui.button("Cancel import").clicked() {
+                    state.enqueue_intent(MacroIntent::CancelImagePackageReverification);
+                }
+            });
+        });
+    ui.add_space(8.0);
 }
 
 fn monitor_from_runtime_state(
@@ -4568,5 +4696,21 @@ mod tests {
         assert_eq!(validation_summary(&state, &[]), "Needs revalidation");
         state.draft.as_mut().unwrap().status = DraftStatus::Ready;
         assert_eq!(validation_summary(&state, &[]), "Valid");
+    }
+
+    #[test]
+    fn image_package_import_is_ui_progress_only_and_cancel_discards_it() {
+        let mut state = MacroPageState::default();
+        state.begin_image_package_reverification(vec!["image-a".into(), "image-b".into()]);
+
+        let progress = state.image_package_reverification.as_ref().unwrap();
+        assert_eq!(progress.active_rule_id(), Some("image-a"));
+        assert_eq!(
+            progress.stage,
+            ImagePackageReverificationStage::CaptureTarget
+        );
+
+        state.clear_image_package_reverification();
+        assert!(state.image_package_reverification.is_none());
     }
 }

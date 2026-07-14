@@ -26,9 +26,11 @@ use crate::engine::{
     macro_engine::{
         AssetRef, AssetStore, ClusterPolicy, ControllerRunRequest, DEFAULT_MAX_SCORE_CELLS,
         ImageMatchCandidate, ImageMatchConfig, ImageMatchResult, ImageMatcher, ImageRule,
-        ImageRuleVerification, ImageRuleVerificationInput, MacroController, MacroStore,
-        NegativeCorpusSample, NegativeSampleEvaluationInputs, PreparedPackageImport, RunEvent,
-        RunMode, SavedRevision, TargetProfile, authoring_test_text_rule, cluster_peaks,
+        ImageRuleVerification, ImageRuleVerificationInput, LocalImageRuleReverification,
+        LocalImageRuleVerificationInput, LocalNegativeImageSample, MacroController, MacroStore,
+        NegativeCorpusSample, NegativeSampleEvaluationInputs, PendingImageImport,
+        PreparedPackageImport, RegionDefinition, RunEvent, RunMode, SavedRevision, TargetProfile,
+        authoring_test_text_rule, cluster_peaks,
     },
     matcher::{MatchResult, match_affix},
     platform::{
@@ -43,9 +45,9 @@ use crate::engine::{
 };
 use crate::macro_ui::{
     AuthoringSessionId, EditorAuthoringKind, EditorAuthoringOutcome, EditorAuthoringRequest,
-    EditorAuthoringResult, EditorDraft, MacroIntent, MacroPage, MacroPageState,
-    RunDefinitionSnapshot, SavedMacroIdentity, WizardAuthoringKind, WizardAuthoringOutcome,
-    WizardAuthoringRequest, WizardAuthoringResult, WizardDetector,
+    EditorAuthoringResult, EditorDraft, ImagePackageReverificationStage, MacroIntent, MacroPage,
+    MacroPageState, RunDefinitionSnapshot, SavedMacroIdentity, WizardAuthoringKind,
+    WizardAuthoringOutcome, WizardAuthoringRequest, WizardAuthoringResult, WizardDetector,
 };
 use eframe::{
     App, CreationContext,
@@ -54,7 +56,7 @@ use eframe::{
         Slider, Stroke, TopBottomPanel, Ui, Vec2, ViewportCommand, Widget,
     },
 };
-use image::{DynamicImage, ImageFormat};
+use image::{DynamicImage, GrayImage, ImageFormat, Luma};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use windows::{
@@ -350,6 +352,10 @@ enum UiEvent {
         outcome: NativeEditorAuthoringOutcome,
         target_binding: Option<CapturedTargetBinding>,
     },
+    ImagePackageReverificationFinished {
+        request: ImagePackageReverificationRequest,
+        outcome: NativeImagePackageReverificationOutcome,
+    },
 }
 
 #[derive(Debug)]
@@ -374,6 +380,64 @@ struct PendingTemplateCapture {
 struct PublishedTemplateCapture {
     asset: AssetRef,
     staged_successor: bool,
+}
+
+/// Native-only transaction state for image packages. Unlike editor authoring,
+/// this never exposes a draft or asset store to the UI and cannot publish an
+/// authoring asset. The persistence verifier owns the only asset installation.
+#[derive(Debug)]
+struct PendingImagePackageReverification {
+    pending: PendingImageImport,
+    binding: Option<CapturedTargetBinding>,
+    active_rule_index: usize,
+    evidence: Option<LocalImagePackageEvidence>,
+    completions: Vec<LocalImageRuleReverification>,
+    in_flight_request_id: Option<u64>,
+    next_request_id: u64,
+}
+
+#[derive(Debug)]
+struct LocalImagePackageEvidence {
+    region: RegionDefinition,
+    template_png: Option<Vec<u8>>,
+    target_region_png: Option<Vec<u8>>,
+    negative_pngs: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct ImagePackageReverificationRequest {
+    id: u64,
+    step: ImagePackageReverificationStep,
+}
+
+#[derive(Debug, Clone)]
+enum ImagePackageReverificationStep {
+    CaptureTarget,
+    CaptureRegion {
+        binding: CapturedTargetBinding,
+        region_id: String,
+        region_revision: u64,
+    },
+    CaptureTemplate {
+        binding: CapturedTargetBinding,
+        region: RegionDefinition,
+    },
+    CaptureNegative {
+        binding: CapturedTargetBinding,
+        region: RegionDefinition,
+    },
+}
+
+#[derive(Debug)]
+enum NativeImagePackageReverificationOutcome {
+    CapturedTarget(CapturedTargetBinding),
+    CapturedRegion(RegionDefinition),
+    CapturedTemplate {
+        template_png: Vec<u8>,
+        target_region_png: Vec<u8>,
+    },
+    CapturedNegative(Vec<u8>),
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -457,6 +521,7 @@ struct NativeApp {
     selected_saved_revision: Option<SavedRevision>,
     macro_controller: Option<MacroController>,
     active_macro_bundle: Option<WindowsMacroRuntimeBundle>,
+    pending_image_package_reverification: Option<PendingImagePackageReverification>,
 }
 
 impl NativeApp {
@@ -495,6 +560,7 @@ impl NativeApp {
             selected_saved_revision: None,
             macro_controller: None,
             active_macro_bundle: None,
+            pending_image_package_reverification: None,
         }
     }
 
@@ -753,6 +819,246 @@ impl NativeApp {
         }
     }
 
+    fn begin_image_package_reverification(&mut self, pending: PendingImageImport) {
+        if self.pending_image_package_reverification.is_some() {
+            self.macro_state.editor_feedback = Some(
+                "Finish or cancel the current local image-package re-verification first.".into(),
+            );
+            return;
+        }
+        let rule_ids = pending.image_rule_ids().to_vec();
+        self.macro_state
+            .begin_image_package_reverification(rule_ids);
+        self.macro_state.editor_feedback = Some(
+            "Portable image data was discarded. Capture fresh local evidence for every image rule."
+                .into(),
+        );
+        self.pending_image_package_reverification = Some(PendingImagePackageReverification {
+            pending,
+            binding: None,
+            active_rule_index: 0,
+            evidence: None,
+            completions: Vec::new(),
+            in_flight_request_id: None,
+            next_request_id: 1,
+        });
+    }
+
+    fn discard_image_package_reverification(&mut self, message: impl Into<String>) {
+        self.pending_image_package_reverification = None;
+        self.macro_state.clear_image_package_reverification();
+        self.macro_state.editor_feedback = Some(message.into());
+    }
+
+    fn begin_next_image_package_capture(&mut self) {
+        let request = {
+            let Some(session) = self.pending_image_package_reverification.as_mut() else {
+                self.macro_state.editor_feedback =
+                    Some("No local image-package import is awaiting re-verification.".into());
+                return;
+            };
+            if session.in_flight_request_id.is_some() {
+                return;
+            }
+            let id = session.next_request_id;
+            session.next_request_id = session.next_request_id.saturating_add(1);
+            let rule_id = match session
+                .pending
+                .image_rule_ids()
+                .get(session.active_rule_index)
+            {
+                Some(rule_id) => rule_id,
+                None => {
+                    self.discard_image_package_reverification(
+                        "Image package re-verification lost its active rule; import was discarded.",
+                    );
+                    return;
+                }
+            };
+            let step = match (&session.binding, &session.evidence) {
+                (None, _) => ImagePackageReverificationStep::CaptureTarget,
+                (Some(binding), None) => {
+                    let source_region = session
+                        .pending
+                        .definition()
+                        .image_rules
+                        .iter()
+                        .find(|rule| rule.id == *rule_id)
+                        .and_then(|rule| {
+                            session
+                                .pending
+                                .definition()
+                                .regions
+                                .iter()
+                                .find(|region| region.id == rule.region_id)
+                        });
+                    let Some(source_region) = source_region else {
+                        self.discard_image_package_reverification(
+                            "Image package re-verification is missing a rule region; import was discarded.",
+                        );
+                        return;
+                    };
+                    ImagePackageReverificationStep::CaptureRegion {
+                        binding: binding.clone(),
+                        region_id: source_region.id.clone(),
+                        // The portable geometry and revision are deliberately
+                        // non-authoritative. The preserved id binds this fresh
+                        // local capture to the pending rule; revision restarts
+                        // from local evidence rather than the package value.
+                        region_revision: 1,
+                    }
+                }
+                (Some(binding), Some(evidence)) if evidence.template_png.is_none() => {
+                    ImagePackageReverificationStep::CaptureTemplate {
+                        binding: binding.clone(),
+                        region: evidence.region.clone(),
+                    }
+                }
+                (Some(binding), Some(evidence)) if evidence.negative_pngs.is_empty() => {
+                    ImagePackageReverificationStep::CaptureNegative {
+                        binding: binding.clone(),
+                        region: evidence.region.clone(),
+                    }
+                }
+                _ => {
+                    self.discard_image_package_reverification(
+                        "Image package re-verification evidence was inconsistent; import was discarded.",
+                    );
+                    return;
+                }
+            };
+            session.in_flight_request_id = Some(id);
+            ImagePackageReverificationRequest { id, step }
+        };
+        let tx = self.tx.clone();
+        let repaint = self.egui_ctx.clone();
+        thread::spawn(move || {
+            let outcome = run_image_package_reverification_request(&request);
+            send_ui_event(
+                &tx,
+                &repaint,
+                UiEvent::ImagePackageReverificationFinished { request, outcome },
+            );
+        });
+    }
+
+    fn apply_image_package_reverification_result(
+        &mut self,
+        request: ImagePackageReverificationRequest,
+        outcome: NativeImagePackageReverificationOutcome,
+    ) {
+        let Some(mut session) = self.pending_image_package_reverification.take() else {
+            return;
+        };
+        if session.in_flight_request_id != Some(request.id) {
+            self.pending_image_package_reverification = Some(session);
+            self.macro_state.editor_feedback =
+                Some("Discarded stale local image-package capture result.".into());
+            return;
+        }
+        session.in_flight_request_id = None;
+
+        match outcome {
+            NativeImagePackageReverificationOutcome::CapturedTarget(binding) => {
+                session.binding = Some(binding);
+                self.macro_state.set_image_package_reverification_stage(
+                    session.active_rule_index,
+                    ImagePackageReverificationStage::CaptureRegion,
+                );
+                self.pending_image_package_reverification = Some(session);
+            }
+            NativeImagePackageReverificationOutcome::CapturedRegion(region) => {
+                session.evidence = Some(LocalImagePackageEvidence {
+                    region,
+                    template_png: None,
+                    target_region_png: None,
+                    negative_pngs: Vec::new(),
+                });
+                self.macro_state.set_image_package_reverification_stage(
+                    session.active_rule_index,
+                    ImagePackageReverificationStage::CaptureTemplate,
+                );
+                self.pending_image_package_reverification = Some(session);
+            }
+            NativeImagePackageReverificationOutcome::CapturedTemplate {
+                template_png,
+                target_region_png,
+            } => {
+                let Some(evidence) = session.evidence.as_mut() else {
+                    self.discard_image_package_reverification(
+                        "Template capture arrived without local region evidence; import was discarded.",
+                    );
+                    return;
+                };
+                evidence.template_png = Some(template_png);
+                evidence.target_region_png = Some(target_region_png);
+                self.macro_state.set_image_package_reverification_stage(
+                    session.active_rule_index,
+                    ImagePackageReverificationStage::CaptureNegative,
+                );
+                self.pending_image_package_reverification = Some(session);
+            }
+            NativeImagePackageReverificationOutcome::CapturedNegative(negative_png) => {
+                let completion = complete_pending_image_rule_reverification(
+                    self.macro_store.as_deref(),
+                    &session,
+                    negative_png,
+                );
+                let completion = match completion {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        self.discard_image_package_reverification(format!(
+                            "Local image re-verification failed; import was discarded: {error}"
+                        ));
+                        return;
+                    }
+                };
+                session.completions.push(completion);
+                session.active_rule_index += 1;
+                session.evidence = None;
+                if session.active_rule_index < session.pending.image_rule_ids().len() {
+                    self.macro_state.set_image_package_reverification_stage(
+                        session.active_rule_index,
+                        ImagePackageReverificationStage::CaptureRegion,
+                    );
+                    self.pending_image_package_reverification = Some(session);
+                    return;
+                }
+                let Some(store) = self.macro_store.as_ref() else {
+                    self.discard_image_package_reverification(
+                        "Macro store became unavailable; image import was discarded.",
+                    );
+                    return;
+                };
+                match store.commit_image_package_import(session.pending, session.completions) {
+                    Ok(saved) => {
+                        let identity = SavedMacroIdentity {
+                            macro_id: saved.definition.id.clone(),
+                            revision: saved.definition.revision,
+                            definition_hash: saved.definition_hash.clone(),
+                        };
+                        self.selected_saved_revision = Some(saved.clone());
+                        self.macro_state
+                            .load_saved_draft(saved.definition, identity);
+                        self.macro_state.clear_image_package_reverification();
+                        self.macro_state.editor_feedback = Some(
+                            "Image package imported after local verifier-owned re-verification."
+                                .into(),
+                        );
+                        self.refresh_macro_library();
+                    }
+                    Err(error) => self.discard_image_package_reverification(format!(
+                        "Image package commit failed; import was discarded: {error}"
+                    )),
+                }
+            }
+            NativeImagePackageReverificationOutcome::Failed(error) => self
+                .discard_image_package_reverification(format!(
+                    "Local image capture failed; import was discarded: {error}"
+                )),
+        }
+    }
+
     fn dispatch_macro_intents(&mut self) {
         if self.macro_state.selected_saved.is_none() {
             self.selected_saved_revision = None;
@@ -914,25 +1220,46 @@ impl NativeApp {
                 MacroIntent::ImportPackage { package_root } => {
                     if let Some(store) = self.macro_store.as_ref() {
                         match store.prepare_package_import(&PathBuf::from(package_root)) {
-                            Ok(PreparedPackageImport::Text(prepared)) => match store.commit_text_package_import(prepared) {
-                                Ok(saved) => {
-                                    self.selected_saved_revision = Some(saved.clone());
-                                    let revision = saved.definition.revision;
-                                    let macro_id = saved.definition.id.clone();
-                                    let definition_hash = saved.definition_hash;
-                                    self.macro_state.load_saved_draft(
-                                        saved.definition,
-                                        SavedMacroIdentity { macro_id, revision, definition_hash },
-                                    );
-                                    self.refresh_macro_library();
+                            Ok(PreparedPackageImport::Text(prepared)) => {
+                                match store.commit_text_package_import(prepared) {
+                                    Ok(saved) => {
+                                        self.selected_saved_revision = Some(saved.clone());
+                                        let revision = saved.definition.revision;
+                                        let macro_id = saved.definition.id.clone();
+                                        let definition_hash = saved.definition_hash;
+                                        self.macro_state.load_saved_draft(
+                                            saved.definition,
+                                            SavedMacroIdentity {
+                                                macro_id,
+                                                revision,
+                                                definition_hash,
+                                            },
+                                        );
+                                        self.refresh_macro_library();
+                                    }
+                                    Err(error) => {
+                                        self.macro_state.editor_feedback =
+                                            Some(format!("Text import failed: {error}"))
+                                    }
                                 }
-                                Err(error) => self.macro_state.editor_feedback = Some(format!("Text import failed: {error}")),
-                            },
-                            Ok(PreparedPackageImport::Image(_)) => self.macro_state.editor_feedback = Some("Image packages require local recapture and re-verification; import was not committed.".into()),
-                            Err(error) => self.macro_state.editor_feedback = Some(format!("Import failed: {error}")),
+                            }
+                            Ok(PreparedPackageImport::Image(pending)) => {
+                                self.begin_image_package_reverification(pending)
+                            }
+                            Err(error) => {
+                                self.macro_state.editor_feedback =
+                                    Some(format!("Import failed: {error}"))
+                            }
                         }
                     }
                 }
+                MacroIntent::ContinueImagePackageReverification => {
+                    self.begin_next_image_package_capture()
+                }
+                MacroIntent::CancelImagePackageReverification => self
+                    .discard_image_package_reverification(
+                        "Image package import cancelled; no data was imported.",
+                    ),
                 MacroIntent::CleanupOrphans => {
                     if let Some(store) = self.macro_store.as_ref() {
                         let active_assets = self
@@ -1324,6 +1651,10 @@ impl NativeApp {
                                 Some(format!("Discarded editor authoring result: {error:?}"));
                         }
                     }
+                }
+                UiEvent::ImagePackageReverificationFinished { request, outcome } => {
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    self.apply_image_package_reverification_result(request, outcome);
                 }
             }
             ctx.request_repaint();
@@ -2304,6 +2635,171 @@ fn publish_pending_template_if_current(
         asset,
         staged_successor,
     }))
+}
+
+fn run_image_package_reverification_request(
+    request: &ImagePackageReverificationRequest,
+) -> NativeImagePackageReverificationOutcome {
+    let run = || -> anyhow::Result<NativeImagePackageReverificationOutcome> {
+        match &request.step {
+            ImagePackageReverificationStep::CaptureTarget => {
+                let selection = select_screen_rect(40)?;
+                Ok(NativeImagePackageReverificationOutcome::CapturedTarget(
+                    resolve_target_from_selection(selection)?,
+                ))
+            }
+            ImagePackageReverificationStep::CaptureRegion {
+                binding,
+                region_id,
+                region_revision,
+            } => {
+                let target = binding.prepare_client_rect()?;
+                let response = select_macro_capture(MacroCaptureRequest {
+                    id: CaptureRequestId(request.id),
+                    kind: MacroCaptureKind::ImageSearchRegion,
+                    target_client: target,
+                    min_size: 4,
+                })?;
+                require_stable_authoring_client(target, binding.validate_client_rect()?)?;
+                let MacroCaptureSelection::Region(rect) = response.selection else {
+                    anyhow::bail!("image package region capture returned the wrong result type")
+                };
+                Ok(NativeImagePackageReverificationOutcome::CapturedRegion(
+                    RegionDefinition {
+                        id: region_id.clone(),
+                        revision: *region_revision,
+                        rect,
+                    },
+                ))
+            }
+            ImagePackageReverificationStep::CaptureTemplate { binding, region } => {
+                let target = binding.prepare_client_rect()?;
+                let response = select_macro_capture(MacroCaptureRequest {
+                    id: CaptureRequestId(request.id),
+                    kind: MacroCaptureKind::TemplateCrop,
+                    target_client: target,
+                    min_size: 4,
+                })?;
+                let MacroCaptureSelection::TemplateCrop { screen_rect, .. } = response.selection
+                else {
+                    anyhow::bail!("image package template capture returned the wrong result type")
+                };
+                let template = binding.capture_screen_region(target, screen_rect)?;
+                let target_region =
+                    binding.capture_screen_region(target, target.rect_from_ratio(region.rect))?;
+                require_stable_authoring_client(target, binding.validate_client_rect()?)?;
+                Ok(NativeImagePackageReverificationOutcome::CapturedTemplate {
+                    template_png: encode_local_capture_png(template)?,
+                    target_region_png: encode_local_capture_png(target_region)?,
+                })
+            }
+            ImagePackageReverificationStep::CaptureNegative { binding, region } => {
+                let target = binding.prepare_client_rect()?;
+                let negative =
+                    binding.capture_screen_region(target, target.rect_from_ratio(region.rect))?;
+                require_stable_authoring_client(target, binding.validate_client_rect()?)?;
+                Ok(NativeImagePackageReverificationOutcome::CapturedNegative(
+                    encode_local_capture_png(negative)?,
+                ))
+            }
+        }
+    };
+    match run() {
+        Ok(outcome) => outcome,
+        Err(error) => NativeImagePackageReverificationOutcome::Failed(error.to_string()),
+    }
+}
+
+fn encode_local_capture_png(image: crate::engine::types::ScreenImage) -> anyhow::Result<Vec<u8>> {
+    let mut png = Vec::new();
+    DynamicImage::ImageRgba8(image.rgba).write_to(&mut Cursor::new(&mut png), ImageFormat::Png)?;
+    Ok(png)
+}
+
+fn fresh_opaque_mask_png(template_png: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let template = ImageRuleVerification::decode_template_png(template_png)?;
+    let mask = GrayImage::from_pixel(template.width(), template.height(), Luma([255]));
+    let mut png = Vec::new();
+    DynamicImage::ImageLuma8(mask).write_to(&mut Cursor::new(&mut png), ImageFormat::Png)?;
+    Ok(png)
+}
+
+fn target_profile_from_binding(binding: &CapturedTargetBinding) -> TargetProfile {
+    let profile = binding.profile();
+    TargetProfile {
+        process_path: profile.process_path.clone(),
+        window_class: profile.window_class.clone(),
+        title_contains: profile.title.clone(),
+        captured_client_width: profile.client_rect.width,
+        captured_client_height: profile.client_rect.height,
+        captured_dpi: profile.dpi,
+    }
+}
+
+fn complete_pending_image_rule_reverification(
+    store: Option<&MacroStore>,
+    session: &PendingImagePackageReverification,
+    negative_png: Vec<u8>,
+) -> anyhow::Result<LocalImageRuleReverification> {
+    let store = store.ok_or_else(|| anyhow::anyhow!("macro store is unavailable"))?;
+    let binding = session
+        .binding
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("local target capture is missing"))?;
+    let rule_id = session
+        .pending
+        .image_rule_ids()
+        .get(session.active_rule_index)
+        .ok_or_else(|| anyhow::anyhow!("active image rule is missing"))?;
+    let evidence = session
+        .evidence
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("local image evidence is missing"))?;
+    let template_png = evidence
+        .template_png
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("local template evidence is missing"))?;
+    let target_region_png = evidence
+        .target_region_png
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("local target-region evidence is missing"))?;
+    let rule = session
+        .pending
+        .definition()
+        .image_rules
+        .iter()
+        .find(|rule| rule.id == *rule_id)
+        .ok_or_else(|| anyhow::anyhow!("pending image rule is missing"))?;
+    let mut negative_pngs = evidence.negative_pngs.clone();
+    negative_pngs.push(negative_png);
+    let negative_samples = negative_pngs
+        .iter()
+        .enumerate()
+        .map(|(index, png)| {
+            LocalNegativeImageSample::from_local_capture(
+                format!("local-package/{rule_id}/negative/{index}"),
+                png,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mask_png = rule
+        .transparent_mask
+        .as_ref()
+        .map(|_| fresh_opaque_mask_png(template_png))
+        .transpose()?;
+    store.complete_local_image_reverification(
+        &session.pending,
+        LocalImageRuleVerificationInput::from_local_capture(
+            rule_id,
+            template_png,
+            mask_png.as_deref(),
+            target_profile_from_binding(binding),
+            evidence.region.clone(),
+            target_region_png,
+            &negative_samples,
+            DEFAULT_MAX_SCORE_CELLS,
+        ),
+    )
 }
 
 fn run_macro_authoring_request(

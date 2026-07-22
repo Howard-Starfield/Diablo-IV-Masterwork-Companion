@@ -8,9 +8,9 @@ use std::{
     },
     thread::{self, JoinHandle},
 };
-use windows::Win32::Security::Cryptography::SystemPrng;
+use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::{
-    Foundation::{LPARAM, LRESULT, WPARAM},
+    Foundation::{LPARAM, LRESULT, STATUS_SUCCESS, WPARAM},
     System::Threading::GetCurrentThreadId,
     UI::WindowsAndMessaging::{
         CallNextHookEx, GetMessageW, HC_ACTION, HHOOK, LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED,
@@ -34,7 +34,9 @@ pub enum SessionInputMarkerError {
 
 impl SessionInputMarker {
     pub fn generate() -> Result<Self, SessionInputMarkerError> {
-        Self::generate_with(|bytes| unsafe { SystemPrng(bytes).as_bool() })
+        Self::generate_with(|bytes| unsafe {
+            BCryptGenRandom(None, bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == STATUS_SUCCESS
+        })
     }
 
     pub(crate) fn generate_with(
@@ -625,6 +627,11 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     use super::*;
+
+    #[test]
+    fn operating_system_generator_produces_a_nonzero_session_marker() {
+        assert!(SessionInputMarker::generate().is_ok());
+    }
 
     #[test]
     fn session_input_marker_generation_accepts_nonzero_generator_output() {

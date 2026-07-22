@@ -38,6 +38,7 @@ pub enum BlockCategory {
 }
 
 impl BlockCategory {
+    #[cfg(test)]
     pub const ALL: [Self; 4] = [Self::Observe, Self::Decide, Self::Act, Self::Repeat];
 }
 

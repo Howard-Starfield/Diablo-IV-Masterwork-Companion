@@ -31,11 +31,10 @@ use crate::ui_state::{MacroCanvasLayout, UiStateStore};
 use canvas_model::{CanvasProjection, CanvasSelection, insertion_target_for_port, project_canvas};
 use history::HistoryError;
 
-pub use canvas_layout::{
-    CanvasLayoutEngine, CanvasLayoutError, CanvasViewport, LayoutEdit, auto_arrange, fit_view,
-    graph_bounds, node_rect, reconcile_layout, reveal_node, visible_nodes,
-};
-pub use history::{EditDomain, LayoutHistory, UiEditHistory};
+#[cfg(test)]
+use canvas_layout::{CanvasLayoutEngine, CanvasLayoutError};
+use canvas_layout::{LayoutEdit, auto_arrange, fit_view, graph_bounds, reconcile_layout};
+use history::{EditDomain, UiEditHistory};
 use monitor::{
     MonitorProjection, project_last_completion,
     project_last_completion_with_controller_projections, project_monitor,
@@ -183,6 +182,7 @@ pub enum MacroRunIntent {
 
 /// Public composition vocabulary. The native shell translates these bounded UI-only values into
 /// the accepted controller and store calls; widgets never receive those owners directly.
+#[cfg(test)]
 pub type MacroUiIntent = MacroIntent;
 
 impl MacroIntent {
@@ -287,14 +287,17 @@ impl MacroIntentQueue {
         self.values.pop_front()
     }
 
+    #[cfg(test)]
     pub fn drain(&mut self) -> std::collections::vec_deque::Drain<'_, MacroIntent> {
         self.values.drain(..)
     }
 
+    #[cfg(test)]
     pub fn pending(&self) -> usize {
         self.values.len()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.pending()
     }
@@ -451,14 +454,17 @@ impl MacroPageState {
         self.intents.push(intent);
     }
 
+    #[cfg(test)]
     pub fn push_intent(&mut self, intent: MacroUiIntent) {
         self.enqueue_intent(intent);
     }
 
+    #[cfg(test)]
     pub fn pending_intent_count(&self) -> usize {
         self.intents.pending()
     }
 
+    #[cfg(test)]
     pub fn drain_intents(&mut self) -> std::collections::vec_deque::Drain<'_, MacroUiIntent> {
         self.intents.drain()
     }
@@ -538,6 +544,7 @@ impl MacroPageState {
         self.canvas_layout_dirty = false;
     }
 
+    #[cfg(test)]
     pub fn move_canvas_node(
         &mut self,
         block_id: &str,
@@ -2230,7 +2237,6 @@ fn dispatch_editor_command(
                     HistoryError::Definition(error) => error,
                     HistoryError::NothingToUndo => EditorError::NothingToUndo,
                     HistoryError::NothingToRedo => EditorError::NothingToUndo,
-                    HistoryError::Layout => EditorError::NothingToUndo,
                 });
         state.editor_feedback = Some(match &result {
             Ok(_) => "Undid latest editor change.".into(),
@@ -2247,7 +2253,6 @@ fn dispatch_editor_command(
                     HistoryError::Definition(error) => error,
                     HistoryError::NothingToUndo => EditorError::NothingToRedo,
                     HistoryError::NothingToRedo => EditorError::NothingToRedo,
-                    HistoryError::Layout => EditorError::NothingToRedo,
                 });
         state.editor_feedback = Some(match &result {
             Ok(_) => "Redid latest editor change.".into(),

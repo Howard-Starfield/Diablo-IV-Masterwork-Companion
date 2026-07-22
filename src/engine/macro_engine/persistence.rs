@@ -186,12 +186,6 @@ pub struct PreparedTextImport {
     package_fingerprint: String,
 }
 
-impl PreparedTextImport {
-    pub fn package_fingerprint(&self) -> &str {
-        &self.package_fingerprint
-    }
-}
-
 #[derive(Debug)]
 pub struct PendingImageImport {
     package_fingerprint: String,
@@ -205,14 +199,6 @@ pub struct PendingImageImport {
 }
 
 impl PendingImageImport {
-    pub fn package_fingerprint(&self) -> &str {
-        &self.package_fingerprint
-    }
-
-    pub fn destination_macro_id(&self) -> &str {
-        &self.destination_macro_id
-    }
-
     pub fn definition(&self) -> &MacroDefinition {
         &self.definition
     }
@@ -285,12 +271,6 @@ pub struct LocalImageRuleReverification {
     template: PackageAsset,
     mask: Option<PackageAsset>,
     artifact: ImageRuleVerificationArtifact,
-}
-
-impl LocalImageRuleReverification {
-    pub fn rule_id(&self) -> &str {
-        &self.rule_id
-    }
 }
 
 /// Portable image-verification artifacts are untrusted until the destination

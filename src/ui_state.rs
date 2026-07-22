@@ -55,6 +55,7 @@ impl Default for MacroCanvasLayout {
 }
 
 impl MacroCanvasLayout {
+    #[cfg(test)]
     pub fn is_finite(&self) -> bool {
         self.pan.iter().all(|value| value.is_finite())
             && self.zoom.is_finite()

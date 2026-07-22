@@ -18,7 +18,6 @@ pub enum HistoryError {
     NothingToUndo,
     NothingToRedo,
     Definition(EditorError),
-    Layout,
 }
 
 #[derive(Debug, Default)]
@@ -132,10 +131,6 @@ impl UiEditHistory {
     pub fn undo_len(&self) -> usize {
         self.undo_domains.len()
     }
-    pub fn redo_len(&self) -> usize {
-        self.redo_domains.len()
-    }
-
     fn record_domain(&mut self, domain: EditDomain) {
         push_bounded(&mut self.undo_domains, domain);
         self.redo_domains.clear();

@@ -138,10 +138,6 @@ impl ImageRuleVerificationArtifact {
     pub fn best_negative_score(&self) -> f32 {
         self.best_negative_score
     }
-
-    pub fn verification_fingerprint_sha256(&self) -> &str {
-        &self.verification_fingerprint_sha256
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

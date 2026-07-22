@@ -14,6 +14,7 @@ pub const LAYER_GAP: f32 = 72.0;
 pub const SIBLING_GAP: f32 = 36.0;
 const FIT_PADDING: f32 = 32.0;
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanvasLayoutError {
     MissingNode(String),
@@ -70,8 +71,10 @@ impl LayoutEdit {
     }
 }
 
+#[cfg(test)]
 pub struct CanvasLayoutEngine;
 
+#[cfg(test)]
 impl CanvasLayoutEngine {
     pub fn move_node(
         layout: &mut MacroCanvasLayout,

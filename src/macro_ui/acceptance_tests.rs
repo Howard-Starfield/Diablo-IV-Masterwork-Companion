@@ -3,6 +3,9 @@ use crate::engine::macro_engine::{
     WatchGroup, WatchLane, validate_macro,
 };
 use crate::macro_ui::canvas::{CanvasHit, finish_connection};
+use crate::macro_ui::canvas_layout::{
+    CanvasViewport, node_rect, reconcile_layout, reveal_node, visible_nodes,
+};
 use crate::macro_ui::canvas_model::{
     CanvasConnectionError, CanvasEdgeKind, CanvasGroupKind, OutputPort, connection_command,
     project_canvas,
@@ -13,8 +16,7 @@ use crate::macro_ui::test_support::{
     fixture_nested_loop_draft, fixture_ready_state, fixture_with_pinned_run,
 };
 use crate::macro_ui::{
-    CanvasViewport, MacroIntent, MacroPageState, SavedMacroIdentity, node_rect, reconcile_layout,
-    reveal_node, run_control_availability, select_canvas, visible_nodes,
+    MacroIntent, MacroPageState, SavedMacroIdentity, run_control_availability, select_canvas,
 };
 use crate::ui_state::UiStateStore;
 

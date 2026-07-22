@@ -2,6 +2,7 @@
 name = "diablo_masterwork_companion"
 version = "0.1.0"
 edition = "2024"
+default-run = "diablo_masterwork_companion"
 
 [dependencies]
 anyhow = "1.0.102"

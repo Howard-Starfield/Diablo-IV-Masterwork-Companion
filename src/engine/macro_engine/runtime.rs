@@ -8642,8 +8642,19 @@ mod tests {
                 body: vec![point_action("paced-action")],
             },
         )]);
-        let handle = thread::spawn(move || runner.run(saved(definition), RunMode::DryRun).unwrap());
-        thread::sleep(Duration::from_millis(20));
+        let (yielded_tx, yielded_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            runner
+                .run_with_sink(
+                    saved(definition),
+                    RunMode::DryRun,
+                    Some(Arc::new(LoopYieldSignalSink {
+                        yielded: yielded_tx,
+                    })),
+                )
+                .unwrap()
+        });
+        yielded_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         runtime.stop();
         let events = handle.join().unwrap();
 
@@ -10627,6 +10638,18 @@ mod tests {
 
     struct PollingDelayReleaseSink {
         release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct LoopYieldSignalSink {
+        yielded: mpsc::Sender<()>,
+    }
+
+    impl RunEventSink for LoopYieldSignalSink {
+        fn emit(&self, event: &RunEvent) {
+            if matches!(event, RunEvent::LoopYielded { block_id, .. } if block_id == "continuous") {
+                let _ = self.yielded.send(());
+            }
+        }
     }
 
     impl RunEventSink for PollingDelayReleaseSink {

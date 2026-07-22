@@ -9867,12 +9867,20 @@ mod tests {
             100,
             TimeoutOutcome::Continue,
         )]));
-        let events = fixture_runtime_with_detector(WatchSequenceDetector::with([
-            ("lane-1", vec![false]),
-            ("lane-2", vec![false]),
-        ]))
-        .run(macro_revision, RunMode::ObservationOnly)
-        .unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started, _started_rx) = mpsc::channel();
+        let runtime = fixture_runtime_with_detector(GatedWatchDetector {
+            blocked_source: "lane-1".to_string(),
+            started,
+            release: Arc::clone(&release),
+        });
+        let events = runtime
+            .run_with_sink(
+                macro_revision,
+                RunMode::ObservationOnly,
+                Some(Arc::new(PollingDelayReleaseSink { release })),
+            )
+            .unwrap();
 
         assert!(events.iter().any(|event| matches!(event, RunEvent::PollingDelayed { block_id, lane_id, .. } if block_id == "watch" && lane_id == "lane-2")));
     }
@@ -10615,6 +10623,20 @@ mod tests {
         blocked_source: String,
         started: mpsc::Sender<()>,
         release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct PollingDelayReleaseSink {
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl RunEventSink for PollingDelayReleaseSink {
+        fn emit(&self, event: &RunEvent) {
+            if matches!(event, RunEvent::PollingDelayed { lane_id, .. } if lane_id == "lane-2") {
+                let (lock, wake) = &*self.release;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+            }
+        }
     }
 
     struct GateAllWatchDetector {

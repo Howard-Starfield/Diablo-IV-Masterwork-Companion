@@ -297,11 +297,11 @@ mod tests {
     use anyhow::Result;
     use image::RgbaImage;
 
-    use super::*;
     use super::super::{
         config::{MouseMovementSample, MouseMovementStep},
         types::{PointRatio, RectRatio},
     };
+    use super::*;
 
     #[derive(Clone)]
     struct SharedCapture(Rc<RefCell<Vec<&'static str>>>);
@@ -570,7 +570,10 @@ mod tests {
 
         let outcome = runner.run(|_| {}).unwrap();
 
-        assert!(matches!(outcome, EnchantOutcome::MaxAttempts { attempts: 1 }));
+        assert!(matches!(
+            outcome,
+            EnchantOutcome::MaxAttempts { attempts: 1 }
+        ));
         assert_eq!(
             *clicked.borrow(),
             vec![Point::new(10, 10), Point::new(70, 70), Point::new(90, 10)]

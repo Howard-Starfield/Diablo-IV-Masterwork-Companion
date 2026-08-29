@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::engine::macro_engine::{
-    Action, AssetRef, Block, BlockKind, Condition, ImageRule, Limit, MacroDefinition, MouseButton,
-    ObserveMode, PassiveCondition, TextRule, TimeoutOutcome, ValidationProblem,
+    Action, AssetRef, Block, BlockKind, Condition, ImageRule, Limit, MAX_WATCH_GROUP_LANES,
+    MacroDefinition, MouseButton, ObserveMode, PassiveCondition, TextRule, TimeoutOutcome,
+    ValidationProblem, WatchLane,
 };
 use crate::engine::types::RectRatio;
 use std::ops::{Deref, DerefMut};
@@ -246,6 +247,7 @@ pub enum ConversionTarget {
         condition: Condition,
         max_iterations: Limit<u64>,
     },
+    Continuous,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -290,9 +292,17 @@ pub enum EditorCommand {
         lane_id: String,
         to_index: usize,
     },
+    InsertLane {
+        group_id: String,
+        lane: WatchLane,
+    },
     ConvertBlock {
         path: BlockPath,
         target: ConversionTarget,
+    },
+    SetAction {
+        path: BlockPath,
+        action: Action,
     },
     SetConditionMode {
         path: BlockPath,
@@ -433,7 +443,9 @@ fn block_family(block: &Block) -> BlockFamily {
         BlockKind::Action {
             action: Action::ClickPoint { .. } | Action::ClickRegion { .. },
         } => BlockFamily::SavedLocationClick,
-        BlockKind::RepeatN { .. } | BlockKind::RepeatUntil { .. } => BlockFamily::Loop,
+        BlockKind::RepeatN { .. }
+        | BlockKind::RepeatUntil { .. }
+        | BlockKind::Continuous { .. } => BlockFamily::Loop,
         _ => BlockFamily::Other,
     }
 }
@@ -792,6 +804,17 @@ fn apply_to_definition(
             let lane = group.lanes.remove(from);
             group.lanes.insert(to_index, lane);
         }
+        EditorCommand::InsertLane { group_id, lane } => {
+            let block = find_block_mut(&mut definition.blocks, &group_id)
+                .ok_or_else(|| EditorError::MissingBlock(group_id.clone()))?;
+            let BlockKind::WatchGroup { group } = &mut block.kind else {
+                return Err(EditorError::MissingContainer);
+            };
+            if group.lanes.len() >= MAX_WATCH_GROUP_LANES {
+                return Err(EditorError::InvalidIndex);
+            }
+            group.lanes.push(lane);
+        }
         EditorCommand::ConvertBlock { path, target } => {
             let block = find_block_in_container_mut(&mut definition.blocks, &path)?
                 .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
@@ -872,6 +895,17 @@ fn apply_to_definition(
             };
             group.timeout_ms = timeout_ms;
             group.cooldown_ms = cooldown_ms;
+        }
+        EditorCommand::SetAction { path, action } => {
+            let block = find_block_in_container_mut(&mut definition.blocks, &path)?
+                .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
+            let BlockKind::Action {
+                action: current, ..
+            } = &mut block.kind
+            else {
+                return Err(EditorError::IncompatibleConversion);
+            };
+            *current = action;
         }
         EditorCommand::ReplaceBlock {
             path,
@@ -1098,6 +1132,33 @@ fn convert_block(block: &mut Block, target: ConversionTarget) -> Result<(), Edit
         (BlockKind::RepeatUntil { body, .. }, ConversionTarget::RepeatN { count }) => {
             let body = std::mem::take(body);
             block.kind = BlockKind::RepeatN { count, body };
+        }
+        (
+            BlockKind::RepeatN { body, .. }
+            | BlockKind::RepeatUntil { body, .. }
+            | BlockKind::Continuous { body },
+            ConversionTarget::Continuous,
+        ) => {
+            let body = std::mem::take(body);
+            block.kind = BlockKind::Continuous { body };
+        }
+        (BlockKind::Continuous { body }, ConversionTarget::RepeatN { count }) => {
+            let body = std::mem::take(body);
+            block.kind = BlockKind::RepeatN { count, body };
+        }
+        (
+            BlockKind::Continuous { body },
+            ConversionTarget::RepeatUntil {
+                condition,
+                max_iterations,
+            },
+        ) => {
+            let body = std::mem::take(body);
+            block.kind = BlockKind::RepeatUntil {
+                condition,
+                max_iterations,
+                body,
+            };
         }
         _ => return Err(EditorError::IncompatibleConversion),
     }
@@ -2219,6 +2280,7 @@ mod tests {
             },
         );
         convert(&mut draft, "loop", ConversionTarget::RepeatN { count: 3 });
+        convert(&mut draft, "loop", ConversionTarget::Continuous);
         assert!(matches!(
             draft.definition.blocks[2].kind,
             BlockKind::Action {
@@ -2241,8 +2303,82 @@ mod tests {
             matches!(draft.definition.blocks[4].kind,BlockKind::Action{action:Action::ClickPoint{ref point_id,..}} if point_id=="point2")
         );
         assert!(
-            matches!(draft.definition.blocks[5].kind,BlockKind::RepeatN{ref body,..} if body[0].id=="owned")
+            matches!(draft.definition.blocks[5].kind,BlockKind::Continuous{ref body} if body[0].id=="owned")
         );
+    }
+
+    #[test]
+    fn insert_lane_appends_a_second_watch_lane() {
+        let lane = WatchLane {
+            id: "lane-1".into(),
+            enabled: true,
+            condition: PassiveCondition::Text {
+                source_block_id: "observe".into(),
+                rule_id: "r".into(),
+            },
+            then_body: vec![],
+        };
+        let mut draft = EditorDraft::new(def(vec![Block {
+            id: "watch".into(),
+            enabled: true,
+            kind: BlockKind::WatchGroup {
+                group: WatchGroup {
+                    lanes: vec![lane.clone()],
+                    timeout_ms: Limit::Unlimited,
+                    timeout_outcome: TimeoutOutcome::Continue,
+                    cooldown_ms: 250,
+                },
+            },
+        }]));
+        let mut second = lane;
+        second.id = "lane-2".into();
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::InsertLane {
+                    group_id: "watch".into(),
+                    lane: second,
+                }
+            ),
+            Ok(EditOutcome::Changed)
+        );
+        assert_eq!(draft.watch_lane_ids("watch"), vec!["lane-1", "lane-2"]);
+    }
+
+    #[test]
+    fn set_action_updates_mouse_button() {
+        let mut draft = EditorDraft::new(def(vec![Block {
+            id: "click".into(),
+            enabled: true,
+            kind: BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: "observe".into(),
+                    button: MouseButton::Left,
+                },
+            },
+        }]));
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::SetAction {
+                    path: path("click"),
+                    action: Action::ClickTextMatch {
+                        source_block_id: "observe".into(),
+                        button: MouseButton::Right,
+                    },
+                }
+            ),
+            Ok(EditOutcome::Changed)
+        );
+        assert!(matches!(
+            draft.definition.blocks[0].kind,
+            BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    button: MouseButton::Right,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]

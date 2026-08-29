@@ -3,13 +3,13 @@ use eframe::egui::{
 };
 
 use crate::engine::macro_engine::{
-    AssetRef, Block, BlockKind, Condition, ImageRule, Limit, MacroDefinition, MatchSelectionPolicy,
-    ObserveMode, PassiveCondition, PreprocessProfile, TextMatchMode, TextRule, TimeoutOutcome,
-    ValidationProblem,
+    Action, ActionTarget, AssetRef, Block, BlockKind, Condition, ImageRule, Limit, MacroDefinition,
+    MatchSelectionPolicy, MouseButton, ObserveMode, PassiveCondition, PreprocessProfile,
+    TextMatchMode, TextRule, TimeoutOutcome, ValidationProblem,
 };
 use crate::ui_theme::text;
 
-const EMPTY_INSPECTOR_PROMPT: &str = "Select a canonical canvas block.";
+const EMPTY_INSPECTOR_PROMPT: &str = "Select a step.";
 pub const IF_BRANCH_STATUS: &str =
     "If true runs THEN. If false runs ELSE. Then continues after the If.";
 
@@ -56,6 +56,13 @@ pub enum InspectorIntent {
         block_id: String,
         timeout_ms: Limit<u64>,
         cooldown_ms: u64,
+    },
+    SetAction {
+        block_id: String,
+        action: Action,
+    },
+    AddWatchLane {
+        block_id: String,
     },
     InvalidEdit {
         message: String,
@@ -107,7 +114,7 @@ pub struct ImageInspector {
     pub supports_observe_mode: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FlowInspector {
     pub block_id: String,
     pub kind: String,
@@ -116,7 +123,7 @@ pub struct FlowInspector {
     pub edit: Option<FlowEdit>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FlowEdit {
     Wait {
         duration_ms: u64,
@@ -127,6 +134,13 @@ pub enum FlowEdit {
     Watch {
         timeout_ms: Limit<u64>,
         cooldown_ms: u64,
+    },
+    Action {
+        action: Action,
+        text_sources: Vec<String>,
+        image_sources: Vec<String>,
+        point_ids: Vec<String>,
+        region_ids: Vec<String>,
     },
 }
 
@@ -207,6 +221,30 @@ pub fn project_inspector(
                     cooldown_ms: group.cooldown_ms,
                 }),
             }),
+            BlockKind::Action { action } => {
+                let (text_sources, image_sources) = observe_sources(&definition.blocks);
+                InspectorProjection::Flow(FlowInspector {
+                    block_id: selected_id.into(),
+                    kind: "ACTION".into(),
+                    fields: action_fields(action),
+                    problems: selected_problems(),
+                    edit: Some(FlowEdit::Action {
+                        action: action.clone(),
+                        text_sources,
+                        image_sources,
+                        point_ids: definition
+                            .points
+                            .iter()
+                            .map(|point| point.id.clone())
+                            .collect(),
+                        region_ids: definition
+                            .regions
+                            .iter()
+                            .map(|region| region.id.clone())
+                            .collect(),
+                    }),
+                })
+            }
             kind => flow_projection(selected_id, kind, selected_problems()),
         };
     }
@@ -391,6 +429,123 @@ fn flow_projection(id: &str, kind: &BlockKind, problems: Vec<String>) -> Inspect
         problems,
         edit,
     })
+}
+
+fn action_fields(action: &Action) -> Vec<(String, String)> {
+    let mut fields = vec![("Kind".into(), action_kind_label(action).into())];
+    if let Some(button) = action_button_label(action) {
+        fields.push(("Button".into(), button.into()));
+    }
+    fields.push(("Target".into(), action_target_id(action)));
+    fields
+}
+
+fn action_kind_label(action: &Action) -> &'static str {
+    match action {
+        Action::ClickTextMatch { .. } => "Click text match",
+        Action::ClickImageMatch { .. } => "Click image match",
+        Action::ClickPoint { .. } => "Click point",
+        Action::ClickRegion { .. } => "Click region",
+        Action::MoveOnly { .. } => "Move only",
+    }
+}
+
+fn action_button_label(action: &Action) -> Option<&'static str> {
+    match action {
+        Action::ClickTextMatch { button, .. }
+        | Action::ClickImageMatch { button, .. }
+        | Action::ClickPoint { button, .. }
+        | Action::ClickRegion { button, .. } => Some(match button {
+            MouseButton::Left => "Left",
+            MouseButton::Right => "Right",
+        }),
+        Action::MoveOnly { .. } => None,
+    }
+}
+
+fn action_target_id(action: &Action) -> String {
+    match action {
+        Action::ClickTextMatch {
+            source_block_id, ..
+        }
+        | Action::ClickImageMatch {
+            source_block_id, ..
+        } => source_block_id.clone(),
+        Action::ClickPoint { point_id, .. } => point_id.clone(),
+        Action::ClickRegion { region_id, .. } => region_id.clone(),
+        Action::MoveOnly { target } => match target {
+            ActionTarget::TextMatch { source_block_id }
+            | ActionTarget::ImageMatch { source_block_id } => source_block_id.clone(),
+            ActionTarget::Point { point_id } => point_id.clone(),
+            ActionTarget::Region { region_id } => region_id.clone(),
+        },
+    }
+}
+
+fn observe_sources(blocks: &[Block]) -> (Vec<String>, Vec<String>) {
+    let mut text_sources = Vec::new();
+    let mut image_sources = Vec::new();
+    collect_observe_sources(blocks, &mut text_sources, &mut image_sources);
+    (text_sources, image_sources)
+}
+
+fn collect_observe_sources(
+    blocks: &[Block],
+    text_sources: &mut Vec<String>,
+    image_sources: &mut Vec<String>,
+) {
+    for block in blocks {
+        if let BlockKind::Observe { condition } = &block.kind {
+            match condition {
+                Condition::Text { .. } => text_sources.push(block.id.clone()),
+                Condition::Image { .. } => image_sources.push(block.id.clone()),
+            }
+        }
+        for child in children(block) {
+            collect_observe_sources(child, text_sources, image_sources);
+        }
+    }
+}
+
+fn with_action_button(action: &Action, button: MouseButton) -> Action {
+    let mut next = action.clone();
+    match &mut next {
+        Action::ClickTextMatch {
+            button: current, ..
+        }
+        | Action::ClickImageMatch {
+            button: current, ..
+        }
+        | Action::ClickPoint {
+            button: current, ..
+        }
+        | Action::ClickRegion {
+            button: current, ..
+        } => *current = button,
+        Action::MoveOnly { .. } => {}
+    }
+    next
+}
+
+fn with_action_target(action: &Action, target_id: String) -> Action {
+    let mut next = action.clone();
+    match &mut next {
+        Action::ClickTextMatch {
+            source_block_id, ..
+        }
+        | Action::ClickImageMatch {
+            source_block_id, ..
+        } => *source_block_id = target_id,
+        Action::ClickPoint { point_id, .. } => *point_id = target_id,
+        Action::ClickRegion { region_id, .. } => *region_id = target_id,
+        Action::MoveOnly { target } => match target {
+            ActionTarget::TextMatch { source_block_id }
+            | ActionTarget::ImageMatch { source_block_id } => *source_block_id = target_id,
+            ActionTarget::Point { point_id } => *point_id = target_id,
+            ActionTarget::Region { region_id } => *region_id = target_id,
+        },
+    }
+    next
 }
 fn flow_fields(kind: &BlockKind) -> Vec<(String, String)> {
     match kind {
@@ -1061,6 +1216,78 @@ fn flow_editor(
                     cooldown_ms: cooldown,
                 });
             }
+            if ui.add_enabled(editable, Button::new("Add Lane")).clicked() {
+                *intent = Some(InspectorIntent::AddWatchLane {
+                    block_id: projection.block_id.clone(),
+                });
+            }
+        }
+        Some(FlowEdit::Action {
+            action,
+            text_sources,
+            image_sources,
+            point_ids,
+            region_ids,
+        }) => {
+            if let Some(button) = action_button_label(action) {
+                let next_button = match action {
+                    Action::ClickTextMatch {
+                        button: MouseButton::Left,
+                        ..
+                    }
+                    | Action::ClickImageMatch {
+                        button: MouseButton::Left,
+                        ..
+                    }
+                    | Action::ClickPoint {
+                        button: MouseButton::Left,
+                        ..
+                    }
+                    | Action::ClickRegion {
+                        button: MouseButton::Left,
+                        ..
+                    } => MouseButton::Right,
+                    _ => MouseButton::Left,
+                };
+                if ui
+                    .add_enabled(editable, Button::new(format!("Mouse button: {button}")))
+                    .clicked()
+                {
+                    *intent = Some(InspectorIntent::SetAction {
+                        block_id: projection.block_id.clone(),
+                        action: with_action_button(action, next_button),
+                    });
+                }
+            }
+            let choices: &[String] = match action {
+                Action::ClickTextMatch { .. } => text_sources,
+                Action::ClickImageMatch { .. } => image_sources,
+                Action::ClickPoint { .. } => point_ids,
+                Action::ClickRegion { .. } => region_ids,
+                Action::MoveOnly { target } => match target {
+                    ActionTarget::TextMatch { .. } => text_sources,
+                    ActionTarget::ImageMatch { .. } => image_sources,
+                    ActionTarget::Point { .. } => point_ids,
+                    ActionTarget::Region { .. } => region_ids,
+                },
+            };
+            let current_target = action_target_id(action);
+            ui.label("Target");
+            for candidate in choices {
+                if candidate == &current_target {
+                    continue;
+                }
+                if ui
+                    .add_enabled(editable, Button::new(format!("Use {candidate}")))
+                    .clicked()
+                {
+                    *intent = Some(InspectorIntent::SetAction {
+                        block_id: projection.block_id.clone(),
+                        action: with_action_target(action, candidate.clone()),
+                    });
+                    break;
+                }
+            }
         }
         None => {}
     }
@@ -1309,6 +1536,42 @@ mod tests {
     }
 
     #[test]
+    fn action_inspector_exposes_button_and_target_fields() {
+        let mut definition = definition();
+        definition.blocks.push(Block {
+            id: "click".into(),
+            enabled: true,
+            kind: BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: "observe".into(),
+                    button: MouseButton::Left,
+                },
+            },
+        });
+
+        let InspectorProjection::Flow(flow) = project_inspector(&definition, "click", &[]) else {
+            panic!("action inspector");
+        };
+        assert_eq!(flow.kind, "ACTION");
+        assert!(
+            flow.fields
+                .contains(&("Kind".into(), "Click text match".into()))
+        );
+        assert!(flow.fields.contains(&("Button".into(), "Left".into())));
+        assert!(flow.fields.contains(&("Target".into(), "observe".into())));
+        assert!(matches!(
+            flow.edit,
+            Some(FlowEdit::Action {
+                action: Action::ClickTextMatch {
+                    button: MouseButton::Left,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn nested_timeout_body_is_available_to_selection() {
         let mut definition = definition();
         let BlockKind::Observe { condition } = &mut definition.blocks[0].kind else {
@@ -1429,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_inspector_prompt_refers_to_a_canvas_block() {
-        assert_eq!(EMPTY_INSPECTOR_PROMPT, "Select a canonical canvas block.");
+    fn empty_inspector_prompt_refers_to_a_step() {
+        assert_eq!(EMPTY_INSPECTOR_PROMPT, "Select a step.");
     }
 }

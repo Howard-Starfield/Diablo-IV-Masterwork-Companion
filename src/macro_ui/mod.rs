@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod acceptance_tests;
+#[cfg(test)]
 mod canvas;
 mod canvas_layout;
 mod canvas_model;
@@ -8,6 +9,7 @@ mod history;
 mod inspector;
 mod library;
 mod monitor;
+mod step_list;
 #[cfg(test)]
 mod test_support;
 mod wizard;
@@ -28,12 +30,12 @@ use crate::engine::macro_engine::{
 use crate::ui_theme::text;
 
 use crate::ui_state::{MacroCanvasLayout, UiStateStore};
-use canvas_model::{CanvasProjection, CanvasSelection, insertion_target_for_port, project_canvas};
+use canvas_model::{CanvasSelection, project_canvas};
 use history::HistoryError;
 
+use canvas_layout::reconcile_layout;
 #[cfg(test)]
-use canvas_layout::{CanvasLayoutEngine, CanvasLayoutError};
-use canvas_layout::{LayoutEdit, auto_arrange, fit_view, graph_bounds, reconcile_layout};
+use canvas_layout::{CanvasLayoutEngine, CanvasLayoutError, LayoutEdit, fit_view, graph_bounds};
 use history::{EditDomain, UiEditHistory};
 use monitor::{
     MonitorProjection, project_last_completion,
@@ -178,6 +180,49 @@ pub enum MacroRunIntent {
     RunOnce,
     ContinuousObservation,
     ContinuousLive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTargetFacts {
+    pub title: String,
+    pub is_foreground: bool,
+    pub is_visible: bool,
+    pub is_minimized: bool,
+    pub client_width: u32,
+    pub client_height: u32,
+    pub dpi: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LiveTargetStatus {
+    #[default]
+    Unbound,
+    Bound(LiveTargetFacts),
+    Lost {
+        title: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunHistoryRow {
+    pub run_id: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusChrome {
+    window: String,
+    foreground: String,
+    display: String,
+    geometry: String,
+}
+
+pub fn run_history_feedback(rows: &[RunHistoryRow]) -> String {
+    match rows.len() {
+        0 => "No saved run history.".to_string(),
+        1 => "1 saved run history entry.".to_string(),
+        count => format!("{count} saved run history entries."),
+    }
 }
 
 /// Public composition vocabulary. The native shell translates these bounded UI-only values into
@@ -326,10 +371,11 @@ pub struct MacroPageState {
     pub ui_edit_history: UiEditHistory,
     canvas_layout_dirty: bool,
     canvas_layout_hydrated: bool,
+    pub live_target: LiveTargetStatus,
+    pub run_history: Option<Vec<RunHistoryRow>>,
     intents: MacroIntentQueue,
     pub selected_block_id: Option<String>,
     selected_canvas: Option<CanvasSelection>,
-    pending_canvas_port: Option<canvas_model::OutputPort>,
     pub pending_inspector_intent: Option<inspector::InspectorIntent>,
     pub editor_feedback: Option<String>,
     pending_conversion: Option<PendingConversion>,
@@ -369,10 +415,11 @@ impl Default for MacroPageState {
             ui_edit_history: UiEditHistory::default(),
             canvas_layout_dirty: false,
             canvas_layout_hydrated: false,
+            live_target: LiveTargetStatus::Unbound,
+            run_history: None,
             intents: MacroIntentQueue::with_capacity(MacroIntentQueue::DEFAULT_CAPACITY),
             selected_block_id: None,
             selected_canvas: None,
-            pending_canvas_port: None,
             pending_inspector_intent: None,
             editor_feedback: None,
             pending_conversion: None,
@@ -544,6 +591,30 @@ impl MacroPageState {
         self.canvas_layout_dirty = false;
     }
 
+    pub fn open_run_history(&mut self, rows: Vec<RunHistoryRow>) {
+        self.run_history = Some(rows);
+    }
+
+    pub(crate) fn record_side_pane_widths(&mut self, library: (f32, f32), inspector: (f32, f32)) {
+        let mut changed = false;
+        if library.1 > 50.0 && (library.1 - library.0).abs() > 4.0 {
+            self.canvas_layout.library_width = library.1;
+            changed = true;
+        }
+        if inspector.1 > 50.0 && (inspector.1 - inspector.0).abs() > 4.0 {
+            self.canvas_layout.inspector_width = inspector.1;
+            changed = true;
+        }
+        self.canvas_layout_dirty |= changed;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pane_widths(&mut self, library_width: f32, inspector_width: f32) {
+        self.canvas_layout.library_width = library_width;
+        self.canvas_layout.inspector_width = inspector_width;
+        self.canvas_layout_dirty = true;
+    }
+
     #[cfg(test)]
     pub fn move_canvas_node(
         &mut self,
@@ -558,49 +629,16 @@ impl MacroPageState {
             return Err(CanvasLayoutError::MissingNode(block_id.into()));
         }
         let edit = CanvasLayoutEngine::move_node(&mut self.canvas_layout, block_id, position)?;
-        if let LayoutEdit::NodePosition { before, after, .. } = &edit {
-            if before == after {
-                return Ok(());
-            }
+        let LayoutEdit::NodePosition { before, after, .. } = &edit;
+        if before == after {
+            return Ok(());
         }
         self.ui_edit_history.record_layout(edit);
         self.canvas_layout_dirty = true;
         Ok(())
     }
 
-    pub fn auto_arrange_canvas(&mut self) {
-        let Some(draft) = &self.draft else { return };
-        let mut next = auto_arrange(&project_canvas(draft));
-        let before = self.canvas_layout.clone();
-        next.pan = before.pan;
-        next.zoom = before.zoom;
-        next.library_width = before.library_width;
-        next.inspector_width = before.inspector_width;
-        if before == next {
-            return;
-        }
-        self.canvas_layout = next.clone();
-        self.ui_edit_history.record_layout(LayoutEdit::Layout {
-            before,
-            after: next,
-        });
-        self.canvas_layout_dirty = true;
-    }
-
-    pub fn reset_canvas_zoom(&mut self) {
-        self.canvas_layout.zoom = 1.0;
-        self.canvas_layout_dirty = true;
-    }
-
-    fn record_canvas_layout_edit(&mut self, edit: LayoutEdit) {
-        self.ui_edit_history.record_layout(edit);
-        self.canvas_layout_dirty = true;
-    }
-
-    fn mark_canvas_layout_changed(&mut self) {
-        self.canvas_layout_dirty = true;
-    }
-
+    #[cfg(test)]
     pub fn fit_canvas_view(&mut self, canvas_size: [f32; 2]) {
         let Some(draft) = &self.draft else { return };
         let viewport = fit_view(
@@ -1279,8 +1317,8 @@ pub fn run_control_availability(state: &MacroPageState) -> RunControlAvailabilit
 pub struct MacroPage;
 
 impl MacroPage {
-    pub const BOTTOM_MIN_HEIGHT: f32 = 184.0;
-    pub const BOTTOM_DEFAULT_HEIGHT: f32 = 276.0;
+    pub const BOTTOM_MIN_HEIGHT: f32 = 168.0;
+    pub const BOTTOM_DEFAULT_HEIGHT: f32 = 204.0;
     pub const BOTTOM_MAX_HEIGHT: f32 = 520.0;
 
     pub fn show(ui: &mut Ui, state: &mut MacroPageState) {
@@ -1303,15 +1341,6 @@ impl MacroPage {
             .unwrap_or_default();
         let library_rows =
             project_library_rows(state, &monitor, &problems, last_completion.as_ref());
-        let canvas = state
-            .draft
-            .as_ref()
-            .map(|definition| project_canvas(definition))
-            .unwrap_or(CanvasProjection {
-                nodes: Vec::new(),
-                groups: Vec::new(),
-                edges: Vec::new(),
-            });
 
         ui.set_width(ui.available_width());
         ui.vertical(|ui| {
@@ -1331,8 +1360,7 @@ impl MacroPage {
                 select_canvas(state, CanvasSelection::Block(target));
             }
             ui.add_space(8.0);
-            if let Some(target) = workspace(ui, state, &library_rows, &canvas, &monitor, &problems)
-            {
+            if let Some(target) = workspace(ui, state, &library_rows, &monitor, &problems) {
                 select_canvas(state, target);
             }
         });
@@ -1599,6 +1627,7 @@ fn status_strip(
         .inner_margin(egui::Margin::same(11.0))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                let chrome = status_chrome(state);
                 status_fact(
                     ui,
                     "TARGET",
@@ -1609,46 +1638,15 @@ fn status_strip(
                         .filter(|title| !title.is_empty())
                         .unwrap_or("No target selected"),
                 );
-                status_fact(ui, "WINDOW", "Not connected");
-                status_fact(ui, "FOREGROUND", "Unknown");
-                status_fact(
-                    ui,
-                    "DISPLAY",
-                    state
-                        .draft
-                        .as_ref()
-                        .map(|definition| {
-                            format!(
-                                "{}x{} | {} DPI",
-                                definition.target.captured_client_width,
-                                definition.target.captured_client_height,
-                                definition.target.captured_dpi
-                            )
-                        })
-                        .as_deref()
-                        .unwrap_or("--"),
-                );
-                status_fact(ui, "GEOMETRY", "Snapshot only");
+                status_fact(ui, "WINDOW", chrome.window.as_str());
+                status_fact(ui, "FOREGROUND", chrome.foreground.as_str());
+                status_fact(ui, "DISPLAY", chrome.display.as_str());
+                status_fact(ui, "GEOMETRY", chrome.geometry.as_str());
                 status_fact(ui, "REVISION", revision_summary(state, monitor).as_str());
                 status_fact(ui, "VALIDATION", validation_summary(state, problems));
             });
             ui.add_space(9.0);
             ui.horizontal_wrapped(|ui| {
-                if state.draft.is_none()
-                    && ui
-                        .add_enabled(
-                            state.wizard.is_none() && state.active_wizard_request.is_none(),
-                            Button::new("Create starter draft"),
-                        )
-                        .clicked()
-                {
-                    state.begin_draft_session();
-                    state.draft = Some(EditorDraft::new(starter_macro_definition()));
-                    state.selected_block_id = Some("observe-1".into());
-                    state.selected_canvas = Some(CanvasSelection::Block("observe-1".into()));
-                    state.editor_feedback =
-                        Some("Created an unsaved starter draft for editor authoring.".into());
-                }
                 let wizard_pending = state.active_wizard_request.is_some();
                 if state.wizard.is_none()
                     && ui
@@ -1697,12 +1695,58 @@ fn status_strip(
                 if ui.add_enabled(can_save, Button::new("Save")).clicked() {
                     state.enqueue_intent(MacroIntent::Save);
                 }
+                let history_open = state.run_history.is_some();
+                if ui
+                    .add(Button::new(if history_open {
+                        "Close History"
+                    } else {
+                        "History"
+                    }))
+                    .clicked()
+                {
+                    if history_open {
+                        state.run_history = None;
+                    } else {
+                        state.enqueue_intent(MacroIntent::ShowHistory);
+                    }
+                }
                 if let Some(target) = inspector::problem_navigation_target(problems, 0) {
                     if ui.small_button("Open first problem").clicked() {
                         navigate = Some(target);
                     }
                 }
             });
+            if let Some(rows) = state.run_history.clone() {
+                ui.add_space(8.0);
+                if rows.is_empty() {
+                    ui.label(
+                        RichText::new("No saved run history.")
+                            .size(text::SUPPORTING)
+                            .color(Color32::from_gray(176)),
+                    );
+                } else {
+                    for row in rows {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(row.run_id.as_str())
+                                    .monospace()
+                                    .size(text::META)
+                                    .color(Color32::from_gray(202)),
+                            );
+                            ui.label(
+                                RichText::new(format!("{} bytes", row.bytes))
+                                    .size(text::META)
+                                    .color(Color32::from_gray(150)),
+                            );
+                            if ui.small_button("Delete").clicked() {
+                                state.enqueue_intent(MacroIntent::DeleteHistory {
+                                    run_id: row.run_id,
+                                });
+                            }
+                        });
+                    }
+                }
+            }
         });
     navigate
 }
@@ -1927,6 +1971,76 @@ fn status_fact(ui: &mut Ui, label: &str, value: &str) {
     ui.add_space(10.0);
 }
 
+fn snapshot_display(state: &MacroPageState) -> Option<String> {
+    state.draft.as_ref().map(|definition| {
+        format!(
+            "{}x{} | {} DPI",
+            definition.target.captured_client_width,
+            definition.target.captured_client_height,
+            definition.target.captured_dpi
+        )
+    })
+}
+
+fn status_chrome(state: &MacroPageState) -> StatusChrome {
+    let snapshot = snapshot_display(state);
+    match &state.live_target {
+        LiveTargetStatus::Unbound => StatusChrome {
+            window: "Not connected".into(),
+            foreground: "Not bound".into(),
+            display: snapshot.clone().unwrap_or_else(|| "--".into()),
+            geometry: if snapshot.is_some() {
+                "Snapshot only".into()
+            } else {
+                "--".into()
+            },
+        },
+        LiveTargetStatus::Bound(facts) => {
+            let foreground = if !facts.is_visible {
+                "Hidden"
+            } else if facts.is_minimized {
+                "Minimized"
+            } else if facts.is_foreground {
+                "Foreground"
+            } else {
+                "Background"
+            };
+            let title = if facts.title.is_empty() {
+                "Connected".to_string()
+            } else {
+                facts.title.clone()
+            };
+            StatusChrome {
+                window: title,
+                foreground: foreground.into(),
+                display: format!(
+                    "{}x{} | {} DPI",
+                    facts.client_width, facts.client_height, facts.dpi
+                ),
+                geometry: format!("Live {}x{}", facts.client_width, facts.client_height),
+            }
+        }
+        LiveTargetStatus::Lost { title } => StatusChrome {
+            window: if title.is_empty() {
+                "Lost".into()
+            } else {
+                format!("Lost ({title})")
+            },
+            foreground: "Unknown".into(),
+            display: snapshot.unwrap_or_else(|| "--".into()),
+            geometry: "Snapshot only".into(),
+        },
+    }
+}
+
+fn pane_widths_for_mode(layout: &MacroCanvasLayout, compact: bool) -> (f32, f32) {
+    let max = if compact { 230.0 } else { 340.0 };
+    (
+        layout.sanitized_library_width().clamp(150.0, max),
+        layout.sanitized_inspector_width().clamp(170.0, max),
+    )
+}
+
 fn revision_summary(state: &MacroPageState, monitor: &MonitorProjection) -> String {
     let draft = state
         .draft
@@ -1948,7 +2062,6 @@ fn workspace(
     ui: &mut Ui,
     state: &mut MacroPageState,
     library_rows: &[MacroLibraryRow],
-    canvas: &CanvasProjection,
     monitor: &MonitorProjection,
     problems: &[ValidationProblem],
 ) -> Option<CanvasSelection> {
@@ -1977,11 +2090,12 @@ fn workspace(
     match pane_mode(ui.available_width()) {
         PaneMode::ThreePane | PaneMode::ThreePaneCompact => {
             let compact = pane_mode(ui.available_width()) == PaneMode::ThreePaneCompact;
-            let side_width = if compact { 175.0 } else { 250.0 };
+            let (library_width, inspector_width) =
+                pane_widths_for_mode(&state.canvas_layout, compact);
             let side_max = if compact { 230.0 } else { 340.0 };
-            egui::SidePanel::left("macro-library-pane")
+            let library_panel = egui::SidePanel::left("macro-library-pane")
                 .resizable(true)
-                .default_width(side_width)
+                .default_width(library_width)
                 .min_width(150.0)
                 .max_width(side_max)
                 .show_inside(ui, |ui| {
@@ -1989,9 +2103,9 @@ fn workspace(
                         library_pane(ui, state, &filtered_rows);
                     });
                 });
-            egui::SidePanel::right("macro-inspector-pane")
+            let inspector_panel = egui::SidePanel::right("macro-inspector-pane")
                 .resizable(true)
-                .default_width(side_width)
+                .default_width(inspector_width)
                 .min_width(170.0)
                 .max_width(side_max)
                 .show_inside(ui, |ui| {
@@ -2001,31 +2115,41 @@ fn workspace(
                         }
                     });
                 });
+            state.record_side_pane_widths(
+                (library_width, library_panel.response.rect.width()),
+                (inspector_width, inspector_panel.response.rect.width()),
+            );
             egui::CentralPanel::default()
                 .frame(Frame::none())
                 .show_inside(ui, |ui| {
-                    section(ui, "EVENT CANVAS", |ui| {
+                    section(ui, "STEPS", |ui| {
                         editor_toolbar(ui, state);
-                        selection = show_interactive_canvas(
-                            ui,
-                            state,
-                            canvas,
-                            monitor.active_block.as_deref(),
-                            selected_canvas.as_ref(),
-                        );
+                        let list_height = (ui.available_height() - 160.0).max(180.0);
+                        ui.allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
+                            selection = show_step_list(
+                                ui,
+                                state,
+                                monitor.active_block.as_deref(),
+                                selected_canvas.as_ref(),
+                            );
+                        });
+                        editor_selection_actions(ui, state);
                     });
                 });
         }
         PaneMode::CanvasWithDrawers => {
-            section(ui, "EVENT CANVAS", |ui| {
+            section(ui, "STEPS", |ui| {
                 editor_toolbar(ui, state);
-                selection = show_interactive_canvas(
-                    ui,
-                    state,
-                    canvas,
-                    monitor.active_block.as_deref(),
-                    selected_canvas.as_ref(),
-                );
+                let list_height = (ui.available_height() - 160.0).max(180.0);
+                ui.allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
+                    selection = show_step_list(
+                        ui,
+                        state,
+                        monitor.active_block.as_deref(),
+                        selected_canvas.as_ref(),
+                    );
+                });
+                editor_selection_actions(ui, state);
             });
             ui.add_space(8.0);
             egui::CollapsingHeader::new("Library drawer")
@@ -2157,29 +2281,26 @@ fn create_starter_draft(state: &mut MacroPageState) {
     state.editor_feedback = Some("Created an unsaved starter draft for editor authoring.".into());
 }
 
-fn show_interactive_canvas(
+fn show_step_list(
     ui: &mut Ui,
     state: &mut MacroPageState,
-    canvas: &CanvasProjection,
     active_block: Option<&str>,
     current_selection: Option<&CanvasSelection>,
 ) -> Option<CanvasSelection> {
-    if canvas.nodes.is_empty() {
-        ui.label("Create or select a macro to inspect its canonical blocks.");
+    if state.draft.is_none() {
+        ui.label("Create or select a macro to inspect its steps.");
         return None;
     }
     let shortcuts = !ui.ctx().wants_keyboard_input()
         && ui.input(|input| {
             (input.modifiers.command && input.key_pressed(egui::Key::Z))
                 || (input.modifiers.command && input.key_pressed(egui::Key::Y))
-                || input.key_pressed(egui::Key::F)
         });
     if shortcuts {
         let input = ui.input(|input| {
             (
                 input.modifiers.command && input.key_pressed(egui::Key::Z),
                 input.modifiers.command && input.key_pressed(egui::Key::Y),
-                input.key_pressed(egui::Key::F),
             )
         });
         if input.0 {
@@ -2188,48 +2309,13 @@ fn show_interactive_canvas(
         if input.1 {
             let _ = dispatch_editor_command(state, EditorCommand::Redo);
         }
-        if input.2 {
-            state.fit_canvas_view([ui.available_width().max(1.0), canvas::CANVAS_HEIGHT]);
-        }
     }
-    let editable = state.editor_mutations_allowed();
-    let response = canvas::show(
-        ui,
-        canvas,
-        &mut state.canvas_layout,
-        current_selection,
-        active_block,
-        state.draft.as_ref(),
-        editable,
-    );
-    apply_canvas_response(state, response)
-}
-
-fn apply_canvas_response(
-    state: &mut MacroPageState,
-    response: canvas::CanvasResponse,
-) -> Option<CanvasSelection> {
-    if response.layout_changed {
-        state.mark_canvas_layout_changed();
-    }
-    if let Some(edit) = response.layout_edit {
-        state.record_canvas_layout_edit(edit);
-    }
-    if let Some(command) = response.editor_command {
-        let _ = dispatch_editor_command(state, command);
-    }
-    match response.action {
-        Some(canvas::CanvasAction::RejectedConnection(message)) => {
-            state.editor_feedback = Some(format!("Connection rejected: {message}"));
-        }
-        Some(canvas::CanvasAction::OpenAddStep { source, .. }) => {
-            state.pending_canvas_port = Some(source);
-            state.editor_feedback =
-                Some("Choose a block below to add it at the connector drop location.".into());
-        }
-        _ => {}
-    }
-    response.selection
+    let Some(draft) = state.draft.as_ref() else {
+        ui.label("Create or select a macro to inspect its steps.");
+        return None;
+    };
+    let rows = step_list::project_step_list(draft);
+    step_list::show(ui, &rows, current_selection, active_block)
 }
 
 fn dispatch_editor_command(
@@ -2418,15 +2504,21 @@ fn inspector_editor_command(
             timeout_ms: timeout_ms.clone(),
             cooldown_ms: *cooldown_ms,
         },
+        InspectorIntent::SetAction { block_id, action } => EditorCommand::SetAction {
+            path: path(block_id)?,
+            action: action.clone(),
+        },
+        InspectorIntent::AddWatchLane { block_id } => {
+            let draft = draft.ok_or_else(|| "No draft is open.".to_string())?;
+            return Ok(Some(watch_insert_lane_command(draft, block_id)?));
+        }
     };
     Ok(Some(command))
 }
 
 fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
     let editable = state.editor_mutations_allowed();
-    let selected = state.selected_block_id.clone();
     let selected_canvas = current_canvas_selection(state);
-    let pending_canvas_port = state.pending_canvas_port.clone();
     if let Some(feedback) = &state.editor_feedback {
         ui.label(
             RichText::new(feedback)
@@ -2460,18 +2552,6 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
         if ui.add_enabled(editable, Button::new("Redo")).clicked() {
             let _ = dispatch_editor_command(state, EditorCommand::Redo);
         }
-        if ui
-            .add_enabled(editable, Button::new("Auto arrange"))
-            .clicked()
-        {
-            state.auto_arrange_canvas();
-        }
-        if ui.button("Fit view").clicked() {
-            state.fit_canvas_view([ui.available_width().max(1.0), 600.0]);
-        }
-        if ui.button("Reset zoom").clicked() {
-            state.reset_canvas_zoom();
-        }
         if ui.add_enabled(editable, Button::new("+ Note")).clicked() {
             if let Some(draft) = &state.draft {
                 let block = crate::engine::macro_engine::Block {
@@ -2481,35 +2561,24 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                         text: "New step".into(),
                     },
                 };
-                let target = if let Some(port) = pending_canvas_port.as_ref() {
-                    match insertion_target_for_port(&draft.definition, port) {
-                        Ok(target) => target,
-                        Err(error) => {
-                            state.editor_feedback =
-                                Some(format!("Connection rejected: {}", error.message()));
-                            return;
-                        }
-                    }
-                } else {
-                    InsertionTarget {
-                        container: ContainerPath::Root,
-                        index: draft.blocks.len(),
-                    }
-                };
-                if dispatch_editor_command(state, EditorCommand::InsertBlock { target, block })
-                    .is_ok()
-                {
-                    state.pending_canvas_port = None;
-                }
+                let target = insertion_target(draft, selected_canvas.as_ref());
+                let _ =
+                    dispatch_editor_command(state, EditorCommand::InsertBlock { target, block });
             }
         }
     });
+    ui.label(
+        RichText::new("Add step")
+            .size(text::SUPPORTING)
+            .color(Color32::from_gray(174)),
+    );
     ui.horizontal_wrapped(|ui| {
         for (label, kind) in [
             ("+ Observe", PaletteKind::Observe),
             ("+ Action", PaletteKind::Action),
             ("+ IF", PaletteKind::If),
             ("+ Repeat", PaletteKind::Repeat),
+            ("+ Continuous", PaletteKind::Continuous),
             ("+ Watch", PaletteKind::Watch),
             ("+ Wait", PaletteKind::Wait),
             ("+ Stop", PaletteKind::Stop),
@@ -2520,26 +2589,24 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                     .as_ref()
                     .ok_or_else(|| "No draft is open.".to_string())
                     .and_then(|draft| {
-                        let command =
-                            palette_command_for_selection(draft, selected_canvas.as_ref(), kind)?;
-                        if let Some(port) = pending_canvas_port.as_ref() {
-                            retarget_insert_command(draft, port, command)
-                        } else {
-                            Ok(command)
-                        }
+                        palette_command_for_selection(draft, selected_canvas.as_ref(), kind)
                     });
                 match command {
                     Ok(command) => {
-                        if dispatch_editor_command(state, command).is_ok() {
-                            state.pending_canvas_port = None;
-                        }
+                        let _ = dispatch_editor_command(state, command);
                     }
                     Err(message) => state.editor_feedback = Some(message),
                 }
             }
         }
     });
-    let Some(selected) = selected else { return };
+}
+
+fn editor_selection_actions(ui: &mut Ui, state: &mut MacroPageState) {
+    let editable = state.editor_mutations_allowed();
+    let Some(selected) = state.selected_block_id.clone() else {
+        return;
+    };
     if let Some((group_id, index, len, enabled)) = state
         .draft
         .as_ref()
@@ -2586,11 +2653,24 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                 let _ = dispatch_editor_command(
                     state,
                     EditorCommand::SetLaneEnabled {
-                        group_id,
+                        group_id: group_id.clone(),
                         lane_id: selected.clone(),
                         enabled: !enabled,
                     },
                 );
+            }
+            if ui.add_enabled(editable, Button::new("Add Lane")).clicked() {
+                match state
+                    .draft
+                    .as_ref()
+                    .ok_or_else(|| "No draft is open.".to_string())
+                    .and_then(|draft| watch_insert_lane_command(draft, &group_id))
+                {
+                    Ok(command) => {
+                        let _ = dispatch_editor_command(state, command);
+                    }
+                    Err(message) => state.editor_feedback = Some(message),
+                }
             }
         });
         return;
@@ -2667,6 +2747,23 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                     },
                 },
             );
+        }
+        if matches!(
+            block.as_ref().map(|block| &block.kind),
+            Some(crate::engine::macro_engine::BlockKind::WatchGroup { .. })
+        ) && ui.add_enabled(editable, Button::new("Add Lane")).clicked()
+        {
+            match state
+                .draft
+                .as_ref()
+                .ok_or_else(|| "No draft is open.".to_string())
+                .and_then(|draft| watch_insert_lane_command(draft, &selected))
+            {
+                Ok(command) => {
+                    let _ = dispatch_editor_command(state, command);
+                }
+                Err(message) => state.editor_feedback = Some(message),
+            }
         }
         if !matches!(path.container, ContainerPath::Root)
             && ui
@@ -2818,19 +2915,6 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
             });
         }
     }
-}
-
-fn retarget_insert_command(
-    draft: &EditorDraft,
-    port: &canvas_model::OutputPort,
-    command: EditorCommand,
-) -> Result<EditorCommand, String> {
-    let EditorCommand::InsertBlock { block, .. } = command else {
-        return Err("Canvas Add step can only insert a new canonical block.".into());
-    };
-    let target = insertion_target_for_port(&draft.definition, port)
-        .map_err(|error| format!("Connection rejected: {}", error.message()))?;
-    Ok(EditorCommand::InsertBlock { target, block })
 }
 
 fn conversion_preview_ui(ui: &mut Ui, pending: &mut PendingConversion) {
@@ -3200,6 +3284,7 @@ fn conversion_choices(
             }
         }
         BlockKind::RepeatN { .. } => {
+            targets.push(("Continuous".into(), ConversionTarget::Continuous));
             for (source_id, condition) in observation_sources(draft) {
                 targets.push((
                     format!("Repeat Until: {source_id}"),
@@ -3211,7 +3296,20 @@ fn conversion_choices(
             }
         }
         BlockKind::RepeatUntil { .. } => {
-            targets.push(("Repeat N".into(), ConversionTarget::RepeatN { count: 2 }))
+            targets.push(("Repeat N".into(), ConversionTarget::RepeatN { count: 2 }));
+            targets.push(("Continuous".into(), ConversionTarget::Continuous));
+        }
+        BlockKind::Continuous { .. } => {
+            targets.push(("Repeat N".into(), ConversionTarget::RepeatN { count: 2 }));
+            for (source_id, condition) in observation_sources(draft) {
+                targets.push((
+                    format!("Repeat Until: {source_id}"),
+                    ConversionTarget::RepeatUntil {
+                        condition: condition_with_source(condition, source_id),
+                        max_iterations: Limit::Finite(100),
+                    },
+                ));
+            }
         }
         _ => {}
     }
@@ -3275,6 +3373,7 @@ fn conversion_target_changes(
                 button: target_button,
             },
         ) => region_id != target_id || button != target_button,
+        (BlockKind::Continuous { .. }, ConversionTarget::Continuous) => false,
         _ => true,
     }
 }
@@ -3462,9 +3561,9 @@ fn conversion_target_family(target: &ConversionTarget) -> BlockFamily {
         ConversionTarget::ClickPoint { .. } | ConversionTarget::ClickRegion { .. } => {
             BlockFamily::SavedLocationClick
         }
-        ConversionTarget::RepeatN { .. } | ConversionTarget::RepeatUntil { .. } => {
-            BlockFamily::Loop
-        }
+        ConversionTarget::RepeatN { .. }
+        | ConversionTarget::RepeatUntil { .. }
+        | ConversionTarget::Continuous => BlockFamily::Loop,
     }
 }
 
@@ -3502,7 +3601,9 @@ fn block_family_for_ui(block: &crate::engine::macro_engine::Block) -> BlockFamil
         BlockKind::Action {
             action: Action::ClickPoint { .. } | Action::ClickRegion { .. },
         } => BlockFamily::SavedLocationClick,
-        BlockKind::RepeatN { .. } | BlockKind::RepeatUntil { .. } => BlockFamily::Loop,
+        BlockKind::RepeatN { .. }
+        | BlockKind::RepeatUntil { .. }
+        | BlockKind::Continuous { .. } => BlockFamily::Loop,
         _ => BlockFamily::Other,
     }
 }
@@ -3523,6 +3624,7 @@ enum PaletteKind {
     Action,
     If,
     Repeat,
+    Continuous,
     Watch,
     Wait,
     Stop,
@@ -3564,6 +3666,7 @@ fn palette_command_for_selection(
             PaletteKind::Action => "action",
             PaletteKind::If => "if",
             PaletteKind::Repeat => "repeat",
+            PaletteKind::Continuous => "continuous",
             PaletteKind::Watch => "watch",
             PaletteKind::Wait => "wait",
             PaletteKind::Stop => "stop",
@@ -3622,6 +3725,7 @@ fn palette_command_for_selection(
             count: 2,
             body: vec![],
         },
+        PaletteKind::Continuous => BlockKind::Continuous { body: vec![] },
         PaletteKind::Watch => {
             let Some((source_id, condition)) = source else {
                 return Err("Add or select an observation before inserting a Watch Group.".into());
@@ -3660,6 +3764,50 @@ fn palette_command_for_selection(
             id,
             enabled: true,
             kind,
+        },
+    })
+}
+
+fn watch_insert_lane_command(draft: &EditorDraft, group_id: &str) -> Result<EditorCommand, String> {
+    use crate::engine::macro_engine::{
+        BlockKind, Condition, MAX_WATCH_GROUP_LANES, PassiveCondition, WatchLane,
+    };
+    let path = locate_block_path(draft, group_id)
+        .ok_or_else(|| format!("Watch Group '{group_id}' is no longer available."))?;
+    let block = block_at_path(draft, &path)
+        .ok_or_else(|| format!("Watch Group '{group_id}' is no longer available."))?;
+    let BlockKind::WatchGroup { group } = &block.kind else {
+        return Err("Add Lane needs a selected Watch Group.".into());
+    };
+    if group.lanes.len() >= MAX_WATCH_GROUP_LANES {
+        return Err(format!(
+            "Watch Group supports at most {MAX_WATCH_GROUP_LANES} lanes."
+        ));
+    }
+    let condition = if let Some(lane) = group.lanes.first() {
+        lane.condition.clone()
+    } else {
+        let Some((source_id, condition)) = observation_source(draft, None) else {
+            return Err("Add or select an observation before adding a Watch lane.".into());
+        };
+        match condition {
+            Condition::Text { rule_id, .. } => PassiveCondition::Text {
+                source_block_id: source_id,
+                rule_id,
+            },
+            Condition::Image { rule_id, .. } => PassiveCondition::Image {
+                source_block_id: source_id,
+                rule_id,
+            },
+        }
+    };
+    Ok(EditorCommand::InsertLane {
+        group_id: group_id.to_string(),
+        lane: WatchLane {
+            id: next_unique_id(draft, "lane"),
+            enabled: true,
+            condition,
+            then_body: vec![],
         },
     })
 }
@@ -4063,6 +4211,82 @@ mod tests {
     fn bottom_panel_has_a_resizable_height_range_for_compact_layouts() {
         assert!(MacroPage::BOTTOM_MIN_HEIGHT < MacroPage::BOTTOM_DEFAULT_HEIGHT);
         assert!(MacroPage::BOTTOM_DEFAULT_HEIGHT < MacroPage::BOTTOM_MAX_HEIGHT);
+        assert!(MacroPage::BOTTOM_DEFAULT_HEIGHT <= 220.0);
+    }
+
+    #[test]
+    fn unbound_status_does_not_claim_a_live_window() {
+        let chrome = status_chrome(&MacroPageState::default());
+        assert_eq!(chrome.window, "Not connected");
+        assert_eq!(chrome.foreground, "Not bound");
+        assert_eq!(chrome.display, "--");
+        assert_eq!(chrome.geometry, "--");
+    }
+
+    #[test]
+    fn unbound_draft_keeps_snapshot_geometry() {
+        let state = MacroPageState {
+            draft: Some(fixture()),
+            ..MacroPageState::default()
+        };
+        let chrome = status_chrome(&state);
+        assert_eq!(chrome.window, "Not connected");
+        assert_eq!(chrome.foreground, "Not bound");
+        assert_eq!(chrome.display, "1280x720 | 96 DPI");
+        assert_eq!(chrome.geometry, "Snapshot only");
+    }
+
+    #[test]
+    fn bound_status_uses_live_capture_facts() {
+        let mut state = MacroPageState::default();
+        state.live_target = LiveTargetStatus::Bound(LiveTargetFacts {
+            title: "Diablo IV".into(),
+            is_foreground: true,
+            is_visible: true,
+            is_minimized: false,
+            client_width: 1920,
+            client_height: 1080,
+            dpi: 144,
+        });
+        let chrome = status_chrome(&state);
+        assert_eq!(chrome.window, "Diablo IV");
+        assert_eq!(chrome.foreground, "Foreground");
+        assert_eq!(chrome.display, "1920x1080 | 144 DPI");
+        assert_eq!(chrome.geometry, "Live 1920x1080");
+    }
+
+    #[test]
+    fn lost_binding_does_not_pretend_connected() {
+        let mut state = MacroPageState::default();
+        state.live_target = LiveTargetStatus::Lost {
+            title: "Diablo IV".into(),
+        };
+        let chrome = status_chrome(&state);
+        assert_eq!(chrome.window, "Lost (Diablo IV)");
+        assert_eq!(chrome.foreground, "Unknown");
+        assert_eq!(chrome.geometry, "Snapshot only");
+    }
+
+    #[test]
+    fn empty_run_history_stays_honest() {
+        assert_eq!(run_history_feedback(&[]), "No saved run history.");
+        let mut state = MacroPageState::default();
+        state.open_run_history(Vec::new());
+        assert_eq!(state.run_history.as_ref().map(Vec::len), Some(0));
+        state.enqueue_intent(MacroIntent::ShowHistory);
+        assert!(matches!(
+            state.take_intent(),
+            Some(MacroIntent::ShowHistory)
+        ));
+    }
+
+    #[test]
+    fn persisted_pane_widths_follow_the_list_mode_range() {
+        let mut layout = MacroCanvasLayout::default();
+        layout.library_width = 260.0;
+        layout.inspector_width = 320.0;
+        assert_eq!(pane_widths_for_mode(&layout, false), (260.0, 320.0));
+        assert_eq!(pane_widths_for_mode(&layout, true), (230.0, 230.0));
     }
 
     #[test]
@@ -4360,6 +4584,7 @@ mod tests {
             PaletteKind::Action,
             PaletteKind::If,
             PaletteKind::Repeat,
+            PaletteKind::Continuous,
             PaletteKind::Watch,
             PaletteKind::Wait,
             PaletteKind::Stop,
@@ -4419,6 +4644,41 @@ mod tests {
                 owner_id: "observe-1".into()
             }
         );
+    }
+
+    #[test]
+    fn palette_inserts_continuous_beside_repeat() {
+        let mut draft = fixture();
+        let command = palette_command(&draft, Some("observe-1"), PaletteKind::Continuous).unwrap();
+        let EditorCommand::InsertBlock { block, target } = command else {
+            panic!()
+        };
+        assert!(matches!(block.kind, BlockKind::Continuous { .. }));
+        assert_eq!(target.container, ContainerPath::Root);
+        apply_editor_command(&mut draft, EditorCommand::InsertBlock { target, block }).unwrap();
+        assert!(
+            draft
+                .blocks
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Continuous { .. }))
+        );
+    }
+
+    #[test]
+    fn watch_add_lane_appends_a_second_lane() {
+        let mut draft = fixture();
+        let command = palette_command(&draft, Some("observe-1"), PaletteKind::Watch).unwrap();
+        apply_editor_command(&mut draft, command).unwrap();
+        let watch_id = draft
+            .blocks
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::WatchGroup { .. }))
+            .map(|block| block.id.clone())
+            .expect("watch");
+        assert_eq!(draft.watch_lane_ids(&watch_id).len(), 1);
+        let command = watch_insert_lane_command(&draft, &watch_id).unwrap();
+        apply_editor_command(&mut draft, command).unwrap();
+        assert_eq!(draft.watch_lane_ids(&watch_id).len(), 2);
     }
 
     #[test]

@@ -71,6 +71,34 @@ fn persisted_layout_round_trip_leaves_definition_unchanged() {
 }
 
 #[test]
+fn persisted_pane_widths_round_trip_leaves_definition_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut store, _) = UiStateStore::open(temp.path().join("ui-state.json"));
+    let definition = fixture_definition();
+    let definition_before = definition.clone();
+    let saved = SavedMacroIdentity {
+        macro_id: definition.id.clone(),
+        revision: definition.revision,
+        definition_hash: "definition-hash".into(),
+    };
+    let mut state = MacroPageState::default();
+    state.load_saved_draft(definition.clone(), saved.clone());
+    state.set_pane_widths(260.0, 300.0);
+    state.persist_canvas_layout(&mut store);
+
+    let mut reopened = MacroPageState::default();
+    reopened.load_saved_draft(definition, saved);
+    reopened.hydrate_canvas_layout(&store);
+
+    assert_eq!(reopened.canvas_layout.library_width, 260.0);
+    assert_eq!(reopened.canvas_layout.inspector_width, 300.0);
+    assert_eq!(
+        reopened.draft.as_ref().unwrap().definition,
+        definition_before
+    );
+}
+
+#[test]
 fn corrupt_layout_recovery_preserves_canonical_definition() {
     let definition = fixture_definition();
     let recovered = reconcile_layout(&project_canvas(&definition), corrupt_layout());

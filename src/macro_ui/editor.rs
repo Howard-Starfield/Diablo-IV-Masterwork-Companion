@@ -1,0 +1,3741 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+use crate::engine::macro_engine::{
+    Action, AssetRef, Block, BlockKind, Condition, ImageRule, Limit, MacroDefinition, MouseButton,
+    ObserveMode, PassiveCondition, TextRule, TimeoutOutcome, ValidationProblem,
+};
+use crate::engine::types::RectRatio;
+use std::ops::{Deref, DerefMut};
+
+const EDITOR_UNDO_LIMIT: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DraftStatus {
+    Ready,
+    NeedsValidation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DraftEditability {
+    Editable,
+    Running { revision: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct UndoEntry {
+    definition: MacroDefinition,
+    invalidated_source_ids: BTreeSet<String>,
+    detector_test_failures: BTreeMap<String, DetectorTestFailure>,
+}
+
+/// Editor-only state. The canonical definition never stores removed conversion data or undo data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditorDraft {
+    pub definition: MacroDefinition,
+    pub status: DraftStatus,
+    pub editability: DraftEditability,
+    invalidated_source_ids: BTreeSet<String>,
+    detector_test_failures: BTreeMap<String, DetectorTestFailure>,
+    undo: VecDeque<UndoEntry>,
+    redo: VecDeque<UndoEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectorTestFailure {
+    detector_fingerprint: String,
+    message: String,
+}
+
+impl EditorDraft {
+    pub fn new(definition: MacroDefinition) -> Self {
+        Self {
+            definition,
+            status: DraftStatus::Ready,
+            editability: DraftEditability::Editable,
+            invalidated_source_ids: BTreeSet::new(),
+            detector_test_failures: BTreeMap::new(),
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
+        }
+    }
+
+    pub fn invalidated_source_ids(&self) -> &BTreeSet<String> {
+        &self.invalidated_source_ids
+    }
+
+    pub fn watch_lane_ids(&self, group_id: &str) -> Vec<&str> {
+        find_block(&self.definition.blocks, group_id)
+            .and_then(|block| match &block.kind {
+                BlockKind::WatchGroup { group } => {
+                    Some(group.lanes.iter().map(|lane| lane.id.as_str()).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    pub fn redo_len(&self) -> usize {
+        self.redo.len()
+    }
+
+    pub fn record_detector_test_failure(
+        &mut self,
+        block_id: impl Into<String>,
+        detector_fingerprint: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.detector_test_failures.insert(
+            block_id.into(),
+            DetectorTestFailure {
+                detector_fingerprint: detector_fingerprint.into(),
+                message: message.into(),
+            },
+        );
+        self.status = DraftStatus::NeedsValidation;
+    }
+
+    pub fn clear_detector_test_failure(&mut self, block_id: &str) {
+        self.detector_test_failures.remove(block_id);
+    }
+
+    fn has_current_detector_test_failure(&self) -> bool {
+        self.detector_test_failures
+            .iter()
+            .any(|(block_id, failure)| {
+                detector_fingerprint_for_block(&self.definition, block_id).as_deref()
+                    == Some(failure.detector_fingerprint.as_str())
+            })
+    }
+
+    fn prune_superseded_detector_test_failures(&mut self) {
+        let definition = &self.definition;
+        self.detector_test_failures.retain(|block_id, failure| {
+            detector_fingerprint_for_block(definition, block_id).as_deref()
+                == Some(failure.detector_fingerprint.as_str())
+        });
+    }
+}
+
+impl Deref for EditorDraft {
+    type Target = MacroDefinition;
+    fn deref(&self) -> &Self::Target {
+        &self.definition
+    }
+}
+impl DerefMut for EditorDraft {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.definition
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ContainerPath {
+    Root,
+    IfThen { if_id: String },
+    IfElse { if_id: String },
+    LoopBody { loop_id: String },
+    WatchLaneBody { watch_id: String, lane_id: String },
+    TimeoutBody { owner_id: String },
+}
+
+impl ContainerPath {
+    fn owner_ids(&self) -> impl Iterator<Item = &str> {
+        let mut owners = [None, None];
+        match self {
+            Self::Root => {}
+            Self::IfThen { if_id } | Self::IfElse { if_id } => {
+                owners[0] = Some(if_id.as_str());
+            }
+            Self::LoopBody { loop_id } => owners[0] = Some(loop_id.as_str()),
+            Self::WatchLaneBody { watch_id, lane_id } => {
+                owners[0] = Some(watch_id.as_str());
+                owners[1] = Some(lane_id.as_str());
+            }
+            Self::TimeoutBody { owner_id } => owners[0] = Some(owner_id.as_str()),
+        }
+        owners.into_iter().flatten()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlockPath {
+    pub container: ContainerPath,
+    pub block_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InsertionTarget {
+    pub container: ContainerPath,
+    /// Index in the destination after removal for a move operation.
+    pub index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfBranch {
+    Then,
+    Else,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopDeletionChoice {
+    DeleteWithContents,
+    KeepContents,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildDisposition {
+    DeleteOwnedContents,
+    KeepOwnedContents,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockFamily {
+    TextObservation,
+    ImageObservation,
+    TextMatchedClick,
+    ImageMatchedClick,
+    SavedLocationClick,
+    Loop,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversionPreview {
+    Compatible {
+        preserved_fields: Vec<&'static str>,
+        required_fields: Vec<&'static str>,
+        removed_fields: Vec<&'static str>,
+    },
+    ReplaceRequired {
+        from: BlockFamily,
+        to: BlockFamily,
+        reason: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConversionTarget {
+    TextObservation {
+        mode: ObserveMode,
+    },
+    ImageObservation {
+        mode: ObserveMode,
+    },
+    ClickTextMatch {
+        button: MouseButton,
+    },
+    ClickImageMatch {
+        button: MouseButton,
+    },
+    ClickPoint {
+        point_id: String,
+        button: MouseButton,
+    },
+    ClickRegion {
+        region_id: String,
+        button: MouseButton,
+    },
+    RepeatN {
+        count: u32,
+    },
+    RepeatUntil {
+        condition: Condition,
+        max_iterations: Limit<u64>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditorCommand {
+    InsertBlock {
+        target: InsertionTarget,
+        block: Block,
+    },
+    RemoveBlock {
+        path: BlockPath,
+        loop_choice: Option<LoopDeletionChoice>,
+    },
+    DuplicateBlock {
+        source: BlockPath,
+        target: InsertionTarget,
+    },
+    SetBlockEnabled {
+        path: BlockPath,
+        enabled: bool,
+    },
+    SetLaneEnabled {
+        group_id: String,
+        lane_id: String,
+        enabled: bool,
+    },
+    ReorderSibling {
+        path: BlockPath,
+        to_index: usize,
+    },
+    MoveBlock {
+        source: BlockPath,
+        target: InsertionTarget,
+    },
+    TransferIfBranch {
+        if_id: String,
+        branch: IfBranch,
+        block_id: String,
+        to_index: usize,
+    },
+    MoveLane {
+        group_id: String,
+        lane_id: String,
+        to_index: usize,
+    },
+    ConvertBlock {
+        path: BlockPath,
+        target: ConversionTarget,
+    },
+    SetConditionMode {
+        path: BlockPath,
+        mode: ObserveMode,
+    },
+    SetWaitDuration {
+        path: BlockPath,
+        duration_ms: u64,
+    },
+    SetRepeatCount {
+        path: BlockPath,
+        count: u32,
+    },
+    SetRepeatUntilMax {
+        path: BlockPath,
+        max_iterations: Limit<u64>,
+    },
+    SetWatchSettings {
+        path: BlockPath,
+        timeout_ms: Limit<u64>,
+        cooldown_ms: u64,
+    },
+    ReplaceBlock {
+        path: BlockPath,
+        replacement: Block,
+        children: ChildDisposition,
+    },
+    ReplaceTarget {
+        target: crate::engine::macro_engine::TargetProfile,
+    },
+    ReplaceTextRule {
+        rule: TextRule,
+    },
+    ReplaceImageRule {
+        rule: ImageRule,
+    },
+    ApplyRecapture {
+        region_id: String,
+        rect: RectRatio,
+        image_template: Option<(String, AssetRef)>,
+    },
+    ApplyTemplateRecapture {
+        rule_id: String,
+        template: AssetRef,
+    },
+    ApplyImageVerification {
+        rule_id: String,
+        verification: crate::engine::macro_engine::ImageRuleVerificationArtifact,
+    },
+    ClearImageVerification {
+        rule_id: String,
+    },
+    MarkValidated,
+    Undo,
+    Redo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditOutcome {
+    Changed,
+    NoChange,
+    Validated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorError {
+    RunInProgress,
+    DuplicateIdentity(String),
+    MissingContainer,
+    MissingBlock(String),
+    MissingLane(String),
+    MissingRule(String),
+    MissingRegion(String),
+    InvalidIndex,
+    IllegalDescendantMove,
+    NestedWatchGroup,
+    LoopDeletionChoiceRequired,
+    InvalidLoopDeletionChoice,
+    IncompatibleConversion,
+    ReplacementIdMismatch,
+    ValidationFailed,
+    NothingToUndo,
+    NothingToRedo,
+}
+
+pub fn preview_conversion(block: &Block, target: BlockFamily) -> ConversionPreview {
+    let from = block_family(block);
+    if from != target {
+        return ConversionPreview::ReplaceRequired {
+            from,
+            to: target,
+            reason: "Unrelated block families require Replace Block so removed settings are explicit.",
+        };
+    }
+
+    let (preserved_fields, required_fields, removed_fields) = match from {
+        BlockFamily::TextObservation | BlockFamily::ImageObservation => (
+            vec!["source", "rule", "timeout policy"],
+            vec![],
+            vec!["incompatible wait mode fields"],
+        ),
+        BlockFamily::TextMatchedClick | BlockFamily::ImageMatchedClick => {
+            (vec!["matched source"], vec![], vec!["mouse button"])
+        }
+        BlockFamily::SavedLocationClick => (
+            vec!["mouse button"],
+            vec!["saved point or region"],
+            vec!["previous saved target"],
+        ),
+        BlockFamily::Loop => (
+            vec!["complete child body"],
+            vec!["count or until condition"],
+            vec!["previous loop limit"],
+        ),
+        BlockFamily::Other => (vec![], vec![], vec![]),
+    };
+    ConversionPreview::Compatible {
+        preserved_fields,
+        required_fields,
+        removed_fields,
+    }
+}
+
+fn block_family(block: &Block) -> BlockFamily {
+    match &block.kind {
+        BlockKind::Observe {
+            condition: Condition::Text { .. },
+        } => BlockFamily::TextObservation,
+        BlockKind::Observe {
+            condition: Condition::Image { .. },
+        } => BlockFamily::ImageObservation,
+        BlockKind::Action {
+            action: Action::ClickTextMatch { .. },
+        } => BlockFamily::TextMatchedClick,
+        BlockKind::Action {
+            action: Action::ClickImageMatch { .. },
+        } => BlockFamily::ImageMatchedClick,
+        BlockKind::Action {
+            action: Action::ClickPoint { .. } | Action::ClickRegion { .. },
+        } => BlockFamily::SavedLocationClick,
+        BlockKind::RepeatN { .. } | BlockKind::RepeatUntil { .. } => BlockFamily::Loop,
+        _ => BlockFamily::Other,
+    }
+}
+
+pub fn apply_editor_command(
+    draft: &mut EditorDraft,
+    command: EditorCommand,
+) -> Result<EditOutcome, EditorError> {
+    if matches!(draft.editability, DraftEditability::Running { .. }) {
+        return Err(EditorError::RunInProgress);
+    }
+    ensure_unique_structural_ids(&draft.definition)?;
+    let target_rebind = matches!(&command, EditorCommand::ReplaceTarget { .. });
+
+    if command == EditorCommand::MarkValidated {
+        if !crate::engine::macro_engine::validate_macro(&draft.definition).is_empty()
+            || draft.has_current_detector_test_failure()
+        {
+            return Err(EditorError::ValidationFailed);
+        }
+        if draft.status == DraftStatus::Ready && draft.invalidated_source_ids.is_empty() {
+            return Ok(EditOutcome::NoChange);
+        }
+        draft.invalidated_source_ids.clear();
+        draft.redo.clear();
+        draft.status = DraftStatus::Ready;
+        return Ok(EditOutcome::Validated);
+    }
+
+    if command == EditorCommand::Undo {
+        let Some(previous) = draft.undo.pop_back() else {
+            return Err(EditorError::NothingToUndo);
+        };
+        push_history_entry(
+            &mut draft.redo,
+            UndoEntry {
+                definition: draft.definition.clone(),
+                invalidated_source_ids: draft.invalidated_source_ids.clone(),
+                detector_test_failures: draft.detector_test_failures.clone(),
+            },
+        );
+        let revision = draft.definition.revision.saturating_add(1);
+        draft.definition = previous.definition;
+        draft.definition.revision = revision;
+        draft.invalidated_source_ids = previous.invalidated_source_ids;
+        draft.detector_test_failures = previous.detector_test_failures;
+        draft.prune_superseded_detector_test_failures();
+        draft.status = DraftStatus::NeedsValidation;
+        return Ok(EditOutcome::Changed);
+    }
+
+    if command == EditorCommand::Redo {
+        let Some(next) = draft.redo.pop_back() else {
+            return Err(EditorError::NothingToRedo);
+        };
+        push_history_entry(
+            &mut draft.undo,
+            UndoEntry {
+                definition: draft.definition.clone(),
+                invalidated_source_ids: draft.invalidated_source_ids.clone(),
+                detector_test_failures: draft.detector_test_failures.clone(),
+            },
+        );
+        let revision = draft.definition.revision.saturating_add(1);
+        draft.definition = next.definition;
+        draft.definition.revision = revision;
+        draft.invalidated_source_ids = next.invalidated_source_ids;
+        draft.detector_test_failures = next.detector_test_failures;
+        draft.prune_superseded_detector_test_failures();
+        draft.status = DraftStatus::NeedsValidation;
+        return Ok(EditOutcome::Changed);
+    }
+
+    let before = UndoEntry {
+        definition: draft.definition.clone(),
+        invalidated_source_ids: draft.invalidated_source_ids.clone(),
+        detector_test_failures: draft.detector_test_failures.clone(),
+    };
+    let existing_action_dependency_problems = action_dependency_problems(&before.definition);
+    let mut candidate = before.definition.clone();
+    let mut invalidated = before.invalidated_source_ids.clone();
+    apply_to_definition(&mut candidate, &mut invalidated, command)?;
+    ensure_unique_structural_ids(&candidate)?;
+    reject_nested_watch_groups(&candidate.blocks, false)?;
+    if !action_dependency_problems(&candidate).is_subset(&existing_action_dependency_problems) {
+        return Err(EditorError::ValidationFailed);
+    }
+
+    if !target_rebind
+        && candidate == before.definition
+        && invalidated == before.invalidated_source_ids
+    {
+        return Ok(EditOutcome::NoChange);
+    }
+
+    candidate.revision = before.definition.revision.saturating_add(1);
+    push_history_entry(&mut draft.undo, before);
+    draft.redo.clear();
+    draft.definition = candidate;
+    draft.invalidated_source_ids = invalidated;
+    if target_rebind {
+        draft.detector_test_failures.clear();
+    } else {
+        draft.prune_superseded_detector_test_failures();
+    }
+    draft.status = DraftStatus::NeedsValidation;
+    Ok(EditOutcome::Changed)
+}
+
+fn push_history_entry(history: &mut VecDeque<UndoEntry>, entry: UndoEntry) {
+    if history.len() == EDITOR_UNDO_LIMIT {
+        history.pop_front();
+    }
+    history.push_back(entry);
+}
+
+fn action_dependency_problems(
+    definition: &MacroDefinition,
+) -> HashSet<(String, Option<String>, String)> {
+    crate::engine::macro_engine::validate_macro(definition)
+        .into_iter()
+        .filter(|problem| {
+            matches!(
+                problem.code.as_str(),
+                "action.invalid_source"
+                    | "action.detector_family_mismatch"
+                    | "action.disabled_source"
+                    | "action.text_absent_match"
+            )
+        })
+        .map(|problem| (problem.code, problem.block_id, problem.message))
+        .collect()
+}
+
+/// Runtime validation plus editor-only dependency invalidations. Saved canonical definitions do not
+/// carry undo or transient invalidation metadata; callers must clear these only after validation.
+pub fn editor_validation_problems(draft: &EditorDraft) -> Vec<ValidationProblem> {
+    let mut problems = crate::engine::macro_engine::validate_macro(&draft.definition);
+    collect_invalidated_action_problems(
+        &draft.definition.blocks,
+        true,
+        &draft.invalidated_source_ids,
+        &mut problems,
+    );
+    problems.extend(
+        draft
+            .detector_test_failures
+            .iter()
+            .filter_map(|(block_id, failure)| {
+                (detector_fingerprint_for_block(&draft.definition, block_id).as_deref()
+                    == Some(failure.detector_fingerprint.as_str()))
+                .then(|| ValidationProblem {
+                    code: "editor.detector_test_failed".to_string(),
+                    message: format!("latest detector test failed: {}", failure.message),
+                    block_id: Some(block_id.clone()),
+                })
+            }),
+    );
+    problems
+}
+
+fn collect_invalidated_action_problems(
+    blocks: &[Block],
+    ancestors_enabled: bool,
+    invalidated: &BTreeSet<String>,
+    problems: &mut Vec<ValidationProblem>,
+) {
+    for block in blocks {
+        let enabled = ancestors_enabled && block.enabled;
+        if enabled {
+            let source = match &block.kind {
+                BlockKind::Action {
+                    action:
+                        Action::ClickTextMatch {
+                            source_block_id, ..
+                        }
+                        | Action::ClickImageMatch {
+                            source_block_id, ..
+                        },
+                } => Some(source_block_id),
+                BlockKind::Action {
+                    action:
+                        Action::MoveOnly {
+                            target:
+                                crate::engine::macro_engine::ActionTarget::TextMatch { source_block_id }
+                                | crate::engine::macro_engine::ActionTarget::ImageMatch {
+                                    source_block_id,
+                                },
+                        },
+                } => Some(source_block_id),
+                _ => None,
+            };
+            if let Some(source) = source.filter(|source| invalidated.contains(*source)) {
+                problems.push(ValidationProblem {
+                    code: "editor.dependent_action_needs_revalidation".to_string(),
+                    message: format!(
+                        "action '{}' depends on changed observation source '{source}'; validate the source before running",
+                        block.id
+                    ),
+                    block_id: Some(block.id.clone()),
+                });
+            }
+        }
+        for child in child_containers(block) {
+            collect_invalidated_action_problems(child, enabled, invalidated, problems);
+        }
+    }
+}
+
+fn apply_to_definition(
+    definition: &mut MacroDefinition,
+    invalidated: &mut BTreeSet<String>,
+    command: EditorCommand,
+) -> Result<(), EditorError> {
+    match command {
+        EditorCommand::InsertBlock { target, block } => {
+            let container = find_container_mut(&mut definition.blocks, &target.container)
+                .ok_or(EditorError::MissingContainer)?;
+            if target.index > container.len() {
+                return Err(EditorError::InvalidIndex);
+            }
+            container.insert(target.index, block);
+        }
+        EditorCommand::RemoveBlock { path, loop_choice } => {
+            let container = find_container_mut(&mut definition.blocks, &path.container)
+                .ok_or(EditorError::MissingContainer)?;
+            let index = container
+                .iter()
+                .position(|block| block.id == path.block_id)
+                .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
+            let removed = container.remove(index);
+            match &removed.kind {
+                BlockKind::RepeatN { .. }
+                | BlockKind::RepeatUntil { .. }
+                | BlockKind::Continuous { .. } => match loop_choice {
+                    None => return Err(EditorError::LoopDeletionChoiceRequired),
+                    Some(LoopDeletionChoice::DeleteWithContents) => {}
+                    Some(LoopDeletionChoice::KeepContents) => {
+                        container.splice(index..index, owned_contents(removed));
+                    }
+                },
+                _ if loop_choice == Some(LoopDeletionChoice::KeepContents) => {
+                    return Err(EditorError::InvalidLoopDeletionChoice);
+                }
+                _ => {}
+            }
+        }
+        EditorCommand::DuplicateBlock { source, target } => {
+            let block = find_block_in_container(&definition.blocks, &source)?
+                .cloned()
+                .ok_or_else(|| EditorError::MissingBlock(source.block_id.clone()))?;
+            let mut used = structural_id_set(definition);
+            let duplicate = duplicate_with_new_ids(block, &mut used);
+            let container = find_container_mut(&mut definition.blocks, &target.container)
+                .ok_or(EditorError::MissingContainer)?;
+            if target.index > container.len() {
+                return Err(EditorError::InvalidIndex);
+            }
+            container.insert(target.index, duplicate);
+        }
+        EditorCommand::SetBlockEnabled { path, enabled } => {
+            let block = find_block_in_container_mut(&mut definition.blocks, &path)?
+                .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
+            block.enabled = enabled;
+        }
+        EditorCommand::SetLaneEnabled {
+            group_id,
+            lane_id,
+            enabled,
+        } => {
+            let lane = find_lane_mut(&mut definition.blocks, &group_id, &lane_id)
+                .ok_or(EditorError::MissingLane(lane_id))?;
+            lane.enabled = enabled;
+        }
+        EditorCommand::ReorderSibling { path, to_index } => {
+            move_within_container(
+                &mut definition.blocks,
+                &path.container,
+                &path.block_id,
+                to_index,
+            )?;
+        }
+        EditorCommand::MoveBlock { source, target } => {
+            let moving = find_block_in_container(&definition.blocks, &source)?
+                .ok_or_else(|| EditorError::MissingBlock(source.block_id.clone()))?;
+            let descendants = block_owned_identity_set(moving);
+            if target
+                .container
+                .owner_ids()
+                .any(|owner| descendants.contains(owner))
+            {
+                return Err(EditorError::IllegalDescendantMove);
+            }
+            let source_container = find_container_mut(&mut definition.blocks, &source.container)
+                .ok_or(EditorError::MissingContainer)?;
+            let source_index = source_container
+                .iter()
+                .position(|block| block.id == source.block_id)
+                .ok_or_else(|| EditorError::MissingBlock(source.block_id.clone()))?;
+            let moving = source_container.remove(source_index);
+            let target_container = find_container_mut(&mut definition.blocks, &target.container)
+                .ok_or(EditorError::MissingContainer)?;
+            if target.index > target_container.len() {
+                return Err(EditorError::InvalidIndex);
+            }
+            target_container.insert(target.index, moving);
+        }
+        EditorCommand::TransferIfBranch {
+            if_id,
+            branch,
+            block_id,
+            to_index,
+        } => {
+            let block = find_block_mut(&mut definition.blocks, &if_id)
+                .ok_or_else(|| EditorError::MissingBlock(if_id.clone()))?;
+            let BlockKind::If {
+                then_body,
+                else_body,
+                ..
+            } = &mut block.kind
+            else {
+                return Err(EditorError::MissingContainer);
+            };
+            let (source, target) = match branch {
+                IfBranch::Then => (then_body, else_body),
+                IfBranch::Else => (else_body, then_body),
+            };
+            let index = source
+                .iter()
+                .position(|block| block.id == block_id)
+                .ok_or_else(|| EditorError::MissingBlock(block_id.clone()))?;
+            if to_index > target.len() {
+                return Err(EditorError::InvalidIndex);
+            }
+            let moved = source.remove(index);
+            target.insert(to_index, moved);
+        }
+        EditorCommand::MoveLane {
+            group_id,
+            lane_id,
+            to_index,
+        } => {
+            let block = find_block_mut(&mut definition.blocks, &group_id)
+                .ok_or_else(|| EditorError::MissingBlock(group_id.clone()))?;
+            let BlockKind::WatchGroup { group } = &mut block.kind else {
+                return Err(EditorError::MissingContainer);
+            };
+            if to_index >= group.lanes.len() {
+                return Err(EditorError::InvalidIndex);
+            }
+            let from = group
+                .lanes
+                .iter()
+                .position(|lane| lane.id == lane_id)
+                .ok_or_else(|| EditorError::MissingLane(lane_id.clone()))?;
+            let lane = group.lanes.remove(from);
+            group.lanes.insert(to_index, lane);
+        }
+        EditorCommand::ConvertBlock { path, target } => {
+            let block = find_block_in_container_mut(&mut definition.blocks, &path)?
+                .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
+            let before = block.clone();
+            let source = block.id.clone();
+            convert_block(block, target)?;
+            if *block != before {
+                invalidated.insert(source);
+            }
+        }
+        EditorCommand::SetConditionMode { path, mode } => {
+            let block = find_block_in_container_mut(&mut definition.blocks, &path)?
+                .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
+            let condition = match &mut block.kind {
+                BlockKind::Observe { condition }
+                | BlockKind::If { condition, .. }
+                | BlockKind::RepeatUntil { condition, .. } => condition,
+                _ => return Err(EditorError::IncompatibleConversion),
+            };
+            let changed = match condition {
+                Condition::Text { mode: current, .. } | Condition::Image { mode: current, .. } => {
+                    let mode = transition_observe_mode(current, mode);
+                    if *current == mode {
+                        false
+                    } else {
+                        *current = mode;
+                        true
+                    }
+                }
+            };
+            if changed {
+                invalidated.insert(path.block_id);
+            }
+        }
+        EditorCommand::SetWaitDuration { path, duration_ms } => {
+            let block = find_block_in_container_mut(&mut definition.blocks, &path)?
+                .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
+            let BlockKind::Wait {
+                duration_ms: current,
+            } = &mut block.kind
+            else {
+                return Err(EditorError::IncompatibleConversion);
+            };
+            *current = duration_ms;
+        }
+        EditorCommand::SetRepeatCount { path, count } => {
+            let block = find_block_in_container_mut(&mut definition.blocks, &path)?
+                .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
+            let BlockKind::RepeatN { count: current, .. } = &mut block.kind else {
+                return Err(EditorError::IncompatibleConversion);
+            };
+            *current = count;
+        }
+        EditorCommand::SetRepeatUntilMax {
+            path,
+            max_iterations,
+        } => {
+            let block = find_block_in_container_mut(&mut definition.blocks, &path)?
+                .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
+            let BlockKind::RepeatUntil {
+                max_iterations: current,
+                ..
+            } = &mut block.kind
+            else {
+                return Err(EditorError::IncompatibleConversion);
+            };
+            *current = max_iterations;
+        }
+        EditorCommand::SetWatchSettings {
+            path,
+            timeout_ms,
+            cooldown_ms,
+        } => {
+            let block = find_block_in_container_mut(&mut definition.blocks, &path)?
+                .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
+            let BlockKind::WatchGroup { group } = &mut block.kind else {
+                return Err(EditorError::IncompatibleConversion);
+            };
+            group.timeout_ms = timeout_ms;
+            group.cooldown_ms = cooldown_ms;
+        }
+        EditorCommand::ReplaceBlock {
+            path,
+            replacement,
+            children,
+        } => {
+            if replacement.id != path.block_id {
+                return Err(EditorError::ReplacementIdMismatch);
+            }
+            let container = find_container_mut(&mut definition.blocks, &path.container)
+                .ok_or(EditorError::MissingContainer)?;
+            let index = container
+                .iter()
+                .position(|block| block.id == path.block_id)
+                .ok_or_else(|| EditorError::MissingBlock(path.block_id.clone()))?;
+            let old = std::mem::replace(&mut container[index], replacement);
+            if children == ChildDisposition::KeepOwnedContents {
+                container.splice(index + 1..index + 1, owned_contents(old));
+            }
+            invalidated.insert(path.block_id);
+        }
+        EditorCommand::ReplaceTarget { target } => {
+            definition.target = target;
+            for rule in &mut definition.image_rules {
+                rule.verification = None;
+            }
+            let rule_ids = definition
+                .text_rules
+                .iter()
+                .map(|rule| rule.id.as_str())
+                .chain(definition.image_rules.iter().map(|rule| rule.id.as_str()))
+                .collect::<Vec<_>>();
+            for rule_id in rule_ids {
+                invalidated.extend(source_ids_for_rule(&definition.blocks, rule_id));
+            }
+        }
+        EditorCommand::ReplaceTextRule { mut rule } => {
+            let old = definition
+                .text_rules
+                .iter_mut()
+                .find(|item| item.id == rule.id)
+                .ok_or_else(|| EditorError::MissingRule(rule.id.clone()))?;
+            rule.revision = old.revision;
+            if *old != rule {
+                rule.revision = old.revision.saturating_add(1);
+                let id = rule.id.clone();
+                *old = rule;
+                invalidated.extend(source_ids_for_rule(&definition.blocks, &id));
+            }
+        }
+        EditorCommand::ReplaceImageRule { mut rule } => {
+            let old = definition
+                .image_rules
+                .iter_mut()
+                .find(|item| item.id == rule.id)
+                .ok_or_else(|| EditorError::MissingRule(rule.id.clone()))?;
+            rule.revision = old.revision;
+            if *old != rule {
+                rule.revision = old.revision.saturating_add(1);
+                rule.verification = None;
+                let id = rule.id.clone();
+                *old = rule;
+                invalidated.extend(source_ids_for_rule(&definition.blocks, &id));
+            }
+        }
+        EditorCommand::ApplyRecapture {
+            region_id,
+            rect,
+            image_template,
+        } => {
+            if let Some((rule_id, template)) = &image_template {
+                let rule = definition
+                    .image_rules
+                    .iter()
+                    .find(|rule| rule.id == *rule_id)
+                    .ok_or_else(|| EditorError::MissingRule(rule_id.clone()))?;
+                if rule.region_id != region_id
+                    || rule.template.id != template.id
+                    || template.revision <= rule.template.revision
+                {
+                    return Err(EditorError::IncompatibleConversion);
+                }
+            }
+            let region = definition
+                .regions
+                .iter_mut()
+                .find(|item| item.id == region_id)
+                .ok_or_else(|| EditorError::MissingRegion(region_id.clone()))?;
+            region.rect = rect;
+            region.revision = region.revision.saturating_add(1);
+
+            let text_rule_ids = definition
+                .text_rules
+                .iter_mut()
+                .filter(|rule| rule.region_id == region_id)
+                .map(|rule| {
+                    rule.revision = rule.revision.saturating_add(1);
+                    rule.id.clone()
+                })
+                .collect::<Vec<_>>();
+            let image_rule_ids = definition
+                .image_rules
+                .iter_mut()
+                .filter(|rule| rule.region_id == region_id)
+                .map(|rule| {
+                    rule.revision = rule.revision.saturating_add(1);
+                    rule.verification = None;
+                    if let Some((target_rule_id, template)) = &image_template {
+                        if rule.id == *target_rule_id {
+                            rule.template = template.clone();
+                        }
+                    }
+                    rule.id.clone()
+                })
+                .collect::<Vec<_>>();
+            for rule_id in text_rule_ids.into_iter().chain(image_rule_ids) {
+                invalidated.extend(source_ids_for_rule(&definition.blocks, &rule_id));
+            }
+        }
+        EditorCommand::ApplyTemplateRecapture { rule_id, template } => {
+            let rule = definition
+                .image_rules
+                .iter_mut()
+                .find(|rule| rule.id == rule_id)
+                .ok_or_else(|| EditorError::MissingRule(rule_id.clone()))?;
+            if rule.template.id != template.id || template.revision <= rule.template.revision {
+                return Err(EditorError::IncompatibleConversion);
+            }
+            rule.template = template;
+            rule.revision = rule.revision.saturating_add(1);
+            rule.verification = None;
+            invalidated.extend(source_ids_for_rule(&definition.blocks, &rule_id));
+        }
+        EditorCommand::ApplyImageVerification {
+            rule_id,
+            verification,
+        } => {
+            let rule_index = definition
+                .image_rules
+                .iter()
+                .position(|rule| rule.id == rule_id)
+                .ok_or_else(|| EditorError::MissingRule(rule_id.clone()))?;
+            if crate::engine::macro_engine::validate_candidate_binding(
+                definition,
+                &definition.image_rules[rule_index],
+                &verification,
+            )
+            .is_err()
+            {
+                return Err(EditorError::ValidationFailed);
+            }
+            definition.image_rules[rule_index].verification = Some(verification);
+        }
+        EditorCommand::ClearImageVerification { rule_id } => {
+            let rule = definition
+                .image_rules
+                .iter_mut()
+                .find(|rule| rule.id == rule_id)
+                .ok_or_else(|| EditorError::MissingRule(rule_id.clone()))?;
+            rule.verification = None;
+            invalidated.extend(source_ids_for_rule(&definition.blocks, &rule_id));
+        }
+        EditorCommand::MarkValidated | EditorCommand::Undo | EditorCommand::Redo => unreachable!(),
+    }
+    Ok(())
+}
+
+fn convert_block(block: &mut Block, target: ConversionTarget) -> Result<(), EditorError> {
+    match (&mut block.kind, target) {
+        (
+            BlockKind::Observe {
+                condition: Condition::Text { mode, .. },
+            },
+            ConversionTarget::TextObservation { mode: next },
+        )
+        | (
+            BlockKind::Observe {
+                condition: Condition::Image { mode, .. },
+            },
+            ConversionTarget::ImageObservation { mode: next },
+        ) => *mode = transition_observe_mode(mode, next),
+        (
+            BlockKind::Action {
+                action: Action::ClickTextMatch { button, .. },
+            },
+            ConversionTarget::ClickTextMatch { button: next },
+        )
+        | (
+            BlockKind::Action {
+                action: Action::ClickImageMatch { button, .. },
+            },
+            ConversionTarget::ClickImageMatch { button: next },
+        ) => *button = next,
+        (BlockKind::Action { action }, ConversionTarget::ClickPoint { point_id, button })
+            if matches!(
+                action,
+                Action::ClickPoint { .. } | Action::ClickRegion { .. }
+            ) =>
+        {
+            *action = Action::ClickPoint { point_id, button }
+        }
+        (BlockKind::Action { action }, ConversionTarget::ClickRegion { region_id, button })
+            if matches!(
+                action,
+                Action::ClickPoint { .. } | Action::ClickRegion { .. }
+            ) =>
+        {
+            *action = Action::ClickRegion { region_id, button }
+        }
+        (
+            BlockKind::RepeatN { body, .. },
+            ConversionTarget::RepeatUntil {
+                condition,
+                max_iterations,
+            },
+        ) => {
+            let body = std::mem::take(body);
+            block.kind = BlockKind::RepeatUntil {
+                condition,
+                max_iterations,
+                body,
+            };
+        }
+        (BlockKind::RepeatUntil { body, .. }, ConversionTarget::RepeatN { count }) => {
+            let body = std::mem::take(body);
+            block.kind = BlockKind::RepeatN { count, body };
+        }
+        _ => return Err(EditorError::IncompatibleConversion),
+    }
+    Ok(())
+}
+
+pub(super) fn transition_observe_mode(current: &ObserveMode, next: ObserveMode) -> ObserveMode {
+    match (current, next) {
+        (
+            ObserveMode::WaitForTrue {
+                timeout_ms,
+                timeout_outcome,
+            },
+            ObserveMode::WaitForFalse { .. },
+        ) => ObserveMode::WaitForFalse {
+            timeout_ms: timeout_ms.clone(),
+            timeout_outcome: timeout_outcome.clone(),
+        },
+        (
+            ObserveMode::WaitForFalse {
+                timeout_ms,
+                timeout_outcome,
+            },
+            ObserveMode::WaitForTrue { .. },
+        ) => ObserveMode::WaitForTrue {
+            timeout_ms: timeout_ms.clone(),
+            timeout_outcome: timeout_outcome.clone(),
+        },
+        (_, next) => next,
+    }
+}
+
+fn owned_contents(block: Block) -> Vec<Block> {
+    match block.kind {
+        BlockKind::Observe { condition } => condition_owned_timeout(condition),
+        BlockKind::If {
+            mut then_body,
+            else_body,
+            condition,
+        } => {
+            then_body.extend(else_body);
+            then_body.extend(condition_owned_timeout(condition));
+            then_body
+        }
+        BlockKind::RepeatN { body, .. } | BlockKind::Continuous { body } => body,
+        BlockKind::RepeatUntil {
+            mut body,
+            condition,
+            ..
+        } => {
+            body.extend(condition_owned_timeout(condition));
+            body
+        }
+        BlockKind::WatchGroup { group } => {
+            let mut owned: Vec<Block> = group
+                .lanes
+                .into_iter()
+                .flat_map(|lane| lane.then_body)
+                .collect();
+            if let TimeoutOutcome::RunBody { body } = group.timeout_outcome {
+                owned.extend(body);
+            }
+            owned
+        }
+        _ => vec![],
+    }
+}
+
+fn condition_owned_timeout(condition: Condition) -> Vec<Block> {
+    let mode = match condition {
+        Condition::Text { mode, .. } | Condition::Image { mode, .. } => mode,
+    };
+    match mode {
+        ObserveMode::WaitForTrue {
+            timeout_outcome: TimeoutOutcome::RunBody { body },
+            ..
+        }
+        | ObserveMode::WaitForFalse {
+            timeout_outcome: TimeoutOutcome::RunBody { body },
+            ..
+        } => body,
+        _ => vec![],
+    }
+}
+
+fn move_within_container(
+    blocks: &mut Vec<Block>,
+    path: &ContainerPath,
+    id: &str,
+    to: usize,
+) -> Result<(), EditorError> {
+    let list = find_container_mut(blocks, path).ok_or(EditorError::MissingContainer)?;
+    if to >= list.len() {
+        return Err(EditorError::InvalidIndex);
+    }
+    let from = list
+        .iter()
+        .position(|b| b.id == id)
+        .ok_or_else(|| EditorError::MissingBlock(id.into()))?;
+    let block = list.remove(from);
+    list.insert(to, block);
+    Ok(())
+}
+
+fn find_block_in_container<'a>(
+    blocks: &'a [Block],
+    path: &BlockPath,
+) -> Result<Option<&'a Block>, EditorError> {
+    Ok(find_container(blocks, &path.container)
+        .ok_or(EditorError::MissingContainer)?
+        .iter()
+        .find(|b| b.id == path.block_id))
+}
+fn find_block_in_container_mut<'a>(
+    blocks: &'a mut Vec<Block>,
+    path: &BlockPath,
+) -> Result<Option<&'a mut Block>, EditorError> {
+    Ok(find_container_mut(blocks, &path.container)
+        .ok_or(EditorError::MissingContainer)?
+        .iter_mut()
+        .find(|b| b.id == path.block_id))
+}
+
+fn find_container<'a>(blocks: &'a [Block], target: &ContainerPath) -> Option<&'a [Block]> {
+    if *target == ContainerPath::Root {
+        return Some(blocks);
+    }
+    for block in blocks {
+        if let Some(found) = direct_container(block, target) {
+            return Some(found);
+        }
+        for child in child_containers(block) {
+            if let Some(found) = find_container(child, target) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+fn find_container_mut<'a>(
+    blocks: &'a mut Vec<Block>,
+    target: &ContainerPath,
+) -> Option<&'a mut Vec<Block>> {
+    if *target == ContainerPath::Root {
+        return Some(blocks);
+    }
+    for block in blocks {
+        if direct_container(block, target).is_some() {
+            return direct_container_mut(block, target);
+        }
+        for child in child_containers_mut(block) {
+            if let Some(found) = find_container_mut(child, target) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn direct_container<'a>(block: &'a Block, target: &ContainerPath) -> Option<&'a [Block]> {
+    match (&block.kind, target) {
+        (BlockKind::If { then_body, .. }, ContainerPath::IfThen { if_id })
+            if block.id == *if_id =>
+        {
+            Some(then_body)
+        }
+        (BlockKind::If { else_body, .. }, ContainerPath::IfElse { if_id })
+            if block.id == *if_id =>
+        {
+            Some(else_body)
+        }
+        (
+            BlockKind::RepeatN { body, .. }
+            | BlockKind::RepeatUntil { body, .. }
+            | BlockKind::Continuous { body },
+            ContainerPath::LoopBody { loop_id },
+        ) if block.id == *loop_id => Some(body),
+        (BlockKind::WatchGroup { group }, ContainerPath::WatchLaneBody { watch_id, lane_id })
+            if block.id == *watch_id =>
+        {
+            group
+                .lanes
+                .iter()
+                .find(|l| l.id == *lane_id)
+                .map(|l| l.then_body.as_slice())
+        }
+        (BlockKind::WatchGroup { group }, ContainerPath::TimeoutBody { owner_id })
+            if block.id == *owner_id =>
+        {
+            timeout_body(&group.timeout_outcome)
+        }
+        (
+            BlockKind::Observe { condition }
+            | BlockKind::If { condition, .. }
+            | BlockKind::RepeatUntil { condition, .. },
+            ContainerPath::TimeoutBody { owner_id },
+        ) if block.id == *owner_id => condition_timeout_body(condition),
+        _ => None,
+    }
+}
+fn direct_container_mut<'a>(
+    block: &'a mut Block,
+    target: &ContainerPath,
+) -> Option<&'a mut Vec<Block>> {
+    let owner = target.owner_ids().next()?;
+    if block.id != owner {
+        return None;
+    }
+    match target {
+        ContainerPath::IfThen { .. } => {
+            if let BlockKind::If { then_body, .. } = &mut block.kind {
+                Some(then_body)
+            } else {
+                None
+            }
+        }
+        ContainerPath::IfElse { .. } => {
+            if let BlockKind::If { else_body, .. } = &mut block.kind {
+                Some(else_body)
+            } else {
+                None
+            }
+        }
+        ContainerPath::LoopBody { .. } => match &mut block.kind {
+            BlockKind::RepeatN { body, .. }
+            | BlockKind::RepeatUntil { body, .. }
+            | BlockKind::Continuous { body } => Some(body),
+            _ => None,
+        },
+        ContainerPath::WatchLaneBody { lane_id, .. } => {
+            if let BlockKind::WatchGroup { group } = &mut block.kind {
+                group
+                    .lanes
+                    .iter_mut()
+                    .find(|l| l.id == *lane_id)
+                    .map(|l| &mut l.then_body)
+            } else {
+                None
+            }
+        }
+        ContainerPath::TimeoutBody { .. } => match &mut block.kind {
+            BlockKind::WatchGroup { group } => timeout_body_mut(&mut group.timeout_outcome),
+            BlockKind::Observe { condition }
+            | BlockKind::If { condition, .. }
+            | BlockKind::RepeatUntil { condition, .. } => condition_timeout_body_mut(condition),
+            _ => None,
+        },
+        ContainerPath::Root => None,
+    }
+}
+
+fn child_containers(block: &Block) -> Vec<&[Block]> {
+    let mut out = vec![];
+    match &block.kind {
+        BlockKind::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            out.extend([then_body.as_slice(), else_body.as_slice()]);
+            if let Some(b) = condition_timeout_body(condition) {
+                out.push(b);
+            }
+        }
+        BlockKind::RepeatN { body, .. } | BlockKind::Continuous { body } => out.push(body),
+        BlockKind::RepeatUntil {
+            condition, body, ..
+        } => {
+            out.push(body);
+            if let Some(b) = condition_timeout_body(condition) {
+                out.push(b);
+            }
+        }
+        BlockKind::Observe { condition } => {
+            if let Some(b) = condition_timeout_body(condition) {
+                out.push(b);
+            }
+        }
+        BlockKind::WatchGroup { group } => {
+            out.extend(group.lanes.iter().map(|l| l.then_body.as_slice()));
+            if let Some(b) = timeout_body(&group.timeout_outcome) {
+                out.push(b);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+fn child_containers_mut(block: &mut Block) -> Vec<&mut Vec<Block>> {
+    let mut out = vec![];
+    match &mut block.kind {
+        BlockKind::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            out.push(then_body);
+            out.push(else_body);
+            if let Some(b) = condition_timeout_body_mut(condition) {
+                out.push(b);
+            }
+        }
+        BlockKind::RepeatN { body, .. } | BlockKind::Continuous { body } => out.push(body),
+        BlockKind::RepeatUntil {
+            condition, body, ..
+        } => {
+            out.push(body);
+            if let Some(b) = condition_timeout_body_mut(condition) {
+                out.push(b);
+            }
+        }
+        BlockKind::Observe { condition } => {
+            if let Some(b) = condition_timeout_body_mut(condition) {
+                out.push(b);
+            }
+        }
+        BlockKind::WatchGroup { group } => {
+            out.extend(group.lanes.iter_mut().map(|l| &mut l.then_body));
+            if let Some(b) = timeout_body_mut(&mut group.timeout_outcome) {
+                out.push(b);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+fn timeout_body(outcome: &TimeoutOutcome) -> Option<&[Block]> {
+    if let TimeoutOutcome::RunBody { body } = outcome {
+        Some(body)
+    } else {
+        None
+    }
+}
+fn timeout_body_mut(outcome: &mut TimeoutOutcome) -> Option<&mut Vec<Block>> {
+    if let TimeoutOutcome::RunBody { body } = outcome {
+        Some(body)
+    } else {
+        None
+    }
+}
+fn condition_timeout_body(condition: &Condition) -> Option<&[Block]> {
+    match condition {
+        Condition::Text { mode, .. } | Condition::Image { mode, .. } => match mode {
+            ObserveMode::WaitForTrue {
+                timeout_outcome, ..
+            }
+            | ObserveMode::WaitForFalse {
+                timeout_outcome, ..
+            } => timeout_body(timeout_outcome),
+            ObserveMode::CheckNow => None,
+        },
+    }
+}
+fn condition_timeout_body_mut(condition: &mut Condition) -> Option<&mut Vec<Block>> {
+    match condition {
+        Condition::Text { mode, .. } | Condition::Image { mode, .. } => match mode {
+            ObserveMode::WaitForTrue {
+                timeout_outcome, ..
+            }
+            | ObserveMode::WaitForFalse {
+                timeout_outcome, ..
+            } => timeout_body_mut(timeout_outcome),
+            ObserveMode::CheckNow => None,
+        },
+    }
+}
+
+fn find_block<'a>(blocks: &'a [Block], id: &str) -> Option<&'a Block> {
+    for block in blocks {
+        if block.id == id {
+            return Some(block);
+        }
+        for child in child_containers(block) {
+            if let Some(x) = find_block(child, id) {
+                return Some(x);
+            }
+        }
+    }
+    None
+}
+
+pub fn condition_for_block<'a>(definition: &'a MacroDefinition, id: &str) -> Option<&'a Condition> {
+    let block = find_block(&definition.blocks, id)?;
+    match &block.kind {
+        BlockKind::Observe { condition }
+        | BlockKind::If { condition, .. }
+        | BlockKind::RepeatUntil { condition, .. } => Some(condition),
+        _ => None,
+    }
+}
+
+/// Fingerprint only the detector inputs selected by an observation block. Canonical definition
+/// revision, actions/comments, and an image verification artifact are deliberately excluded.
+pub fn detector_fingerprint_for_block(
+    definition: &MacroDefinition,
+    block_id: &str,
+) -> Option<String> {
+    match condition_for_block(definition, block_id)? {
+        Condition::Text { rule_id, .. } => {
+            let rule = definition
+                .text_rules
+                .iter()
+                .find(|rule| rule.id == *rule_id)?;
+            let region = definition
+                .regions
+                .iter()
+                .find(|region| region.id == rule.region_id)?;
+            Some(format!(
+                "text|{:?}|{:?}|{:?}",
+                definition.target, region, rule
+            ))
+        }
+        Condition::Image { rule_id, .. } => {
+            let mut rule = definition
+                .image_rules
+                .iter()
+                .find(|rule| rule.id == *rule_id)?
+                .clone();
+            rule.verification = None;
+            let region = definition
+                .regions
+                .iter()
+                .find(|region| region.id == rule.region_id)?;
+            Some(format!(
+                "image|{:?}|{:?}|{:?}",
+                definition.target, region, rule
+            ))
+        }
+    }
+}
+fn find_block_mut<'a>(blocks: &'a mut Vec<Block>, id: &str) -> Option<&'a mut Block> {
+    for block in blocks {
+        if block.id == id {
+            return Some(block);
+        }
+        for child in child_containers_mut(block) {
+            if let Some(x) = find_block_mut(child, id) {
+                return Some(x);
+            }
+        }
+    }
+    None
+}
+fn find_lane_mut<'a>(
+    blocks: &'a mut Vec<Block>,
+    group: &str,
+    lane: &str,
+) -> Option<&'a mut crate::engine::macro_engine::WatchLane> {
+    let block = find_block_mut(blocks, group)?;
+    if let BlockKind::WatchGroup { group } = &mut block.kind {
+        group.lanes.iter_mut().find(|l| l.id == lane)
+    } else {
+        None
+    }
+}
+
+fn ensure_unique_structural_ids(definition: &MacroDefinition) -> Result<(), EditorError> {
+    fn visit(blocks: &[Block], seen: &mut HashSet<String>) -> Result<(), EditorError> {
+        for b in blocks {
+            if !seen.insert(b.id.clone()) {
+                return Err(EditorError::DuplicateIdentity(b.id.clone()));
+            }
+            if let BlockKind::WatchGroup { group } = &b.kind {
+                for l in &group.lanes {
+                    if !seen.insert(l.id.clone()) {
+                        return Err(EditorError::DuplicateIdentity(l.id.clone()));
+                    }
+                }
+            }
+            for c in child_containers(b) {
+                visit(c, seen)?
+            }
+        }
+        Ok(())
+    }
+    visit(&definition.blocks, &mut HashSet::new())
+}
+fn structural_id_set(definition: &MacroDefinition) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    fn visit(bs: &[Block], ids: &mut HashSet<String>) {
+        for b in bs {
+            ids.insert(b.id.clone());
+            if let BlockKind::WatchGroup { group } = &b.kind {
+                ids.extend(group.lanes.iter().map(|l| l.id.clone()))
+            }
+            for c in child_containers(b) {
+                visit(c, ids)
+            }
+        }
+    }
+    visit(&definition.blocks, &mut ids);
+    ids
+}
+fn block_owned_identity_set(block: &Block) -> HashSet<&str> {
+    let mut ids = HashSet::new();
+    fn visit<'a>(b: &'a Block, ids: &mut HashSet<&'a str>) {
+        ids.insert(&b.id);
+        if let BlockKind::WatchGroup { group } = &b.kind {
+            ids.extend(group.lanes.iter().map(|l| l.id.as_str()))
+        }
+        for c in child_containers(b) {
+            for x in c {
+                visit(x, ids)
+            }
+        }
+    }
+    visit(block, &mut ids);
+    ids
+}
+fn reject_nested_watch_groups(blocks: &[Block], inside: bool) -> Result<(), EditorError> {
+    for b in blocks {
+        let watch = matches!(b.kind, BlockKind::WatchGroup { .. });
+        if inside && watch {
+            return Err(EditorError::NestedWatchGroup);
+        }
+        for c in child_containers(b) {
+            reject_nested_watch_groups(c, inside || watch)?
+        }
+    }
+    Ok(())
+}
+
+fn duplicate_with_new_ids(mut block: Block, used: &mut HashSet<String>) -> Block {
+    fn assign(b: &Block, used: &mut HashSet<String>, map: &mut HashMap<String, String>) {
+        map.insert(b.id.clone(), unique_copy_id(&b.id, used));
+        if let BlockKind::WatchGroup { group } = &b.kind {
+            for l in &group.lanes {
+                map.insert(l.id.clone(), unique_copy_id(&l.id, used));
+            }
+        }
+        for c in child_containers(b) {
+            for x in c {
+                assign(x, used, map)
+            }
+        }
+    }
+    let mut map = HashMap::new();
+    assign(&block, used, &mut map);
+    rewrite_ids(&mut block, &map);
+    block
+}
+fn unique_copy_id(base: &str, used: &mut HashSet<String>) -> String {
+    for n in 1.. {
+        let id = if n == 1 {
+            format!("{base}-copy")
+        } else {
+            format!("{base}-copy-{n}")
+        };
+        if used.insert(id.clone()) {
+            return id;
+        }
+    }
+    unreachable!()
+}
+fn rewrite_ids(block: &mut Block, map: &HashMap<String, String>) {
+    block.id = map
+        .get(&block.id)
+        .cloned()
+        .unwrap_or_else(|| block.id.clone());
+    rewrite_kind_sources(&mut block.kind, map);
+    match &mut block.kind {
+        BlockKind::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for b in then_body.iter_mut().chain(else_body) {
+                rewrite_ids(b, map)
+            }
+        }
+        BlockKind::RepeatN { body, .. }
+        | BlockKind::RepeatUntil { body, .. }
+        | BlockKind::Continuous { body } => {
+            for b in body {
+                rewrite_ids(b, map)
+            }
+        }
+        BlockKind::WatchGroup { group } => {
+            for l in &mut group.lanes {
+                l.id = map.get(&l.id).cloned().unwrap_or_else(|| l.id.clone());
+                rewrite_passive_source(&mut l.condition, map);
+                for b in &mut l.then_body {
+                    rewrite_ids(b, map)
+                }
+            }
+            if let TimeoutOutcome::RunBody { body } = &mut group.timeout_outcome {
+                for b in body {
+                    rewrite_ids(b, map)
+                }
+            }
+        }
+        _ => {}
+    }
+    match &mut block.kind {
+        BlockKind::Observe { condition }
+        | BlockKind::If { condition, .. }
+        | BlockKind::RepeatUntil { condition, .. } => {
+            if let Some(body) = condition_timeout_body_mut(condition) {
+                for child in body {
+                    rewrite_ids(child, map);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+fn rewrite_kind_sources(kind: &mut BlockKind, map: &HashMap<String, String>) {
+    match kind {
+        BlockKind::Observe { condition }
+        | BlockKind::If { condition, .. }
+        | BlockKind::RepeatUntil { condition, .. } => rewrite_condition_source(condition, map),
+        BlockKind::Action { action } => match action {
+            Action::ClickTextMatch {
+                source_block_id, ..
+            }
+            | Action::ClickImageMatch {
+                source_block_id, ..
+            } => rewrite_source(source_block_id, map),
+            Action::MoveOnly {
+                target:
+                    crate::engine::macro_engine::ActionTarget::TextMatch { source_block_id }
+                    | crate::engine::macro_engine::ActionTarget::ImageMatch { source_block_id },
+            } => rewrite_source(source_block_id, map),
+            _ => {}
+        },
+        _ => {}
+    }
+}
+fn rewrite_condition_source(c: &mut Condition, map: &HashMap<String, String>) {
+    match c {
+        Condition::Text {
+            source_block_id, ..
+        }
+        | Condition::Image {
+            source_block_id, ..
+        } => rewrite_source(source_block_id, map),
+    }
+}
+fn rewrite_passive_source(c: &mut PassiveCondition, map: &HashMap<String, String>) {
+    match c {
+        PassiveCondition::Text {
+            source_block_id, ..
+        }
+        | PassiveCondition::Image {
+            source_block_id, ..
+        } => rewrite_source(source_block_id, map),
+    }
+}
+fn rewrite_source(id: &mut String, map: &HashMap<String, String>) {
+    if let Some(next) = map.get(id) {
+        *id = next.clone()
+    }
+}
+fn source_ids_for_rule(blocks: &[Block], rule: &str) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    fn visit(bs: &[Block], rule: &str, ids: &mut BTreeSet<String>) {
+        for b in bs {
+            match &b.kind {
+                BlockKind::Observe { condition }
+                | BlockKind::If { condition, .. }
+                | BlockKind::RepeatUntil { condition, .. } => match condition {
+                    Condition::Text {
+                        source_block_id,
+                        rule_id,
+                        ..
+                    }
+                    | Condition::Image {
+                        source_block_id,
+                        rule_id,
+                        ..
+                    } if rule_id == rule => {
+                        ids.insert(source_block_id.clone());
+                    }
+                    _ => {}
+                },
+                BlockKind::WatchGroup { group } => {
+                    for l in &group.lanes {
+                        match &l.condition {
+                            PassiveCondition::Text {
+                                source_block_id,
+                                rule_id,
+                            }
+                            | PassiveCondition::Image {
+                                source_block_id,
+                                rule_id,
+                            } if rule_id == rule => {
+                                ids.insert(source_block_id.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for c in child_containers(b) {
+                visit(c, rule, ids)
+            }
+        }
+    }
+    visit(blocks, rule, &mut ids);
+    ids
+}
+
+pub fn locate_block_path(definition: &MacroDefinition, id: &str) -> Option<BlockPath> {
+    fn scan(blocks: &[Block], container: ContainerPath, id: &str) -> Option<BlockPath> {
+        for block in blocks {
+            if block.id == id {
+                return Some(BlockPath {
+                    container: container.clone(),
+                    block_id: id.into(),
+                });
+            }
+            let mut candidates: Vec<(ContainerPath, &[Block])> = vec![];
+            match &block.kind {
+                BlockKind::If {
+                    then_body,
+                    else_body,
+                    condition,
+                } => {
+                    candidates.push((
+                        ContainerPath::IfThen {
+                            if_id: block.id.clone(),
+                        },
+                        then_body,
+                    ));
+                    candidates.push((
+                        ContainerPath::IfElse {
+                            if_id: block.id.clone(),
+                        },
+                        else_body,
+                    ));
+                    if let Some(body) = condition_timeout_body(condition) {
+                        candidates.push((
+                            ContainerPath::TimeoutBody {
+                                owner_id: block.id.clone(),
+                            },
+                            body,
+                        ));
+                    }
+                }
+                BlockKind::RepeatN { body, .. } | BlockKind::Continuous { body } => candidates
+                    .push((
+                        ContainerPath::LoopBody {
+                            loop_id: block.id.clone(),
+                        },
+                        body,
+                    )),
+                BlockKind::RepeatUntil {
+                    condition, body, ..
+                } => {
+                    candidates.push((
+                        ContainerPath::LoopBody {
+                            loop_id: block.id.clone(),
+                        },
+                        body,
+                    ));
+                    if let Some(timeout) = condition_timeout_body(condition) {
+                        candidates.push((
+                            ContainerPath::TimeoutBody {
+                                owner_id: block.id.clone(),
+                            },
+                            timeout,
+                        ));
+                    }
+                }
+                BlockKind::Observe { condition } => {
+                    if let Some(body) = condition_timeout_body(condition) {
+                        candidates.push((
+                            ContainerPath::TimeoutBody {
+                                owner_id: block.id.clone(),
+                            },
+                            body,
+                        ));
+                    }
+                }
+                BlockKind::WatchGroup { group } => {
+                    for lane in &group.lanes {
+                        candidates.push((
+                            ContainerPath::WatchLaneBody {
+                                watch_id: block.id.clone(),
+                                lane_id: lane.id.clone(),
+                            },
+                            &lane.then_body,
+                        ));
+                    }
+                    if let Some(body) = timeout_body(&group.timeout_outcome) {
+                        candidates.push((
+                            ContainerPath::TimeoutBody {
+                                owner_id: block.id.clone(),
+                            },
+                            body,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            for (path, body) in candidates {
+                if let Some(found) = scan(body, path, id) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    scan(&definition.blocks, ContainerPath::Root, id)
+}
+
+pub fn block_at_path<'a>(definition: &'a MacroDefinition, path: &BlockPath) -> Option<&'a Block> {
+    find_block_in_container(&definition.blocks, path)
+        .ok()
+        .flatten()
+}
+
+pub fn sibling_position(definition: &MacroDefinition, path: &BlockPath) -> Option<(usize, usize)> {
+    let list = find_container(&definition.blocks, &path.container)?;
+    let index = list.iter().position(|b| b.id == path.block_id)?;
+    Some((index, list.len()))
+}
+pub fn container_len(definition: &MacroDefinition, container: &ContainerPath) -> Option<usize> {
+    Some(find_container(&definition.blocks, container)?.len())
+}
+
+pub fn locate_watch_lane(
+    definition: &MacroDefinition,
+    lane_id: &str,
+) -> Option<(String, usize, usize, bool)> {
+    fn scan(blocks: &[Block], lane_id: &str) -> Option<(String, usize, usize, bool)> {
+        for block in blocks {
+            if let BlockKind::WatchGroup { group } = &block.kind {
+                if let Some(index) = group.lanes.iter().position(|lane| lane.id == lane_id) {
+                    return Some((
+                        block.id.clone(),
+                        index,
+                        group.lanes.len(),
+                        group.lanes[index].enabled,
+                    ));
+                }
+            }
+            for child in child_containers(block) {
+                if let Some(found) = scan(child, lane_id) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    scan(&definition.blocks, lane_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::macro_engine::{
+        AssetRef, DEFAULT_MAX_SCORE_CELLS, FocusLossPolicy, ImageRule, ImageRuleVerification,
+        ImageRuleVerificationArtifact, ImageRuleVerificationInput, MACRO_SCHEMA_VERSION,
+        MatchSelectionPolicy, NegativeCorpusSample, NegativeSampleEvaluationInputs,
+        PreprocessProfile, RegionDefinition, SafetyPolicy, TargetProfile, TextMatchMode,
+        WatchGroup, WatchLane,
+    };
+
+    fn def(blocks: Vec<Block>) -> MacroDefinition {
+        MacroDefinition {
+            schema_version: MACRO_SCHEMA_VERSION,
+            id: "m".into(),
+            name: "m".into(),
+            revision: 4,
+            target: TargetProfile {
+                process_path: "g".into(),
+                window_class: "w".into(),
+                title_contains: "d".into(),
+                captured_client_width: 1280,
+                captured_client_height: 720,
+                captured_dpi: 96,
+            },
+            regions: vec![],
+            points: vec![],
+            text_rules: vec![],
+            image_rules: vec![],
+            blocks,
+            safety: SafetyPolicy {
+                max_runtime_ms: Limit::Finite(1000),
+                max_clicks: Limit::Finite(2),
+                max_observation_retries: Limit::Finite(2),
+                max_observations_per_second: 20,
+                minimum_click_interval_ms: 50,
+                focus_loss: FocusLossPolicy::Stop,
+            },
+        }
+    }
+    fn comment(id: &str) -> Block {
+        Block {
+            id: id.into(),
+            enabled: true,
+            kind: BlockKind::Comment { text: id.into() },
+        }
+    }
+    fn path(id: &str) -> BlockPath {
+        BlockPath {
+            container: ContainerPath::Root,
+            block_id: id.into(),
+        }
+    }
+
+    fn image_definition_and_verification() -> (MacroDefinition, ImageRuleVerificationArtifact) {
+        use image::{GrayImage, Luma};
+
+        let mut definition = def(vec![Block {
+            id: "image-source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Image {
+                    source_block_id: "image-source".into(),
+                    rule_id: "image".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        }]);
+        definition.regions.push(RegionDefinition {
+            id: "region".into(),
+            revision: 3,
+            rect: RectRatio {
+                x: 0.25,
+                y: 0.25,
+                width: 0.5,
+                height: 0.2,
+            },
+        });
+        let rule = ImageRule {
+            id: "image".into(),
+            revision: 4,
+            region_id: "region".into(),
+            template: AssetRef {
+                id: "template".into(),
+                revision: 2,
+                content_hash: "template-hash".into(),
+            },
+            transparent_mask: None,
+            threshold: 0.95,
+            scales_percent: vec![100],
+            stable_frames: 2,
+            maximum_center_drift_px: 5,
+            minimum_runner_up_margin: 0.05,
+            verification: None,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 100,
+            timeout_ms: Limit::Unlimited,
+        };
+        let template =
+            GrayImage::from_fn(2, 2, |x, y| Luma([if (x + y) % 2 == 0 { 0 } else { 255 }]));
+        let search_dimensions = (640, 144);
+        let samples = [NegativeCorpusSample {
+            stable_id: "negative/sample".into(),
+            content_sha256: "11".repeat(32),
+            measured_score: 0.1,
+            evaluation: NegativeSampleEvaluationInputs::for_rule(
+                &rule,
+                definition.target.captured_dpi,
+                definition.regions[0].revision,
+                search_dimensions,
+            ),
+        }];
+        let verification = ImageRuleVerification::verify(ImageRuleVerificationInput {
+            rule: &rule,
+            template: &template,
+            mask: None,
+            captured_dpi: definition.target.captured_dpi,
+            current_dpi: definition.target.captured_dpi,
+            region_revision: definition.regions[0].revision,
+            search_dimensions,
+            negative_samples: &samples,
+            observed_clusters: &[],
+            maximum_score_cells: DEFAULT_MAX_SCORE_CELLS,
+        })
+        .unwrap()
+        .into_artifact();
+        definition.image_rules.push(rule);
+        (definition, verification)
+    }
+    fn mode_wait_true() -> ObserveMode {
+        ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Finite(50),
+            timeout_outcome: TimeoutOutcome::Continue,
+        }
+    }
+    fn mode_wait_false() -> ObserveMode {
+        ObserveMode::WaitForFalse {
+            timeout_ms: Limit::Unlimited,
+            timeout_outcome: TimeoutOutcome::Continue,
+        }
+    }
+
+    #[test]
+    fn all_compatible_conversion_directions_preserve_identity_and_owned_bodies() {
+        let obs = |id: &str, text: bool| Block {
+            id: id.into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: if text {
+                    Condition::Text {
+                        source_block_id: id.into(),
+                        rule_id: "r".into(),
+                        mode: ObserveMode::CheckNow,
+                    }
+                } else {
+                    Condition::Image {
+                        source_block_id: id.into(),
+                        rule_id: "i".into(),
+                        mode: ObserveMode::CheckNow,
+                    }
+                },
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![
+            obs("text", true),
+            obs("image", false),
+            Block {
+                id: "tc".into(),
+                enabled: true,
+                kind: BlockKind::Action {
+                    action: Action::ClickTextMatch {
+                        source_block_id: "text".into(),
+                        button: MouseButton::Left,
+                    },
+                },
+            },
+            Block {
+                id: "ic".into(),
+                enabled: true,
+                kind: BlockKind::Action {
+                    action: Action::ClickImageMatch {
+                        source_block_id: "image".into(),
+                        button: MouseButton::Left,
+                    },
+                },
+            },
+            Block {
+                id: "fixed".into(),
+                enabled: true,
+                kind: BlockKind::Action {
+                    action: Action::ClickPoint {
+                        point_id: "p".into(),
+                        button: MouseButton::Left,
+                    },
+                },
+            },
+            Block {
+                id: "loop".into(),
+                enabled: true,
+                kind: BlockKind::RepeatN {
+                    count: 2,
+                    body: vec![comment("owned")],
+                },
+            },
+        ]));
+        let convert = |draft: &mut EditorDraft, id: &str, target| {
+            apply_editor_command(
+                draft,
+                EditorCommand::ConvertBlock {
+                    path: path(id),
+                    target,
+                },
+            )
+            .unwrap()
+        };
+        for mode in [mode_wait_true(), mode_wait_false(), ObserveMode::CheckNow] {
+            convert(
+                &mut draft,
+                "text",
+                ConversionTarget::TextObservation { mode },
+            );
+        }
+        for mode in [mode_wait_false(), mode_wait_true(), ObserveMode::CheckNow] {
+            convert(
+                &mut draft,
+                "image",
+                ConversionTarget::ImageObservation { mode },
+            );
+        }
+        convert(
+            &mut draft,
+            "tc",
+            ConversionTarget::ClickTextMatch {
+                button: MouseButton::Right,
+            },
+        );
+        convert(
+            &mut draft,
+            "ic",
+            ConversionTarget::ClickImageMatch {
+                button: MouseButton::Right,
+            },
+        );
+        convert(
+            &mut draft,
+            "fixed",
+            ConversionTarget::ClickRegion {
+                region_id: "region".into(),
+                button: MouseButton::Right,
+            },
+        );
+        convert(
+            &mut draft,
+            "fixed",
+            ConversionTarget::ClickPoint {
+                point_id: "point2".into(),
+                button: MouseButton::Left,
+            },
+        );
+        convert(
+            &mut draft,
+            "loop",
+            ConversionTarget::RepeatUntil {
+                condition: Condition::Text {
+                    source_block_id: "loop".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+                max_iterations: Limit::Finite(9),
+            },
+        );
+        convert(&mut draft, "loop", ConversionTarget::RepeatN { count: 3 });
+        assert!(matches!(
+            draft.definition.blocks[2].kind,
+            BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    button: MouseButton::Right,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            draft.definition.blocks[3].kind,
+            BlockKind::Action {
+                action: Action::ClickImageMatch {
+                    button: MouseButton::Right,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            matches!(draft.definition.blocks[4].kind,BlockKind::Action{action:Action::ClickPoint{ref point_id,..}} if point_id=="point2")
+        );
+        assert!(
+            matches!(draft.definition.blocks[5].kind,BlockKind::RepeatN{ref body,..} if body[0].id=="owned")
+        );
+    }
+
+    #[test]
+    fn structural_commands_are_transactional_and_revisioned() {
+        let lane = |id: &str| WatchLane {
+            id: id.into(),
+            enabled: true,
+            condition: PassiveCondition::Text {
+                source_block_id: id.into(),
+                rule_id: "r".into(),
+            },
+            then_body: vec![comment(&format!("{id}-body"))],
+        };
+        let watch = Block {
+            id: "watch".into(),
+            enabled: true,
+            kind: BlockKind::WatchGroup {
+                group: WatchGroup {
+                    lanes: vec![lane("a"), lane("b"), lane("c")],
+                    timeout_ms: Limit::Finite(100),
+                    timeout_outcome: TimeoutOutcome::Continue,
+                    cooldown_ms: 25,
+                },
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![watch]));
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::MoveLane {
+                    group_id: "watch".into(),
+                    lane_id: "c".into(),
+                    to_index: 0
+                }
+            ),
+            Ok(EditOutcome::Changed)
+        );
+        assert_eq!(draft.watch_lane_ids("watch"), vec!["c", "a", "b"]);
+        assert_eq!(draft.definition.revision, 5);
+        assert_eq!(draft.status, DraftStatus::NeedsValidation);
+        let before = draft.clone();
+        let nested = Block {
+            id: "nested".into(),
+            enabled: true,
+            kind: BlockKind::WatchGroup {
+                group: WatchGroup {
+                    lanes: vec![],
+                    timeout_ms: Limit::Finite(1),
+                    timeout_outcome: TimeoutOutcome::Continue,
+                    cooldown_ms: 0,
+                },
+            },
+        };
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::InsertBlock {
+                    target: InsertionTarget {
+                        container: ContainerPath::WatchLaneBody {
+                            watch_id: "watch".into(),
+                            lane_id: "a".into()
+                        },
+                        index: 0
+                    },
+                    block: nested
+                }
+            ),
+            Err(EditorError::NestedWatchGroup)
+        );
+        assert_eq!(draft, before);
+    }
+
+    #[test]
+    fn running_and_duplicate_ids_reject_without_mutation() {
+        let mut running = EditorDraft::new(def(vec![comment("x")]));
+        running.editability = DraftEditability::Running { revision: 4 };
+        let before = running.clone();
+        assert_eq!(
+            apply_editor_command(
+                &mut running,
+                EditorCommand::SetBlockEnabled {
+                    path: path("x"),
+                    enabled: false
+                }
+            ),
+            Err(EditorError::RunInProgress)
+        );
+        assert_eq!(running, before);
+        let mut duplicate = EditorDraft::new(def(vec![comment("x"), comment("x")]));
+        let before = duplicate.clone();
+        assert_eq!(
+            apply_editor_command(
+                &mut duplicate,
+                EditorCommand::SetBlockEnabled {
+                    path: path("x"),
+                    enabled: false
+                }
+            ),
+            Err(EditorError::DuplicateIdentity("x".into()))
+        );
+        assert_eq!(duplicate, before);
+    }
+
+    #[test]
+    fn rule_and_recapture_invalidate_dependent_matched_click_until_validation() {
+        let source = Block {
+            id: "source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "source".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        };
+        let click = Block {
+            id: "click".into(),
+            enabled: true,
+            kind: BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: "source".into(),
+                    button: MouseButton::Left,
+                },
+            },
+        };
+        let mut definition = def(vec![source, click]);
+        definition.regions.push(RegionDefinition {
+            id: "region".into(),
+            revision: 1,
+            rect: RectRatio {
+                x: 0.1,
+                y: 0.1,
+                width: 0.2,
+                height: 0.2,
+            },
+        });
+        definition.text_rules.push(TextRule {
+            id: "r".into(),
+            revision: 1,
+            region_id: "region".into(),
+            language: "en-US".into(),
+            preprocess: PreprocessProfile::Grayscale,
+            expected: "Salvage".into(),
+            match_mode: TextMatchMode::Contains,
+            threshold: 0.9,
+            case_sensitive: false,
+            allow_cross_line: false,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 250,
+            timeout_ms: Limit::Finite(1000),
+            stable_frames: 1,
+        });
+        let mut draft = EditorDraft::new(definition);
+        let mut rule = draft.definition.text_rules[0].clone();
+        rule.expected = "Retry".into();
+        apply_editor_command(&mut draft, EditorCommand::ReplaceTextRule { rule }).unwrap();
+        assert!(draft.invalidated_source_ids().contains("source"));
+        assert!(
+            editor_validation_problems(&draft)
+                .iter()
+                .any(|p| p.code == "editor.dependent_action_needs_revalidation"
+                    && p.block_id.as_deref() == Some("click"))
+        );
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::ApplyRecapture {
+                region_id: "region".into(),
+                rect: RectRatio {
+                    x: 0.2,
+                    y: 0.1,
+                    width: 0.2,
+                    height: 0.2,
+                },
+                image_template: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(draft.definition.regions[0].revision, 2);
+        assert_eq!(draft.definition.text_rules[0].expected, "Retry");
+    }
+
+    #[test]
+    fn undo_restores_known_detector_failure_for_restored_fingerprint() {
+        let mut definition = def(vec![Block {
+            id: "source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "source".into(),
+                    rule_id: "rule".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        }]);
+        definition.regions.push(RegionDefinition {
+            id: "region".into(),
+            revision: 1,
+            rect: RectRatio {
+                x: 0.1,
+                y: 0.1,
+                width: 0.2,
+                height: 0.2,
+            },
+        });
+        definition.text_rules.push(TextRule {
+            id: "rule".into(),
+            revision: 1,
+            region_id: "region".into(),
+            language: "en-US".into(),
+            preprocess: PreprocessProfile::Grayscale,
+            expected: "fingerprint F".into(),
+            match_mode: TextMatchMode::Contains,
+            threshold: 0.9,
+            case_sensitive: false,
+            allow_cross_line: false,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 250,
+            timeout_ms: Limit::Finite(1_000),
+            stable_frames: 1,
+        });
+        let mut draft = EditorDraft::new(definition);
+        let failed_fingerprint = detector_fingerprint_for_block(&draft.definition, "source")
+            .expect("text observation has a detector fingerprint");
+        draft.record_detector_test_failure(
+            "source",
+            failed_fingerprint,
+            "fingerprint F did not match",
+        );
+
+        let mut rule_g = draft.definition.text_rules[0].clone();
+        rule_g.expected = "fingerprint G".into();
+        apply_editor_command(&mut draft, EditorCommand::ReplaceTextRule { rule: rule_g }).unwrap();
+        assert!(
+            !editor_validation_problems(&draft)
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
+
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        assert_eq!(draft.definition.text_rules[0].expected, "fingerprint F");
+        assert!(
+            editor_validation_problems(&draft)
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
+        assert_eq!(
+            apply_editor_command(&mut draft, EditorCommand::MarkValidated),
+            Err(EditorError::ValidationFailed)
+        );
+
+        let mut rule_g_again = draft.definition.text_rules[0].clone();
+        rule_g_again.expected = "fingerprint G".into();
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::ReplaceTextRule { rule: rule_g_again },
+        )
+        .unwrap();
+        assert!(
+            !editor_validation_problems(&draft)
+                .iter()
+                .any(|problem| problem.code == "editor.detector_test_failed")
+        );
+    }
+
+    #[test]
+    fn replacing_target_invalidates_detector_proofs_and_is_undoable() {
+        let (mut definition, verification) = image_definition_and_verification();
+        definition.image_rules[0].verification = Some(verification.clone());
+        let mut draft = EditorDraft::new(definition);
+        let original = draft.definition.target.clone();
+
+        let mut replacement = original.clone();
+        replacement.captured_dpi = 144;
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::ReplaceTarget {
+                    target: replacement.clone(),
+                },
+            ),
+            Ok(EditOutcome::Changed)
+        );
+        assert_eq!(draft.definition.target, replacement);
+        assert!(draft.definition.image_rules[0].verification.is_none());
+        assert!(draft.invalidated_source_ids().contains("image-source"));
+
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        assert_eq!(draft.definition.target, original);
+        assert_eq!(
+            draft.definition.image_rules[0].verification,
+            Some(verification)
+        );
+        assert!(!draft.invalidated_source_ids().contains("image-source"));
+    }
+
+    #[test]
+    fn identical_profile_retarget_invalidates_proofs_and_detector_failures_and_is_undoable() {
+        let (mut definition, verification) = image_definition_and_verification();
+        definition.image_rules[0].verification = Some(verification.clone());
+        let mut draft = EditorDraft::new(definition);
+        let target = draft.definition.target.clone();
+        let failed_fingerprint =
+            detector_fingerprint_for_block(&draft.definition, "image-source").unwrap();
+        draft.record_detector_test_failure(
+            "image-source",
+            failed_fingerprint,
+            "known failure before retarget",
+        );
+
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::ReplaceTarget {
+                    target: target.clone(),
+                },
+            ),
+            Ok(EditOutcome::Changed)
+        );
+        assert_eq!(draft.definition.revision, 5);
+        assert_eq!(draft.definition.target, target);
+        assert!(draft.definition.image_rules[0].verification.is_none());
+        assert!(draft.invalidated_source_ids().contains("image-source"));
+        assert!(draft.detector_test_failures.is_empty());
+
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        assert_eq!(draft.definition.revision, 6);
+        assert_eq!(
+            draft.definition.image_rules[0].verification,
+            Some(verification)
+        );
+        assert!(!draft.invalidated_source_ids().contains("image-source"));
+        assert!(draft.detector_test_failures.contains_key("image-source"));
+        assert_eq!(
+            apply_editor_command(&mut draft, EditorCommand::MarkValidated),
+            Err(EditorError::ValidationFailed)
+        );
+    }
+
+    #[test]
+    fn canonical_recapture_bumps_region_and_rule_revisions_even_for_same_rect() {
+        let rect = RectRatio {
+            x: 0.1,
+            y: 0.1,
+            width: 0.2,
+            height: 0.2,
+        };
+        let mut definition = def(vec![Block {
+            id: "source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "source".into(),
+                    rule_id: "text".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        }]);
+        definition.regions.push(RegionDefinition {
+            id: "region".into(),
+            revision: 3,
+            rect,
+        });
+        definition.text_rules.push(TextRule {
+            id: "text".into(),
+            revision: 4,
+            region_id: "region".into(),
+            language: "en-US".into(),
+            preprocess: PreprocessProfile::Grayscale,
+            expected: "Preserve me".into(),
+            match_mode: TextMatchMode::Contains,
+            threshold: 0.9,
+            case_sensitive: false,
+            allow_cross_line: false,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 250,
+            timeout_ms: Limit::Unlimited,
+            stable_frames: 2,
+        });
+        let old_asset = AssetRef {
+            id: "template".into(),
+            revision: 1,
+            content_hash: "old".into(),
+        };
+        let new_asset = AssetRef {
+            id: "template".into(),
+            revision: 2,
+            content_hash: "new".into(),
+        };
+        definition.image_rules.push(ImageRule {
+            id: "image".into(),
+            revision: 6,
+            region_id: "region".into(),
+            template: old_asset,
+            transparent_mask: None,
+            threshold: 0.9,
+            scales_percent: vec![100],
+            stable_frames: 2,
+            maximum_center_drift_px: 5,
+            minimum_runner_up_margin: 0.05,
+            verification: None,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 100,
+            timeout_ms: Limit::Unlimited,
+        });
+        let mut draft = EditorDraft::new(definition);
+
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::ApplyRecapture {
+                region_id: "region".into(),
+                rect,
+                image_template: Some(("image".into(), new_asset.clone())),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(draft.definition.regions[0].revision, 4);
+        assert_eq!(draft.definition.text_rules[0].revision, 5);
+        assert_eq!(draft.definition.text_rules[0].expected, "Preserve me");
+        assert_eq!(draft.definition.image_rules[0].revision, 7);
+        assert_eq!(draft.definition.image_rules[0].template, new_asset);
+        assert_eq!(draft.definition.image_rules[0].verification, None);
+        assert!(draft.invalidated_source_ids().contains("source"));
+    }
+
+    #[test]
+    fn template_only_recapture_keeps_region_revision_and_revises_only_image_rule() {
+        let mut definition = def(vec![Block {
+            id: "image-source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Image {
+                    source_block_id: "image-source".into(),
+                    rule_id: "image".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        }]);
+        definition.regions.push(RegionDefinition {
+            id: "region".into(),
+            revision: 8,
+            rect: RectRatio {
+                x: 0.1,
+                y: 0.1,
+                width: 0.2,
+                height: 0.2,
+            },
+        });
+        definition.image_rules.push(ImageRule {
+            id: "image".into(),
+            revision: 4,
+            region_id: "region".into(),
+            template: AssetRef {
+                id: "template".into(),
+                revision: 2,
+                content_hash: "old".into(),
+            },
+            transparent_mask: None,
+            threshold: 0.9,
+            scales_percent: vec![100],
+            stable_frames: 2,
+            maximum_center_drift_px: 5,
+            minimum_runner_up_margin: 0.05,
+            verification: None,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 100,
+            timeout_ms: Limit::Unlimited,
+        });
+        let mut draft = EditorDraft::new(definition);
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::ApplyTemplateRecapture {
+                rule_id: "image".into(),
+                template: AssetRef {
+                    id: "template".into(),
+                    revision: 3,
+                    content_hash: "new".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(draft.regions[0].revision, 8);
+        assert_eq!(draft.image_rules[0].revision, 5);
+        assert_eq!(draft.image_rules[0].template.revision, 3);
+        assert_eq!(draft.image_rules[0].verification, None);
+        assert!(draft.invalidated_source_ids().contains("image-source"));
+    }
+
+    #[test]
+    fn image_verification_command_rejects_same_rule_stale_or_tampered_artifacts_atomically() {
+        let (definition, verification) = image_definition_and_verification();
+
+        let mut stale_definition = definition.clone();
+        stale_definition.image_rules[0].revision += 1;
+        let mut stale_draft = EditorDraft::new(stale_definition);
+        let stale_before = stale_draft.clone();
+        assert_eq!(
+            apply_editor_command(
+                &mut stale_draft,
+                EditorCommand::ApplyImageVerification {
+                    rule_id: "image".into(),
+                    verification: verification.clone(),
+                },
+            ),
+            Err(EditorError::ValidationFailed)
+        );
+        assert_eq!(stale_draft, stale_before);
+
+        let mut tampered = verification;
+        tampered.verification_fingerprint_sha256 = "00".repeat(32);
+        let mut tampered_draft = EditorDraft::new(definition);
+        let tampered_before = tampered_draft.clone();
+        assert_eq!(
+            apply_editor_command(
+                &mut tampered_draft,
+                EditorCommand::ApplyImageVerification {
+                    rule_id: "image".into(),
+                    verification: tampered,
+                },
+            ),
+            Err(EditorError::ValidationFailed)
+        );
+        assert_eq!(tampered_draft, tampered_before);
+    }
+
+    #[test]
+    fn unrelated_conversion_requires_replace_preview() {
+        let block = Block {
+            id: "o".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "o".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        };
+        assert!(matches!(
+            preview_conversion(&block, BlockFamily::Loop),
+            ConversionPreview::ReplaceRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn moving_container_into_descendant_is_transactional() {
+        let outer = Block {
+            id: "outer".into(),
+            enabled: true,
+            kind: BlockKind::RepeatN {
+                count: 2,
+                body: vec![Block {
+                    id: "inner".into(),
+                    enabled: true,
+                    kind: BlockKind::RepeatN {
+                        count: 2,
+                        body: vec![comment("leaf")],
+                    },
+                }],
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![outer]));
+        let before = draft.clone();
+        let result = apply_editor_command(
+            &mut draft,
+            EditorCommand::MoveBlock {
+                source: path("outer"),
+                target: InsertionTarget {
+                    container: ContainerPath::LoopBody {
+                        loop_id: "inner".into(),
+                    },
+                    index: 0,
+                },
+            },
+        );
+        assert_eq!(result, Err(EditorError::IllegalDescendantMove));
+        assert_eq!(draft, before);
+    }
+
+    #[test]
+    fn explicit_then_else_transfer_preserves_whole_loop() {
+        let branch = Block {
+            id: "if".into(),
+            enabled: true,
+            kind: BlockKind::If {
+                condition: Condition::Text {
+                    source_block_id: "if".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+                then_body: vec![Block {
+                    id: "loop".into(),
+                    enabled: true,
+                    kind: BlockKind::RepeatN {
+                        count: 2,
+                        body: vec![comment("inside")],
+                    },
+                }],
+                else_body: vec![comment("fallback")],
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![branch]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::TransferIfBranch {
+                if_id: "if".into(),
+                branch: IfBranch::Then,
+                block_id: "loop".into(),
+                to_index: 1,
+            },
+        )
+        .unwrap();
+        let BlockKind::If {
+            then_body,
+            else_body,
+            ..
+        } = &draft.definition.blocks[0].kind
+        else {
+            panic!()
+        };
+        assert!(then_body.is_empty());
+        assert_eq!(else_body[1].id, "loop");
+        assert!(matches!(else_body[1].kind,BlockKind::RepeatN{ref body,..}if body[0].id=="inside"));
+    }
+
+    #[test]
+    fn loop_deletion_requires_choice_and_can_keep_contents() {
+        let loop_block = Block {
+            id: "loop".into(),
+            enabled: true,
+            kind: BlockKind::RepeatN {
+                count: 2,
+                body: vec![comment("a"), comment("b")],
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![loop_block]));
+        let before = draft.clone();
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::RemoveBlock {
+                    path: path("loop"),
+                    loop_choice: None
+                }
+            ),
+            Err(EditorError::LoopDeletionChoiceRequired)
+        );
+        assert_eq!(draft, before);
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::RemoveBlock {
+                path: path("loop"),
+                loop_choice: Some(LoopDeletionChoice::KeepContents),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            draft
+                .definition
+                .blocks
+                .iter()
+                .map(|b| b.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    fn condition_with_timeout(owner: &str, timeout_child: &str) -> Condition {
+        Condition::Text {
+            source_block_id: owner.into(),
+            rule_id: "r".into(),
+            mode: ObserveMode::WaitForTrue {
+                timeout_ms: Limit::Finite(321),
+                timeout_outcome: TimeoutOutcome::RunBody {
+                    body: vec![comment(timeout_child)],
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn keep_owned_contents_flattens_all_owned_branches_in_canonical_order() {
+        let blocks = vec![
+            Block {
+                id: "observe".into(),
+                enabled: true,
+                kind: BlockKind::Observe {
+                    condition: condition_with_timeout("observe", "observe-timeout"),
+                },
+            },
+            Block {
+                id: "if".into(),
+                enabled: true,
+                kind: BlockKind::If {
+                    condition: condition_with_timeout("if", "if-timeout"),
+                    then_body: vec![comment("if-then")],
+                    else_body: vec![comment("if-else")],
+                },
+            },
+            Block {
+                id: "repeat".into(),
+                enabled: true,
+                kind: BlockKind::RepeatUntil {
+                    condition: condition_with_timeout("repeat", "repeat-timeout"),
+                    max_iterations: Limit::Finite(4),
+                    body: vec![comment("repeat-body")],
+                },
+            },
+            Block {
+                id: "watch".into(),
+                enabled: true,
+                kind: BlockKind::WatchGroup {
+                    group: WatchGroup {
+                        lanes: vec![
+                            WatchLane {
+                                id: "lane-1".into(),
+                                enabled: true,
+                                condition: PassiveCondition::Text {
+                                    source_block_id: "lane-1".into(),
+                                    rule_id: "r".into(),
+                                },
+                                then_body: vec![comment("lane-1-body")],
+                            },
+                            WatchLane {
+                                id: "lane-2".into(),
+                                enabled: true,
+                                condition: PassiveCondition::Text {
+                                    source_block_id: "lane-2".into(),
+                                    rule_id: "r".into(),
+                                },
+                                then_body: vec![comment("lane-2-body")],
+                            },
+                        ],
+                        timeout_ms: Limit::Finite(100),
+                        timeout_outcome: TimeoutOutcome::RunBody {
+                            body: vec![comment("watch-timeout")],
+                        },
+                        cooldown_ms: 0,
+                    },
+                },
+            },
+        ];
+        let mut draft = EditorDraft::new(def(blocks));
+        for id in ["observe", "if", "repeat", "watch"] {
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::ReplaceBlock {
+                    path: path(id),
+                    replacement: comment(id),
+                    children: ChildDisposition::KeepOwnedContents,
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            draft
+                .blocks
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "observe",
+                "observe-timeout",
+                "if",
+                "if-then",
+                "if-else",
+                "if-timeout",
+                "repeat",
+                "repeat-body",
+                "repeat-timeout",
+                "watch",
+                "lane-1-body",
+                "lane-2-body",
+                "watch-timeout",
+            ]
+        );
+    }
+
+    #[test]
+    fn repeat_until_keep_contents_preserves_body_then_timeout_branch() {
+        let mut draft = EditorDraft::new(def(vec![Block {
+            id: "repeat".into(),
+            enabled: true,
+            kind: BlockKind::RepeatUntil {
+                condition: condition_with_timeout("repeat", "timeout"),
+                max_iterations: Limit::Finite(4),
+                body: vec![comment("body")],
+            },
+        }]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::RemoveBlock {
+                path: path("repeat"),
+                loop_choice: Some(LoopDeletionChoice::KeepContents),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            draft
+                .blocks
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["body", "timeout"]
+        );
+    }
+
+    #[test]
+    fn wait_mode_direction_changes_preserve_timeout_configuration_and_body() {
+        let configured = ObserveMode::WaitForTrue {
+            timeout_ms: Limit::Finite(777),
+            timeout_outcome: TimeoutOutcome::RunBody {
+                body: vec![comment("fallback")],
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![Block {
+            id: "observe".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "observe".into(),
+                    rule_id: "r".into(),
+                    mode: configured,
+                },
+            },
+        }]));
+
+        for command in [
+            EditorCommand::ConvertBlock {
+                path: path("observe"),
+                target: ConversionTarget::TextObservation {
+                    mode: ObserveMode::WaitForFalse {
+                        timeout_ms: Limit::Unlimited,
+                        timeout_outcome: TimeoutOutcome::Continue,
+                    },
+                },
+            },
+            EditorCommand::SetConditionMode {
+                path: path("observe"),
+                mode: ObserveMode::WaitForTrue {
+                    timeout_ms: Limit::Unlimited,
+                    timeout_outcome: TimeoutOutcome::Continue,
+                },
+            },
+        ] {
+            apply_editor_command(&mut draft, command).unwrap();
+            let BlockKind::Observe { condition } = &draft.blocks[0].kind else {
+                panic!()
+            };
+            let mode = match condition {
+                Condition::Text { mode, .. } => mode,
+                _ => panic!(),
+            };
+            assert!(matches!(
+                mode,
+                ObserveMode::WaitForTrue {
+                    timeout_ms: Limit::Finite(777),
+                    timeout_outcome: TimeoutOutcome::RunBody { body },
+                } | ObserveMode::WaitForFalse {
+                    timeout_ms: Limit::Finite(777),
+                    timeout_outcome: TimeoutOutcome::RunBody { body },
+                } if body[0].id == "fallback"
+            ));
+        }
+    }
+
+    #[test]
+    fn replacement_rejects_action_sources_removed_by_the_same_transaction() {
+        let owner = Block {
+            id: "owner".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "owner".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::WaitForTrue {
+                        timeout_ms: Limit::Finite(321),
+                        timeout_outcome: TimeoutOutcome::RunBody {
+                            body: vec![Block {
+                                id: "child-source".into(),
+                                enabled: true,
+                                kind: BlockKind::Observe {
+                                    condition: Condition::Text {
+                                        source_block_id: "child-source".into(),
+                                        rule_id: "r".into(),
+                                        mode: ObserveMode::CheckNow,
+                                    },
+                                },
+                            }],
+                        },
+                    },
+                },
+            },
+        };
+        let replacement = |source: &str| Block {
+            id: "owner".into(),
+            enabled: true,
+            kind: BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: source.into(),
+                    button: MouseButton::Left,
+                },
+            },
+        };
+
+        for source in ["owner", "child-source"] {
+            let mut draft = EditorDraft::new(def(vec![owner.clone()]));
+            let before = draft.clone();
+            assert_eq!(
+                apply_editor_command(
+                    &mut draft,
+                    EditorCommand::ReplaceBlock {
+                        path: path("owner"),
+                        replacement: replacement(source),
+                        children: ChildDisposition::DeleteOwnedContents,
+                    },
+                ),
+                Err(EditorError::ValidationFailed)
+            );
+            assert_eq!(draft, before);
+        }
+
+        let mut keep = EditorDraft::new(def(vec![owner]));
+        assert_eq!(
+            apply_editor_command(
+                &mut keep,
+                EditorCommand::ReplaceBlock {
+                    path: path("owner"),
+                    replacement: replacement("child-source"),
+                    children: ChildDisposition::KeepOwnedContents,
+                },
+            ),
+            Ok(EditOutcome::Changed)
+        );
+    }
+
+    #[test]
+    fn direct_command_rejects_text_absent_matched_click_source() {
+        let source = Block {
+            id: "source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "source".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        };
+        let mut definition = def(vec![source, comment("target")]);
+        definition.text_rules.push(TextRule {
+            id: "r".into(),
+            revision: 1,
+            region_id: "region".into(),
+            language: "en-US".into(),
+            preprocess: PreprocessProfile::Original,
+            expected: "missing".into(),
+            match_mode: TextMatchMode::Absent,
+            threshold: 0.9,
+            case_sensitive: false,
+            allow_cross_line: false,
+            match_policy: MatchSelectionPolicy::ExactlyOne,
+            poll_interval_ms: 250,
+            timeout_ms: Limit::Unlimited,
+            stable_frames: 1,
+        });
+        let mut draft = EditorDraft::new(definition);
+        let before = draft.clone();
+        let action = |id: &str| Block {
+            id: id.into(),
+            enabled: true,
+            kind: BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    source_block_id: "source".into(),
+                    button: MouseButton::Left,
+                },
+            },
+        };
+        for command in [
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 2,
+                },
+                block: action("inserted"),
+            },
+            EditorCommand::ReplaceBlock {
+                path: path("target"),
+                replacement: action("target"),
+                children: ChildDisposition::DeleteOwnedContents,
+            },
+        ] {
+            assert_eq!(
+                apply_editor_command(&mut draft, command),
+                Err(EditorError::ValidationFailed)
+            );
+            assert_eq!(draft, before);
+        }
+    }
+
+    #[test]
+    fn no_op_preserves_revision_status_and_undo() {
+        let mut draft = EditorDraft::new(def(vec![comment("x")]));
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::SetBlockEnabled {
+                    path: path("x"),
+                    enabled: true
+                }
+            ),
+            Ok(EditOutcome::NoChange)
+        );
+        assert_eq!(draft.definition.revision, 4);
+        assert_eq!(draft.status, DraftStatus::Ready);
+        assert_eq!(draft.undo_len(), 0);
+    }
+
+    #[test]
+    fn inspector_flow_commands_edit_mode_repeat_and_watch_settings() {
+        let condition = || Condition::Text {
+            source_block_id: "observe".into(),
+            rule_id: "r".into(),
+            mode: ObserveMode::CheckNow,
+        };
+        let mut draft = EditorDraft::new(def(vec![
+            Block {
+                id: "observe".into(),
+                enabled: true,
+                kind: BlockKind::Observe {
+                    condition: condition(),
+                },
+            },
+            Block {
+                id: "repeat-n".into(),
+                enabled: true,
+                kind: BlockKind::RepeatN {
+                    count: 2,
+                    body: vec![],
+                },
+            },
+            Block {
+                id: "repeat-until".into(),
+                enabled: true,
+                kind: BlockKind::RepeatUntil {
+                    condition: condition(),
+                    max_iterations: Limit::Finite(10),
+                    body: vec![],
+                },
+            },
+            Block {
+                id: "watch".into(),
+                enabled: true,
+                kind: BlockKind::WatchGroup {
+                    group: WatchGroup {
+                        lanes: vec![],
+                        timeout_ms: Limit::Finite(1_000),
+                        timeout_outcome: TimeoutOutcome::Continue,
+                        cooldown_ms: 100,
+                    },
+                },
+            },
+        ]));
+
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::SetConditionMode {
+                path: path("observe"),
+                mode: ObserveMode::WaitForTrue {
+                    timeout_ms: Limit::Unlimited,
+                    timeout_outcome: TimeoutOutcome::Continue,
+                },
+            },
+        )
+        .unwrap();
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::SetRepeatCount {
+                path: path("repeat-n"),
+                count: 7,
+            },
+        )
+        .unwrap();
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::SetRepeatUntilMax {
+                path: path("repeat-until"),
+                max_iterations: Limit::Unlimited,
+            },
+        )
+        .unwrap();
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::SetWatchSettings {
+                path: path("watch"),
+                timeout_ms: Limit::Unlimited,
+                cooldown_ms: 275,
+            },
+        )
+        .unwrap();
+
+        let BlockKind::Observe { condition } = &draft.blocks[0].kind else {
+            panic!()
+        };
+        assert!(matches!(
+            condition,
+            Condition::Text {
+                mode: ObserveMode::WaitForTrue {
+                    timeout_ms: Limit::Unlimited,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            draft.blocks[1].kind,
+            BlockKind::RepeatN { count: 7, .. }
+        ));
+        assert!(matches!(
+            draft.blocks[2].kind,
+            BlockKind::RepeatUntil {
+                max_iterations: Limit::Unlimited,
+                ..
+            }
+        ));
+        let BlockKind::WatchGroup { group } = &draft.blocks[3].kind else {
+            panic!()
+        };
+        assert_eq!(group.timeout_ms, Limit::Unlimited);
+        assert_eq!(group.cooldown_ms, 275);
+    }
+
+    #[test]
+    fn duplication_remaps_internal_dependency_and_undo_is_bounded() {
+        let subtree = Block {
+            id: "loop".into(),
+            enabled: true,
+            kind: BlockKind::RepeatN {
+                count: 1,
+                body: vec![
+                    Block {
+                        id: "source".into(),
+                        enabled: true,
+                        kind: BlockKind::Observe {
+                            condition: Condition::Text {
+                                source_block_id: "source".into(),
+                                rule_id: "r".into(),
+                                mode: ObserveMode::CheckNow,
+                            },
+                        },
+                    },
+                    Block {
+                        id: "click".into(),
+                        enabled: true,
+                        kind: BlockKind::Action {
+                            action: Action::ClickTextMatch {
+                                source_block_id: "source".into(),
+                                button: MouseButton::Left,
+                            },
+                        },
+                    },
+                ],
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![subtree]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::DuplicateBlock {
+                source: path("loop"),
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+            },
+        )
+        .unwrap();
+        let BlockKind::RepeatN { body, .. } = &draft.definition.blocks[1].kind else {
+            panic!()
+        };
+        assert!(
+            matches!(body[1].kind,BlockKind::Action{action:Action::ClickTextMatch{ref source_block_id,..}}if source_block_id=="source-copy")
+        );
+        for _ in 0..40 {
+            let enabled = !draft.definition.blocks[0].enabled;
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::SetBlockEnabled {
+                    path: path("loop"),
+                    enabled,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(draft.undo_len(), EDITOR_UNDO_LIMIT);
+    }
+
+    #[test]
+    fn duplication_remaps_timeout_descendants_and_internal_references() {
+        let timeout_source = Block {
+            id: "timeout-source".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "timeout-source".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        };
+        let owner = Block {
+            id: "owner".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "owner".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::WaitForTrue {
+                        timeout_ms: Limit::Finite(100),
+                        timeout_outcome: TimeoutOutcome::RunBody {
+                            body: vec![
+                                timeout_source,
+                                Block {
+                                    id: "timeout-click".into(),
+                                    enabled: true,
+                                    kind: BlockKind::Action {
+                                        action: Action::ClickTextMatch {
+                                            source_block_id: "timeout-source".into(),
+                                            button: MouseButton::Left,
+                                        },
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                },
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![owner]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::DuplicateBlock {
+                source: path("owner"),
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+            },
+        )
+        .unwrap();
+
+        let duplicate = &draft.blocks[1];
+        let BlockKind::Observe { condition } = &duplicate.kind else {
+            panic!()
+        };
+        let body = condition_timeout_body(condition).unwrap();
+        assert_eq!(duplicate.id, "owner-copy");
+        assert_eq!(body[0].id, "timeout-source-copy");
+        assert_eq!(body[1].id, "timeout-click-copy");
+        assert!(matches!(
+            body[1].kind,
+            BlockKind::Action {
+                action: Action::ClickTextMatch {
+                    ref source_block_id,
+                    ..
+                }
+            } if source_block_id == "timeout-source-copy"
+        ));
+    }
+
+    #[test]
+    fn timeout_body_children_are_structural_insertion_reorder_and_move_targets() {
+        let owner = Block {
+            id: "owner".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "owner".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::WaitForTrue {
+                        timeout_ms: Limit::Finite(100),
+                        timeout_outcome: TimeoutOutcome::RunBody {
+                            body: vec![comment("first")],
+                        },
+                    },
+                },
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![owner]));
+        let first = locate_block_path(&draft, "first").unwrap();
+        assert_eq!(
+            first.container,
+            ContainerPath::TimeoutBody {
+                owner_id: "owner".into()
+            }
+        );
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: first.container.clone(),
+                    index: 1,
+                },
+                block: comment("second"),
+            },
+        )
+        .unwrap();
+        let second = locate_block_path(&draft, "second").unwrap();
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::ReorderSibling {
+                path: second,
+                to_index: 0,
+            },
+        )
+        .unwrap();
+        let first = locate_block_path(&draft, "first").unwrap();
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::MoveBlock {
+                source: first,
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(draft.blocks[1].id, "first");
+        let timeout = container_len(
+            &draft,
+            &ContainerPath::TimeoutBody {
+                owner_id: "owner".into(),
+            },
+        );
+        assert_eq!(timeout, Some(1));
+    }
+
+    #[test]
+    fn identical_conversion_and_condition_mode_are_true_no_ops() {
+        let observe = Block {
+            id: "observe".into(),
+            enabled: true,
+            kind: BlockKind::Observe {
+                condition: Condition::Text {
+                    source_block_id: "observe".into(),
+                    rule_id: "r".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+            },
+        };
+        let mut draft = EditorDraft::new(def(vec![observe]));
+        let revision = draft.revision;
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::ConvertBlock {
+                    path: path("observe"),
+                    target: ConversionTarget::TextObservation {
+                        mode: ObserveMode::CheckNow,
+                    },
+                },
+            ),
+            Ok(EditOutcome::NoChange)
+        );
+        assert_eq!(
+            apply_editor_command(
+                &mut draft,
+                EditorCommand::SetConditionMode {
+                    path: path("observe"),
+                    mode: ObserveMode::CheckNow,
+                },
+            ),
+            Ok(EditOutcome::NoChange)
+        );
+        assert_eq!(draft.revision, revision);
+        assert_eq!(draft.undo_len(), 0);
+        assert!(draft.invalidated_source_ids().is_empty());
+    }
+
+    #[test]
+    fn sibling_reorder_and_lane_enable_are_revisioned() {
+        let mut draft = EditorDraft::new(def(vec![comment("a"), comment("b"), comment("c")]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::ReorderSibling {
+                path: path("c"),
+                to_index: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            draft
+                .definition
+                .blocks
+                .iter()
+                .map(|b| b.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "a", "b"]
+        );
+        assert_eq!(draft.definition.revision, 5);
+    }
+
+    #[test]
+    fn undo_then_redo_restores_structure_with_a_new_revision() {
+        let mut draft = EditorDraft::new(def(vec![comment("first")]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+                block: comment("second"),
+            },
+        )
+        .unwrap();
+        let edited_revision = draft.definition.revision;
+        assert_eq!(draft.definition.blocks.len(), 2);
+
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        let undone_revision = draft.definition.revision;
+        assert_eq!(draft.definition.blocks.len(), 1);
+
+        apply_editor_command(&mut draft, EditorCommand::Redo).unwrap();
+        assert_eq!(draft.definition.blocks.len(), 2);
+        assert!(draft.definition.revision > undone_revision);
+        assert_ne!(draft.definition.revision, edited_revision);
+        assert_eq!(draft.status, DraftStatus::NeedsValidation);
+    }
+
+    #[test]
+    fn non_history_edit_after_undo_clears_redo() {
+        let mut draft = EditorDraft::new(def(vec![comment("first")]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+                block: comment("second"),
+            },
+        )
+        .unwrap();
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        assert_eq!(draft.redo_len(), 1);
+
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+                block: comment("replacement"),
+            },
+        )
+        .unwrap();
+        assert_eq!(draft.redo_len(), 0);
+        assert_eq!(
+            apply_editor_command(&mut draft, EditorCommand::Redo),
+            Err(EditorError::NothingToRedo)
+        );
+    }
+
+    #[test]
+    fn successful_validation_after_undo_clears_redo() {
+        let mut draft = EditorDraft::new(def(vec![comment("first")]));
+        apply_editor_command(
+            &mut draft,
+            EditorCommand::InsertBlock {
+                target: InsertionTarget {
+                    container: ContainerPath::Root,
+                    index: 1,
+                },
+                block: comment("second"),
+            },
+        )
+        .unwrap();
+        apply_editor_command(&mut draft, EditorCommand::Undo).unwrap();
+        assert_eq!(draft.redo_len(), 1);
+
+        assert_eq!(
+            apply_editor_command(&mut draft, EditorCommand::MarkValidated),
+            Ok(EditOutcome::Validated)
+        );
+        assert_eq!(draft.redo_len(), 0);
+        assert_eq!(
+            apply_editor_command(&mut draft, EditorCommand::Redo),
+            Err(EditorError::NothingToRedo)
+        );
+    }
+}

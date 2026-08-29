@@ -20,43 +20,66 @@ use windows::{
     Win32::{
         Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
-            BLACK_BRUSH, BeginPaint, CreatePen, DeleteObject, EndPaint, FillRect, GetStockObject,
-            NULL_BRUSH, PAINTSTRUCT, PS_SOLID, Rectangle, SelectObject, SetBkMode, SetTextColor,
-            TRANSPARENT, TextOutW,
+            BLACK_BRUSH, BeginPaint, CreatePen, DeleteObject, EndPaint, FillRect, GetMonitorInfoW,
+            GetStockObject, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, NULL_BRUSH,
+            PAINTSTRUCT, PS_SOLID, Rectangle, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+            TextOutW,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::{
-                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-                SetThreadDpiAwarenessContext,
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
+                SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
             },
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
-                MOUSEEVENTF_LEFTUP, MOUSEINPUT, ReleaseCapture, SendInput, SetCapture, VK_ESCAPE,
-                VK_LBUTTON,
+                MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEINPUT,
+                ReleaseCapture, SendInput, SetCapture, VK_ESCAPE, VK_LBUTTON,
             },
             WindowsAndMessaging::{
                 CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-                DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetSystemMetrics,
-                GetWindowLongPtrW, HTCLIENT, IDC_CROSS, LWA_ALPHA, LoadCursorW, MSG, PM_REMOVE,
-                PeekMessageW, PostQuitMessage, RegisterClassW, SM_CXVIRTUALSCREEN,
-                SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOW, SetCursorPos,
-                SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, ShowWindow,
-                TranslateMessage, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-                WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_LAYERED,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                DestroyWindow, DispatchMessageW, GA_ROOT, GWLP_USERDATA, GetAncestor, GetCursorPos,
+                GetSystemMetrics, GetWindowLongPtrW, HTCLIENT, IDC_CROSS, LWA_ALPHA, LoadCursorW,
+                MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SM_CXVIRTUALSCREEN,
+                SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNOACTIVATE,
+                SetCursorPos, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
+                ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_DESTROY, WM_KEYDOWN,
+                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT,
+                WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                WS_POPUP, WindowFromPoint,
             },
         },
     },
     core::{HSTRING, PCWSTR, w},
 };
-use xcap::Monitor;
+use xcap::{Monitor, Window};
 
 use super::super::{
+    automation::{
+        AtomicCaptureSnapshot, AtomicFrameCapture, AtomicFrameSnapshotSource, CaptureSource, Clock,
+        InputSink, MouseButton, StopSource, SystemClock, TargetGuard, TargetSnapshot,
+    },
     config::{MouseMovementModel, MouseMovementProfile, MouseMovementSample, MouseMovementStep},
-    enchant_loop::{InputController, OcrReader, RegionCapture, StopSignal},
+    enchant_loop::OcrReader,
+    macro_engine::{
+        ConditionDetector, ConditionDetectorRouter, ImageDetector, LiveActionInput, MacroRuntime,
+        RuntimeControlHandle, TargetProfile, TextDetector,
+    },
     types::{Point, Rect, ScreenImage},
 };
+use super::windows_input::WindowsInputSink;
+use super::windows_snapshot::{
+    CanonicalWindowIdentity, Win32WindowsSnapshotSource, WindowsSnapshotSource,
+    client_rect_in_screen, window_class, window_title,
+};
+use super::windows_target::{DurableTargetHints, WindowsTargetGuard};
+
+/// Creates a run-local target guard from the same xcap window identity used by atomic capture.
+/// The live HWND is never copied into the durable hints.
+#[allow(dead_code)]
+pub fn xcap_window_target_guard(window_id: u32, hints: DurableTargetHints) -> WindowsTargetGuard {
+    WindowsTargetGuard::from_xcap_window_id(window_id, hints)
+}
 
 pub fn enable_per_monitor_dpi_awareness() {
     unsafe {
@@ -64,11 +87,79 @@ pub fn enable_per_monitor_dpi_awareness() {
     }
 }
 
+const NATIVE_DECORATION_HEIGHT: f32 = 48.0;
+const MIN_WINDOW_WIDTH: f32 = 720.0;
+const MIN_WINDOW_HEIGHT: f32 = 680.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowPlacement {
+    pub inner_size: [f32; 2],
+    pub outer_position: [f32; 2],
+}
+
+pub fn clamp_window_placement(
+    preferred: [f32; 2],
+    work_area_physical: [f32; 4],
+    scale: f32,
+) -> WindowPlacement {
+    let scale = scale.max(f32::EPSILON);
+    let work_width = (work_area_physical[2] - work_area_physical[0]).max(0.0) / scale;
+    let work_height = (work_area_physical[3] - work_area_physical[1]).max(0.0) / scale;
+    let max_inner_height = (work_height - NATIVE_DECORATION_HEIGHT).max(0.0);
+    let min_width = MIN_WINDOW_WIDTH.min(work_width);
+    let min_height = MIN_WINDOW_HEIGHT.min(max_inner_height);
+    let inner_size = [
+        preferred[0].clamp(min_width, work_width),
+        preferred[1].clamp(min_height, max_inner_height),
+    ];
+    let outer_size = [inner_size[0], inner_size[1] + NATIVE_DECORATION_HEIGHT];
+    let outer_position = [
+        work_area_physical[0] / scale + (work_width - outer_size[0]) / 2.0,
+        work_area_physical[1] / scale + (work_height - outer_size[1]) / 2.0,
+    ];
+    WindowPlacement {
+        inner_size,
+        outer_position,
+    }
+}
+
+pub fn preferred_window_placement(preferred: [f32; 2]) -> WindowPlacement {
+    let fallback = || clamp_window_placement(preferred, [0.0, 0.0, 1920.0, 1080.0], 1.0);
+    let mut point = POINT::default();
+    unsafe {
+        if GetCursorPos(&mut point).is_err() {
+            return fallback();
+        }
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return fallback();
+        }
+        let mut dpi_x = 96;
+        let mut dpi_y = 96;
+        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let work = info.rcWork;
+        clamp_window_placement(
+            preferred,
+            [
+                work.left as f32,
+                work.top as f32,
+                work.right as f32,
+                work.bottom as f32,
+            ],
+            dpi_x as f32 / 96.0,
+        )
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct XcapRegionCapture;
 
-impl RegionCapture for XcapRegionCapture {
-    fn capture_region(&self, rect: Rect) -> Result<ScreenImage> {
+impl CaptureSource for XcapRegionCapture {
+    fn capture(&self, rect: Rect) -> Result<ScreenImage> {
         let monitor = Monitor::from_point(rect.x, rect.y)
             .with_context(|| format!("failed to locate monitor for {}, {}", rect.x, rect.y))?;
         let monitor_x = monitor.x()?;
@@ -85,6 +176,405 @@ impl RegionCapture for XcapRegionCapture {
 
         Ok(ScreenImage::new(image))
     }
+}
+
+pub trait WindowClientGeometrySource {
+    fn client_rect(&self, window_id: u32) -> Result<Rect>;
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Win32ClientGeometrySource;
+
+impl WindowClientGeometrySource for Win32ClientGeometrySource {
+    fn client_rect(&self, window_id: u32) -> Result<Rect> {
+        client_rect_in_screen(CanonicalWindowIdentity::from_xcap_window_id(window_id))
+            .with_context(|| format!("failed to query client rect for xcap window {window_id}"))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CapturedWindowImage {
+    outer_rect: Rect,
+    image: RgbaImage,
+}
+
+trait ConcreteWindowImageSource {
+    fn capture_window(&self, window_id: u32) -> Result<CapturedWindowImage>;
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct XcapConcreteWindowImageSource;
+
+impl ConcreteWindowImageSource for XcapConcreteWindowImageSource {
+    fn capture_window(&self, window_id: u32) -> Result<CapturedWindowImage> {
+        let window = Window::all()
+            .context("failed to enumerate concrete windows for capture")?
+            .into_iter()
+            .find(|window| window.id().ok() == Some(window_id))
+            .ok_or_else(|| anyhow!("selected concrete window is no longer available"))?;
+        anyhow::ensure!(
+            !window.is_minimized().unwrap_or(true),
+            "selected concrete window is minimized"
+        );
+        let outer_rect = Rect::new(
+            window.x().context("failed to query concrete window x")?,
+            window.y().context("failed to query concrete window y")?,
+            window
+                .width()
+                .context("failed to query concrete window width")?,
+            window
+                .height()
+                .context("failed to query concrete window height")?,
+        );
+        let image = window
+            .capture_image()
+            .context("failed to capture concrete window image")?;
+        anyhow::ensure!(
+            image.dimensions() == (outer_rect.width, outer_rect.height),
+            "concrete window capture dimensions changed during capture"
+        );
+        Ok(CapturedWindowImage { outer_rect, image })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XcapWindowRegionCapture<G = Win32ClientGeometrySource, I = XcapConcreteWindowImageSource>
+{
+    window_id: u32,
+    geometry: G,
+    images: I,
+}
+
+impl XcapWindowRegionCapture<Win32ClientGeometrySource> {
+    pub const fn new(window_id: u32) -> Self {
+        Self {
+            window_id,
+            geometry: Win32ClientGeometrySource,
+            images: XcapConcreteWindowImageSource,
+        }
+    }
+}
+
+impl<G> XcapWindowRegionCapture<G> {
+    fn with_geometry(window_id: u32, geometry: G) -> Self {
+        Self {
+            window_id,
+            geometry,
+            images: XcapConcreteWindowImageSource,
+        }
+    }
+}
+
+impl<G, I> XcapWindowRegionCapture<G, I> {
+    #[cfg(test)]
+    fn with_sources(window_id: u32, geometry: G, images: I) -> Self {
+        Self {
+            window_id,
+            geometry,
+            images,
+        }
+    }
+}
+
+impl<G: WindowClientGeometrySource, I> XcapWindowRegionCapture<G, I> {
+    fn screen_rect(&self, local: Rect) -> Result<Rect> {
+        window_local_to_screen(self.geometry.client_rect(self.window_id)?, local)
+    }
+}
+
+impl<G: WindowClientGeometrySource, I: ConcreteWindowImageSource> CaptureSource
+    for XcapWindowRegionCapture<G, I>
+{
+    fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+        let requested = self.screen_rect(rect)?;
+        let captured = self.images.capture_window(self.window_id)?;
+        anyhow::ensure!(
+            captured.image.dimensions() == (captured.outer_rect.width, captured.outer_rect.height),
+            "concrete window capture dimensions do not match its outer frame"
+        );
+        let crop = screen_rect_relative_to(captured.outer_rect, requested)
+            .context("requested client region is outside the concrete window image")?;
+        Ok(ScreenImage::new(
+            imageops::crop_imm(
+                &captured.image,
+                crop.x as u32,
+                crop.y as u32,
+                crop.width,
+                crop.height,
+            )
+            .to_image(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowsXcapWindowSnapshotSource<S = Win32WindowsSnapshotSource> {
+    identity: CanonicalWindowIdentity,
+    snapshots: S,
+}
+
+impl WindowsXcapWindowSnapshotSource<Win32WindowsSnapshotSource> {
+    pub const fn new(window_id: u32) -> Self {
+        Self {
+            identity: CanonicalWindowIdentity::from_xcap_window_id(window_id),
+            snapshots: Win32WindowsSnapshotSource,
+        }
+    }
+}
+
+impl<S> WindowsXcapWindowSnapshotSource<S> {
+    #[cfg(test)]
+    fn with_snapshot_source_for_test(identity: CanonicalWindowIdentity, snapshots: S) -> Self {
+        Self {
+            identity,
+            snapshots,
+        }
+    }
+}
+
+impl<S: WindowsSnapshotSource> AtomicFrameSnapshotSource for WindowsXcapWindowSnapshotSource<S> {
+    fn snapshot(&self, requested_region: Rect) -> Result<AtomicCaptureSnapshot> {
+        let snapshot = self.snapshots.snapshot(self.identity)?;
+        let client_rect = snapshot.client_rect;
+        window_local_to_screen(client_rect, requested_region).with_context(|| {
+            format!(
+                "requested macro capture region is outside xcap window {}",
+                self.identity.window_id()
+            )
+        })?;
+        Ok(snapshot.atomic_capture_snapshot(requested_region))
+    }
+}
+
+pub type XcapAtomicWindowCapture =
+    AtomicFrameCapture<WindowsXcapWindowSnapshotSource, XcapWindowRegionCapture, SystemClock>;
+
+/// Builds the production image-detection capture path for one concrete xcap window identity.
+/// The returned source retains raw `capture` for OCR/Enchant and adds atomic `capture_frame`.
+pub fn xcap_atomic_window_capture(window_id: u32) -> XcapAtomicWindowCapture {
+    AtomicFrameCapture::new(
+        WindowsXcapWindowSnapshotSource::new(window_id),
+        XcapWindowRegionCapture::new(window_id),
+        SystemClock::default(),
+    )
+}
+
+/// A run-owned native Macro runtime. Its capture and target guard originate from one captured
+/// binding, while its emergency watcher is stopped before any bundle field is released.
+#[allow(dead_code)]
+pub(crate) struct WindowsMacroRuntimeBundle {
+    pub(crate) runtime: MacroRuntime,
+    pub(crate) control: RuntimeControlHandle,
+    escape_watcher: EscRuntimeEmergencyWatcher,
+}
+
+impl Drop for WindowsMacroRuntimeBundle {
+    fn drop(&mut self) {
+        self.escape_watcher.shutdown();
+    }
+}
+
+/// Builds the production live-runtime dependencies for an already captured target. The typed
+/// binding is intentionally the only native target input; raw HWND/xcap ids stay private here.
+#[allow(dead_code)]
+pub(crate) fn build_windows_macro_runtime(
+    binding: &CapturedTargetBinding,
+    saved_target: &TargetProfile,
+) -> Result<WindowsMacroRuntimeBundle> {
+    anyhow::ensure!(
+        saved_target_matches_captured_binding(saved_target, &binding.profile),
+        "saved macro target does not match the captured target binding"
+    );
+
+    let detector = windows_condition_detector_router(
+        Arc::new(TextDetector::default()),
+        Arc::new(ImageDetector::new()),
+    );
+    let input = Arc::new(WindowsInputSink::new().context("failed to initialize live input")?);
+    compose_windows_macro_runtime_bundle(
+        binding,
+        saved_target,
+        |window_id| Arc::new(xcap_atomic_window_capture(window_id)),
+        detector,
+        input,
+        Arc::new(SystemClock::default()),
+        Arc::new(EscStopSignal::default()),
+    )
+}
+
+fn saved_target_matches_captured_binding(
+    saved_target: &TargetProfile,
+    captured: &CapturedTargetProfile,
+) -> bool {
+    saved_target
+        .process_path
+        .eq_ignore_ascii_case(&captured.process_path)
+        && saved_target.window_class == captured.window_class
+        && captured.title.contains(&saved_target.title_contains)
+        && saved_target.captured_client_width == captured.client_rect.width
+        && saved_target.captured_client_height == captured.client_rect.height
+        && saved_target.captured_dpi == captured.dpi
+}
+
+fn binding_xcap_window_id(binding: &CapturedTargetBinding) -> Result<u32> {
+    u32::try_from(binding.expected.window_id)
+        .context("captured target binding has a non-canonical xcap window identity")
+}
+
+fn windows_condition_detector_router(
+    text: Arc<dyn ConditionDetector>,
+    image: Arc<dyn ConditionDetector>,
+) -> Arc<dyn ConditionDetector> {
+    Arc::new(ConditionDetectorRouter::new(text, image))
+}
+
+#[allow(dead_code)]
+fn compose_windows_macro_runtime(
+    capture: Arc<dyn CaptureSource + Send + Sync>,
+    guard: WindowsTargetGuard,
+    detector: Arc<dyn ConditionDetector>,
+    input: Arc<dyn LiveActionInput>,
+    clock: Arc<dyn Clock + Send + Sync>,
+) -> MacroRuntime {
+    MacroRuntime::new(capture, detector, clock).with_live_input(Arc::new(guard), input)
+}
+
+fn compose_windows_macro_runtime_bundle<S>(
+    binding: &CapturedTargetBinding,
+    saved_target: &TargetProfile,
+    capture_from_binding: impl FnOnce(u32) -> Arc<dyn CaptureSource + Send + Sync>,
+    detector: Arc<dyn ConditionDetector>,
+    input: Arc<dyn LiveActionInput>,
+    clock: Arc<dyn Clock + Send + Sync>,
+    escape: Arc<S>,
+) -> Result<WindowsMacroRuntimeBundle>
+where
+    S: EscapeStopSource,
+{
+    anyhow::ensure!(
+        saved_target_matches_captured_binding(saved_target, &binding.profile),
+        "saved macro target does not match the captured target binding"
+    );
+    let capture = capture_from_binding(binding_xcap_window_id(binding)?);
+    let runtime =
+        compose_windows_macro_runtime(capture, binding.guard.clone(), detector, input, clock);
+    let control = runtime.control_handle();
+    let escape_watcher = EscRuntimeEmergencyWatcher::spawn(escape, control.clone());
+    Ok(WindowsMacroRuntimeBundle {
+        runtime,
+        control,
+        escape_watcher,
+    })
+}
+
+trait EscapeStopSource: Send + Sync + 'static {
+    fn is_stop_requested(&self) -> bool;
+}
+
+impl EscapeStopSource for EscStopSignal {
+    fn is_stop_requested(&self) -> bool {
+        EscStopSignal::is_stop_requested(self)
+    }
+}
+
+#[derive(Debug)]
+struct EscRuntimeEmergencyWatcher {
+    shutdown: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl EscRuntimeEmergencyWatcher {
+    fn spawn<S>(escape: Arc<S>, control: RuntimeControlHandle) -> Self
+    where
+        S: EscapeStopSource,
+    {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let worker = thread::spawn(move || {
+            while !worker_shutdown.load(Ordering::SeqCst) {
+                if escape.is_stop_requested() {
+                    control.emergency_stop();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(8));
+            }
+            worker_finished.store(true, Ordering::SeqCst);
+        });
+        Self {
+            shutdown,
+            finished,
+            worker: Some(worker),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for EscRuntimeEmergencyWatcher {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn rect_contains(container: Rect, nested: Rect) -> bool {
+    let Some(container_right) = i64::from(container.x).checked_add(i64::from(container.width))
+    else {
+        return false;
+    };
+    let Some(container_bottom) = i64::from(container.y).checked_add(i64::from(container.height))
+    else {
+        return false;
+    };
+    let Some(nested_right) = i64::from(nested.x).checked_add(i64::from(nested.width)) else {
+        return false;
+    };
+    let Some(nested_bottom) = i64::from(nested.y).checked_add(i64::from(nested.height)) else {
+        return false;
+    };
+    i64::from(nested.x) >= i64::from(container.x)
+        && i64::from(nested.y) >= i64::from(container.y)
+        && nested_right <= container_right
+        && nested_bottom <= container_bottom
+}
+
+fn window_local_to_screen(window: Rect, local: Rect) -> Result<Rect> {
+    let local_bounds = Rect::new(0, 0, window.width, window.height);
+    anyhow::ensure!(
+        rect_contains(local_bounds, local),
+        "capture region is outside the concrete xcap window"
+    );
+    let x = i64::from(window.x)
+        .checked_add(i64::from(local.x))
+        .and_then(|value| i32::try_from(value).ok())
+        .context("window-local capture x coordinate overflowed")?;
+    let y = i64::from(window.y)
+        .checked_add(i64::from(local.y))
+        .and_then(|value| i32::try_from(value).ok())
+        .context("window-local capture y coordinate overflowed")?;
+    Ok(Rect::new(x, y, local.width, local.height))
+}
+
+fn screen_rect_relative_to(container: Rect, screen: Rect) -> Result<Rect> {
+    anyhow::ensure!(
+        rect_contains(container, screen),
+        "screen region is outside its container"
+    );
+    let x = i64::from(screen.x) - i64::from(container.x);
+    let y = i64::from(screen.y) - i64::from(container.y);
+    Ok(Rect::new(
+        i32::try_from(x).context("relative capture x overflowed")?,
+        i32::try_from(y).context("relative capture y overflowed")?,
+        screen.width,
+        screen.height,
+    ))
 }
 
 #[derive(Debug, Default, Clone)]
@@ -204,37 +694,32 @@ fn recognize_png_file(path: &std::path::Path) -> Result<String> {
 #[derive(Debug, Default, Clone)]
 pub struct SendInputController;
 
-impl InputController for SendInputController {
-    fn click(&self, point: Point) -> Result<()> {
-        click_at(point)
-    }
-
-    fn click_with_movement(
+impl InputSink for SendInputController {
+    fn move_and_click(
         &self,
         point: Point,
+        button: MouseButton,
         movement: Option<&MouseMovementProfile>,
-        stop: Option<&dyn StopSignal>,
+        stop: Option<&dyn StopSource>,
     ) -> Result<()> {
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return Ok(());
         }
         if let Some(profile) = movement.filter(|profile| profile.is_usable()) {
             move_cursor_with_profile(point, profile, stop)?;
         }
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return Ok(());
         }
-        click_at(point)
+        click_at(point, button)
     }
 }
 
-fn click_at(point: Point) -> Result<()> {
+fn click_at(point: Point, button: MouseButton) -> Result<()> {
     unsafe {
         SetCursorPos(point.x, point.y)?;
-        let inputs = [
-            mouse_input(MOUSEEVENTF_LEFTDOWN),
-            mouse_input(MOUSEEVENTF_LEFTUP),
-        ];
+        let (down, up) = mouse_button_flags(button);
+        let inputs = [mouse_input(down), mouse_input(up)];
         let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
         if sent != inputs.len() as u32 {
             return Err(anyhow!(
@@ -246,10 +731,22 @@ fn click_at(point: Point) -> Result<()> {
     Ok(())
 }
 
+fn mouse_button_flags(
+    button: MouseButton,
+) -> (
+    windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+    windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+) {
+    match button {
+        MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+    }
+}
+
 fn move_cursor_with_profile(
     target: Point,
     profile: &MouseMovementProfile,
-    stop: Option<&dyn StopSignal>,
+    stop: Option<&dyn StopSource>,
 ) -> Result<()> {
     let start = cursor_pos()?;
     let dx = (target.x - start.x) as f32;
@@ -309,7 +806,7 @@ fn move_cursor_with_profile(
             }
             last_ms = at_ms;
         }
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return Ok(());
         }
 
@@ -336,12 +833,12 @@ fn move_cursor_with_motion_model(
     normal: (f32, f32),
     profile: &MouseMovementProfile,
     model: MouseMovementModel,
-    stop: Option<&dyn StopSignal>,
+    stop: Option<&dyn StopSource>,
 ) -> Result<()> {
     let recorded_id = fitts_index(profile.distance_px, model.target_width_px).max(0.1);
     let target_id = fitts_index(distance, model.target_width_px).max(0.1);
-    let duration_ms = ((profile.duration_ms as f32 * target_id / recorded_id).round() as u64)
-        .clamp(70, 1_800);
+    let duration_ms =
+        ((profile.duration_ms as f32 * target_id / recorded_id).round() as u64).clamp(70, 1_800);
     let distance_scale = (distance / profile.distance_px.max(1.0)).sqrt();
     let point_count = ((model.point_count as f32 * distance_scale).round() as u32).clamp(10, 90);
     let curve = model.curve_lateral.clamp(-0.30, 0.30);
@@ -355,7 +852,7 @@ fn move_cursor_with_motion_model(
             return Ok(());
         }
         elapsed = next_elapsed;
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return Ok(());
         }
 
@@ -406,7 +903,7 @@ fn move_cursor_with_learned_steps(
     normal: (f32, f32),
     profile: &MouseMovementProfile,
     scaled_duration_ms: u64,
-    stop: Option<&dyn StopSignal>,
+    stop: Option<&dyn StopSource>,
 ) -> Result<()> {
     let total_delay_ms: u64 = profile
         .movement_steps
@@ -423,7 +920,7 @@ fn move_cursor_with_learned_steps(
         if sleep_until_or_stop(delay_ms, stop) {
             return Ok(());
         }
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return Ok(());
         }
 
@@ -444,17 +941,17 @@ fn move_cursor_with_learned_steps(
     Ok(())
 }
 
-fn sleep_until_or_stop(millis: u64, stop: Option<&dyn StopSignal>) -> bool {
+fn sleep_until_or_stop(millis: u64, stop: Option<&dyn StopSource>) -> bool {
     let mut remaining = millis;
     while remaining > 0 {
-        if stop.is_some_and(|stop| stop.should_stop()) {
+        if stop.is_some_and(|stop| stop.is_stopped()) {
             return true;
         }
         let chunk = remaining.min(8);
         thread::sleep(Duration::from_millis(chunk));
         remaining -= chunk;
     }
-    stop.is_some_and(|stop| stop.should_stop())
+    stop.is_some_and(|stop| stop.is_stopped())
 }
 
 fn mouse_input(flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS) -> INPUT {
@@ -500,8 +997,8 @@ impl Default for EscStopSignal {
     }
 }
 
-impl StopSignal for EscStopSignal {
-    fn should_stop(&self) -> bool {
+impl StopSource for EscStopSignal {
+    fn is_stopped(&self) -> bool {
         self.is_stop_requested()
     }
 }
@@ -569,6 +1066,224 @@ impl OverlayState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CaptureRequestId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacroCaptureKind {
+    TextRegion,
+    ImageSearchRegion,
+    ClickRegion,
+    ClickPoint,
+    TemplateCrop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacroCaptureRequest {
+    pub id: CaptureRequestId,
+    pub kind: MacroCaptureKind,
+    pub target_client: Rect,
+    pub min_size: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MacroCaptureSelection {
+    Region(crate::engine::types::RectRatio),
+    Point(crate::engine::types::PointRatio),
+    TemplateCrop {
+        region: crate::engine::types::RectRatio,
+        screen_rect: Rect,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MacroCaptureResponse {
+    pub id: CaptureRequestId,
+    pub kind: MacroCaptureKind,
+    pub selection: MacroCaptureSelection,
+}
+
+pub fn select_macro_capture(request: MacroCaptureRequest) -> Result<MacroCaptureResponse> {
+    let rect = select_screen_rect_overlay(request.min_size)?;
+    normalize_macro_capture(request, rect)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedTargetProfile {
+    pub process_path: String,
+    pub window_class: String,
+    pub title: String,
+    pub client_rect: Rect,
+    pub dpi: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CapturedTargetBinding {
+    profile: CapturedTargetProfile,
+    expected: TargetSnapshot,
+    guard: WindowsTargetGuard,
+    activator: Arc<dyn TargetActivator>,
+}
+
+trait TargetActivator: std::fmt::Debug + Send + Sync {
+    fn activate(&self, window_id: u64) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Win32TargetActivator;
+
+impl TargetActivator for Win32TargetActivator {
+    fn activate(&self, window_id: u64) -> Result<()> {
+        let identity = CanonicalWindowIdentity::from_window_id(window_id)?;
+        anyhow::ensure!(
+            unsafe { SetForegroundWindow(identity.hwnd()) }.as_bool(),
+            "failed to bring the selected target window to the foreground"
+        );
+        Ok(())
+    }
+}
+
+impl CapturedTargetBinding {
+    pub fn profile(&self) -> &CapturedTargetProfile {
+        &self.profile
+    }
+
+    /// Brings the selected target forward, then revalidates its concrete HWND,
+    /// process instance and capture geometry. Only absolute movement is refreshed.
+    pub fn prepare_client_rect(&self) -> Result<Rect> {
+        self.activator.activate(self.expected.window_id)?;
+        Ok(self
+            .guard
+            .refresh_authoring_snapshot(&self.expected)?
+            .client_rect)
+    }
+
+    /// Post-capture validation is deliberately observation-only. In particular,
+    /// it must not restore focus after an overlay or another application steals it.
+    pub fn validate_client_rect(&self) -> Result<Rect> {
+        Ok(self
+            .guard
+            .refresh_authoring_snapshot(&self.expected)?
+            .client_rect)
+    }
+
+    /// Captures pixels from the concrete HWND image, never from the monitor compositor.
+    /// The caller owns the prepare/capture/observation-only validation bracket.
+    pub fn capture_screen_region(
+        &self,
+        client_rect: Rect,
+        screen_rect: Rect,
+    ) -> Result<ScreenImage> {
+        let local = screen_rect_relative_to(client_rect, screen_rect)
+            .context("authoring capture left the selected target client")?;
+        XcapWindowRegionCapture::new(self.expected.window_id as u32).capture(local)
+    }
+}
+
+pub fn resolve_target_from_selection(selection: Rect) -> Result<CapturedTargetBinding> {
+    let center = POINT {
+        x: selection.x + i32::try_from(selection.width / 2).unwrap_or(i32::MAX),
+        y: selection.y + i32::try_from(selection.height / 2).unwrap_or(i32::MAX),
+    };
+    let child = unsafe { WindowFromPoint(center) };
+    anyhow::ensure!(
+        !child.is_invalid(),
+        "no window exists under the selected target"
+    );
+    let root = unsafe { GetAncestor(child, GA_ROOT) };
+    anyhow::ensure!(
+        !root.is_invalid(),
+        "failed to resolve the selected top-level window"
+    );
+    anyhow::ensure!(
+        unsafe { SetForegroundWindow(root) }.as_bool(),
+        "failed to bring the selected target window to the foreground"
+    );
+    let identity = CanonicalWindowIdentity::from_raw_hwnd(root.0 as isize)?;
+    let snapshot = Win32WindowsSnapshotSource.snapshot(identity)?;
+    let window_class = window_class(identity)?;
+    let title = window_title(identity)?;
+    let profile = CapturedTargetProfile {
+        process_path: snapshot.process_path.clone(),
+        window_class: window_class.clone(),
+        title: title.clone(),
+        client_rect: snapshot.client_rect,
+        dpi: snapshot.dpi,
+    };
+    let guard = WindowsTargetGuard::from_window_id(
+        identity.window_id(),
+        DurableTargetHints {
+            process_path: snapshot.process_path.clone(),
+            window_class,
+            title_contains: title,
+        },
+    )?;
+    let expected = guard.snapshot()?;
+    guard.refresh_authoring_snapshot(&expected)?;
+    Ok(CapturedTargetBinding {
+        profile,
+        expected,
+        guard,
+        activator: Arc::new(Win32TargetActivator),
+    })
+}
+
+fn normalize_macro_capture(
+    request: MacroCaptureRequest,
+    selected: Rect,
+) -> Result<MacroCaptureResponse> {
+    if request.target_client.width == 0 || request.target_client.height == 0 {
+        return Err(anyhow!("target client geometry is empty"));
+    }
+    if selected.width < request.min_size || selected.height < request.min_size {
+        return Err(anyhow!(
+            "selected region is too small: {}x{}",
+            selected.width,
+            selected.height
+        ));
+    }
+    let target_right = i64::from(request.target_client.x) + i64::from(request.target_client.width);
+    let target_bottom =
+        i64::from(request.target_client.y) + i64::from(request.target_client.height);
+    let selected_right = i64::from(selected.x) + i64::from(selected.width);
+    let selected_bottom = i64::from(selected.y) + i64::from(selected.height);
+    if selected.x < request.target_client.x
+        || selected.y < request.target_client.y
+        || selected_right > target_right
+        || selected_bottom > target_bottom
+    {
+        return Err(anyhow!("selection must stay inside the target client area"));
+    }
+
+    let region =
+        crate::engine::types::RectRatio::from_rect_relative(request.target_client, selected);
+    let selection = match request.kind {
+        MacroCaptureKind::TextRegion
+        | MacroCaptureKind::ImageSearchRegion
+        | MacroCaptureKind::ClickRegion => MacroCaptureSelection::Region(region),
+        MacroCaptureKind::ClickPoint => {
+            let center_x = i64::from(selected.x) + i64::from(selected.width) / 2;
+            let center_y = i64::from(selected.y) + i64::from(selected.height) / 2;
+            MacroCaptureSelection::Point(crate::engine::types::PointRatio {
+                x: (center_x - i64::from(request.target_client.x)) as f32
+                    / request.target_client.width as f32,
+                y: (center_y - i64::from(request.target_client.y)) as f32
+                    / request.target_client.height as f32,
+            })
+        }
+        MacroCaptureKind::TemplateCrop => MacroCaptureSelection::TemplateCrop {
+            region,
+            screen_rect: selected,
+        },
+    };
+    Ok(MacroCaptureResponse {
+        id: request.id,
+        kind: request.kind,
+        selection,
+    })
+}
+
+/// Compatibility adapter used by the existing Enchant calibration flow.
 pub fn select_screen_rect(min_size: u32) -> Result<Rect> {
     select_screen_rect_overlay(min_size)
 }
@@ -605,7 +1320,7 @@ fn select_screen_rect_overlay(min_size: u32) -> Result<Rect> {
         ));
         let state_ptr = state.as_mut() as *mut OverlayState;
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+            region_overlay_extended_style(),
             class_name,
             w!("Select Region"),
             WS_POPUP,
@@ -622,8 +1337,7 @@ fn select_screen_rect_overlay(min_size: u32) -> Result<Rect> {
 
         SetLayeredWindowAttributes(hwnd, COLORREF(0), 86, LWA_ALPHA)
             .context("failed to configure translucent region overlay")?;
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
+        let _ = ShowWindow(hwnd, region_overlay_show_command());
 
         let mut msg = MSG::default();
         while state.result.is_none() {
@@ -651,6 +1365,14 @@ fn select_screen_rect_overlay(min_size: u32) -> Result<Rect> {
             None => Err(anyhow!("screen selection cancelled")),
         }
     }
+}
+
+fn region_overlay_extended_style() -> WINDOW_EX_STYLE {
+    WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+}
+
+fn region_overlay_show_command() -> windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD {
+    SW_SHOWNOACTIVATE
 }
 
 unsafe extern "system" fn region_overlay_proc(
@@ -870,7 +1592,9 @@ fn analyze_mouse_movement(samples: Vec<TimedPoint>) -> Result<MouseMovementProfi
     let dy = (end.y - start.y) as f32;
     let distance = (dx * dx + dy * dy).sqrt();
     if distance < 8.0 {
-        return Err(anyhow!("recorded mouse movement must move at least 8 pixels"));
+        return Err(anyhow!(
+            "recorded mouse movement must move at least 8 pixels"
+        ));
     }
 
     let duration_ms = samples.last().unwrap().at_ms.max(1);
@@ -1081,4 +1805,836 @@ fn cursor_pos() -> Result<Point> {
         GetCursorPos(&mut point)?;
     }
     Ok(Point::new(point.x, point.y))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc::{SyncSender, sync_channel},
+        },
+        time::Duration,
+    };
+
+    use image::RgbaImage;
+    use sha2::{Digest, Sha256};
+
+    use crate::engine::{
+        automation::{AtomicFrameCapture, Clock, TargetGuard},
+        macro_engine::*,
+        types::ScreenImage,
+    };
+
+    use super::super::windows_snapshot::{
+        CanonicalWindowIdentity, CanonicalWindowsSnapshot, DisplayProfileInputs,
+        WindowsSnapshotSource,
+    };
+    use super::*;
+
+    #[test]
+    fn preferred_size_is_clamped_inside_work_area() {
+        let placement = clamp_window_placement([900.0, 1080.0], [0.0, 0.0, 1920.0, 1040.0], 1.0);
+        assert_eq!(placement.inner_size, [900.0, 992.0]);
+        assert!(placement.outer_position[1] >= 0.0);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FakeClientGeometry {
+        client_rect: Rect,
+    }
+
+    impl WindowClientGeometrySource for FakeClientGeometry {
+        fn client_rect(&self, _window_id: u32) -> Result<Rect> {
+            Ok(self.client_rect)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeWindowsSnapshot(CanonicalWindowsSnapshot);
+
+    impl WindowsSnapshotSource for FakeWindowsSnapshot {
+        fn snapshot(&self, identity: CanonicalWindowIdentity) -> Result<CanonicalWindowsSnapshot> {
+            anyhow::ensure!(
+                identity == self.0.identity,
+                "wrong canonical window identity"
+            );
+            Ok(self.0.clone())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FakeRawCapture;
+
+    impl CaptureSource for FakeRawCapture {
+        fn capture(&self, rect: Rect) -> Result<ScreenImage> {
+            Ok(ScreenImage::new(RgbaImage::new(rect.width, rect.height)))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FixedClock;
+
+    impl Clock for FixedClock {
+        fn now_ms(&self) -> u64 {
+            123
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordingActivator(Arc<AtomicUsize>);
+
+    impl TargetActivator for RecordingActivator {
+        fn activate(&self, _window_id: u64) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn authoring_binding(
+        expected_snapshot: CanonicalWindowsSnapshot,
+        current_snapshot: CanonicalWindowsSnapshot,
+        activations: Arc<AtomicUsize>,
+    ) -> CapturedTargetBinding {
+        let expected = expected_snapshot.target_snapshot();
+        let profile = CapturedTargetProfile {
+            process_path: expected_snapshot.process_path.clone(),
+            window_class: String::new(),
+            title: String::new(),
+            client_rect: expected_snapshot.client_rect,
+            dpi: expected_snapshot.dpi,
+        };
+        let guard = WindowsTargetGuard::with_snapshot_source_for_test(
+            expected_snapshot.identity,
+            DurableTargetHints {
+                process_path: expected_snapshot.process_path.clone(),
+                window_class: String::new(),
+                title_contains: String::new(),
+            },
+            FakeWindowsSnapshot(current_snapshot),
+        );
+        CapturedTargetBinding {
+            profile,
+            expected,
+            guard,
+            activator: Arc::new(RecordingActivator(activations)),
+        }
+    }
+
+    fn actionable_authoring_snapshot() -> CanonicalWindowsSnapshot {
+        CanonicalWindowsSnapshot {
+            identity: CanonicalWindowIdentity::from_xcap_window_id(42),
+            process_id: 7,
+            process_started_at_100ns: 100,
+            process_path: r#"C:\games\Diablo IV.exe"#.to_string(),
+            client_rect: Rect::new(100, 200, 800, 600),
+            dpi: 144,
+            display: DisplayProfileInputs {
+                display_id: 11,
+                monitor_rect: Rect::new(0, 0, 1_920, 1_080),
+                work_rect: Rect::new(0, 0, 1_920, 1_040),
+                flags: 1,
+            },
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
+        }
+    }
+
+    fn saved_target_for(profile: &CapturedTargetProfile) -> TargetProfile {
+        TargetProfile {
+            process_path: profile.process_path.clone(),
+            window_class: profile.window_class.clone(),
+            title_contains: profile.title.clone(),
+            captured_client_width: profile.client_rect.width,
+            captured_client_height: profile.client_rect.height,
+            captured_dpi: profile.dpi,
+        }
+    }
+
+    fn saved_revision(target: TargetProfile, blocks: Vec<Block>) -> SavedRevision {
+        let definition = MacroDefinition {
+            schema_version: MACRO_SCHEMA_VERSION,
+            id: "factory".to_string(),
+            name: "factory".to_string(),
+            revision: 1,
+            target,
+            regions: vec![],
+            points: vec![],
+            text_rules: vec![],
+            image_rules: vec![],
+            blocks,
+            safety: SafetyPolicy {
+                max_runtime_ms: Limit::Finite(5_000),
+                max_clicks: Limit::Finite(1),
+                max_observation_retries: Limit::Finite(1),
+                max_observations_per_second: 1,
+                minimum_click_interval_ms: 1,
+                focus_loss: FocusLossPolicy::Stop,
+            },
+        };
+        let bytes = serde_json::to_vec_pretty(&definition).unwrap();
+        SavedRevision {
+            definition,
+            definition_hash: format!("{:x}", Sha256::digest(bytes)),
+            pinned_assets: vec![],
+        }
+    }
+
+    #[test]
+    fn factory_rejects_saved_target_that_does_not_match_captured_binding() {
+        let profile = CapturedTargetProfile {
+            process_path: r"C:\\Games\\Diablo IV.exe".to_string(),
+            window_class: "D3DWindowClass".to_string(),
+            title: "Diablo IV - Sanctuary".to_string(),
+            client_rect: Rect::new(100, 200, 800, 600),
+            dpi: 144,
+        };
+        let saved = saved_target_for(&profile);
+
+        assert!(saved_target_matches_captured_binding(&saved, &profile));
+
+        let mut wrong_process = saved.clone();
+        wrong_process.process_path = "C:\\Games\\Other.exe".to_string();
+        assert!(!saved_target_matches_captured_binding(
+            &wrong_process,
+            &profile
+        ));
+
+        let mut wrong_class = saved.clone();
+        wrong_class.window_class = "OtherWindowClass".to_string();
+        assert!(!saved_target_matches_captured_binding(
+            &wrong_class,
+            &profile
+        ));
+
+        let mut wrong_title = saved.clone();
+        wrong_title.title_contains = "Helltide".to_string();
+        assert!(!saved_target_matches_captured_binding(
+            &wrong_title,
+            &profile
+        ));
+
+        let mut wrong_width = saved.clone();
+        wrong_width.captured_client_width += 1;
+        assert!(!saved_target_matches_captured_binding(
+            &wrong_width,
+            &profile
+        ));
+
+        let mut wrong_height = saved.clone();
+        wrong_height.captured_client_height += 1;
+        assert!(!saved_target_matches_captured_binding(
+            &wrong_height,
+            &profile
+        ));
+
+        let mut wrong_dpi = saved;
+        wrong_dpi.captured_dpi += 1;
+        assert!(!saved_target_matches_captured_binding(&wrong_dpi, &profile));
+    }
+
+    #[test]
+    fn factory_keeps_high_bit_capture_identity_aligned_with_binding_guard() {
+        let high_bit_window_id = 0x8000_0001;
+        let mut snapshot = actionable_authoring_snapshot();
+        snapshot.identity = CanonicalWindowIdentity::from_xcap_window_id(high_bit_window_id);
+        let binding = authoring_binding(snapshot.clone(), snapshot, Arc::new(AtomicUsize::new(0)));
+        let saved_target = saved_target_for(binding.profile());
+        let captured_window_id = Arc::new(AtomicUsize::new(0));
+        let bundle = compose_windows_macro_runtime_bundle(
+            &binding,
+            &saved_target,
+            {
+                let captured_window_id = Arc::clone(&captured_window_id);
+                move |window_id| {
+                    captured_window_id.store(window_id as usize, Ordering::SeqCst);
+                    Arc::new(FakeRawCapture) as Arc<dyn CaptureSource + Send + Sync>
+                }
+            },
+            Arc::new(UnavailableDetector),
+            Arc::new(TestLiveInput::default()),
+            Arc::new(SystemClock::default()),
+            Arc::new(TestEscapeStop::default()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            captured_window_id.load(Ordering::SeqCst),
+            high_bit_window_id as usize
+        );
+        assert_eq!(
+            binding.guard.snapshot().unwrap().window_id,
+            u64::from(high_bit_window_id)
+        );
+        assert!(matches!(
+            bundle
+                .runtime
+                .run(
+                    saved_revision(
+                        saved_target,
+                        vec![Block {
+                            id: "comment".to_string(),
+                            enabled: true,
+                            kind: BlockKind::Comment {
+                                text: "guard must authorize this live run".to_string(),
+                            },
+                        }],
+                    ),
+                    RunMode::Live,
+                )
+                .unwrap()
+                .last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::Completed,
+                ..
+            })
+        ));
+    }
+
+    #[derive(Default)]
+    struct TaggedDetector {
+        observed: Arc<Mutex<Vec<&'static str>>>,
+        tag: &'static str,
+    }
+
+    impl TaggedDetector {
+        fn new(tag: &'static str) -> Self {
+            Self {
+                observed: Arc::new(Mutex::new(Vec::new())),
+                tag,
+            }
+        }
+    }
+
+    impl ConditionDetector for TaggedDetector {
+        fn observe(
+            &self,
+            _request: &ObservationRequest<'_>,
+            _capture: &(dyn CaptureSource + Send + Sync),
+        ) -> Result<DetectorEvidence> {
+            self.observed.lock().unwrap().push(self.tag);
+            Ok(DetectorEvidence::unmatched(1, 1))
+        }
+    }
+
+    fn compiled_router_fixture() -> CompiledMacro {
+        let definition = MacroDefinition {
+            schema_version: MACRO_SCHEMA_VERSION,
+            id: "router".to_string(),
+            name: "router".to_string(),
+            revision: 1,
+            target: TargetProfile {
+                process_path: "game.exe".to_string(),
+                window_class: "game".to_string(),
+                title_contains: "Diablo".to_string(),
+                captured_client_width: 64,
+                captured_client_height: 48,
+                captured_dpi: 96,
+            },
+            regions: vec![],
+            points: vec![],
+            text_rules: vec![],
+            image_rules: vec![],
+            blocks: vec![Block {
+                id: "comment".to_string(),
+                enabled: true,
+                kind: BlockKind::Comment {
+                    text: "router fixture".to_string(),
+                },
+            }],
+            safety: SafetyPolicy {
+                max_runtime_ms: Limit::Finite(1_000),
+                max_clicks: Limit::Finite(1),
+                max_observation_retries: Limit::Finite(1),
+                max_observations_per_second: 1,
+                minimum_click_interval_ms: 1,
+                focus_loss: FocusLossPolicy::Stop,
+            },
+        };
+        let bytes = serde_json::to_vec_pretty(&definition).unwrap();
+        CompiledMacro::compile(SavedRevision {
+            definition,
+            definition_hash: format!("{:x}", Sha256::digest(bytes)),
+            pinned_assets: vec![],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn factory_routes_text_and_image_conditions_to_distinct_engines() {
+        let text = Arc::new(TaggedDetector::new("text"));
+        let image = Arc::new(TaggedDetector::new("image"));
+        let router = windows_condition_detector_router(text.clone(), image.clone());
+        let compiled = compiled_router_fixture();
+        let capture = FakeRawCapture;
+        let text_condition = Condition::Text {
+            source_block_id: "text".to_string(),
+            rule_id: "text".to_string(),
+            mode: ObserveMode::CheckNow,
+        };
+        let image_condition = Condition::Image {
+            source_block_id: "image".to_string(),
+            rule_id: "image".to_string(),
+            mode: ObserveMode::CheckNow,
+        };
+
+        for condition in [&text_condition, &image_condition] {
+            router
+                .observe(
+                    &ObservationRequest {
+                        run_id: "router",
+                        generation: 1,
+                        side_effect_epoch: 0,
+                        condition,
+                        compiled: &compiled,
+                        observed_at_ms: 1,
+                    },
+                    &capture,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(*text.observed.lock().unwrap(), vec!["text"]);
+        assert_eq!(*image.observed.lock().unwrap(), vec!["image"]);
+    }
+
+    #[derive(Debug, Default)]
+    struct TestEscapeStop(AtomicBool);
+
+    impl EscapeStopSource for TestEscapeStop {
+        fn is_stop_requested(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestLiveInput {
+        resumed: Option<SyncSender<()>>,
+        watcher_finished: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+        dropped_after_watcher: Arc<AtomicBool>,
+    }
+
+    impl Drop for TestLiveInput {
+        fn drop(&mut self) {
+            let watcher_finished = self
+                .watcher_finished
+                .lock()
+                .expect("factory watcher state poisoned")
+                .as_ref()
+                .is_some_and(|finished| finished.load(Ordering::SeqCst));
+            self.dropped_after_watcher
+                .store(watcher_finished, Ordering::SeqCst);
+        }
+    }
+
+    impl LiveActionInput for TestLiveInput {
+        fn reset_manual_baseline(&self) -> Result<()> {
+            if let Some(resumed) = &self.resumed {
+                let _ = resumed.send(());
+            }
+            Ok(())
+        }
+
+        fn manual_takeover_detected(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn dispatch_action(
+            &self,
+            _point: Point,
+            _button: MouseButton,
+            _movement: Option<&MouseMovementProfile>,
+            _stop: &dyn StopSource,
+            _input_gate: &dyn LiveInputGate,
+            _commit: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+            _validate_after_movement: &mut dyn FnMut() -> std::result::Result<(), BlockReason>,
+        ) -> InputDispatchOutcome {
+            unreachable!("factory test runtime contains no actions")
+        }
+    }
+
+    #[test]
+    fn factory_escape_signal_stops_an_active_live_run_with_emergency_reason() {
+        let snapshot = actionable_authoring_snapshot();
+        let binding = authoring_binding(snapshot.clone(), snapshot, Arc::new(AtomicUsize::new(0)));
+        let saved_target = saved_target_for(binding.profile());
+        let (resumed, wait_for_resume) = sync_channel(1);
+        let escape = Arc::new(TestEscapeStop::default());
+        let mut input = TestLiveInput::default();
+        input.resumed = Some(resumed);
+        let bundle = compose_windows_macro_runtime_bundle(
+            &binding,
+            &saved_target,
+            |_| Arc::new(FakeRawCapture) as Arc<dyn CaptureSource + Send + Sync>,
+            Arc::new(UnavailableDetector),
+            Arc::new(input),
+            Arc::new(SystemClock::default()),
+            Arc::clone(&escape),
+        )
+        .unwrap();
+        let runtime = bundle.runtime.clone();
+        let saved = saved_revision(
+            saved_target,
+            vec![Block {
+                id: "wait".to_string(),
+                enabled: true,
+                kind: BlockKind::Wait { duration_ms: 4_000 },
+            }],
+        );
+        let run = thread::spawn(move || runtime.run(saved, RunMode::Live).unwrap());
+
+        wait_for_resume
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        escape.0.store(true, Ordering::SeqCst);
+        let events = run.join().unwrap();
+
+        assert!(bundle.control.is_stopped());
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::RunStopped {
+                reason: StopReason::EmergencyStopped,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn factory_bundle_drop_joins_nontriggered_escape_watcher_before_input_releases() {
+        let snapshot = actionable_authoring_snapshot();
+        let binding = authoring_binding(snapshot.clone(), snapshot, Arc::new(AtomicUsize::new(0)));
+        let saved_target = saved_target_for(binding.profile());
+        let watcher_finished = Arc::new(Mutex::new(None));
+        let input_dropped_after_watcher = Arc::new(AtomicBool::new(false));
+        let input = Arc::new(TestLiveInput {
+            resumed: None,
+            watcher_finished: Arc::clone(&watcher_finished),
+            dropped_after_watcher: Arc::clone(&input_dropped_after_watcher),
+        });
+        let bundle = compose_windows_macro_runtime_bundle(
+            &binding,
+            &saved_target,
+            |_| Arc::new(FakeRawCapture) as Arc<dyn CaptureSource + Send + Sync>,
+            Arc::new(UnavailableDetector),
+            input,
+            Arc::new(SystemClock::default()),
+            Arc::new(TestEscapeStop::default()),
+        )
+        .unwrap();
+        *watcher_finished
+            .lock()
+            .expect("factory watcher state poisoned") =
+            Some(Arc::clone(&bundle.escape_watcher.finished));
+        drop(bundle);
+
+        assert!(input_dropped_after_watcher.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn authoring_post_validation_never_activates_and_rejects_lost_focus() {
+        let activations = Arc::new(AtomicUsize::new(0));
+        let expected = actionable_authoring_snapshot();
+        let binding =
+            authoring_binding(expected.clone(), expected.clone(), Arc::clone(&activations));
+
+        assert_eq!(
+            binding.validate_client_rect().unwrap(),
+            Rect::new(100, 200, 800, 600)
+        );
+        assert_eq!(activations.load(Ordering::SeqCst), 0);
+        binding.prepare_client_rect().unwrap();
+        assert_eq!(activations.load(Ordering::SeqCst), 1);
+
+        let mut unfocused = expected.clone();
+        unfocused.is_foreground = false;
+        let unfocused = authoring_binding(expected, unfocused, Arc::clone(&activations));
+        assert!(unfocused.validate_client_rect().is_err());
+        assert_eq!(
+            activations.load(Ordering::SeqCst),
+            1,
+            "post validation must not restore stolen focus"
+        );
+    }
+
+    #[test]
+    fn nonactivating_overlay_lifecycle_preserves_a_valid_target() {
+        let activations = Arc::new(AtomicUsize::new(0));
+        let snapshot = actionable_authoring_snapshot();
+        let binding = authoring_binding(snapshot.clone(), snapshot, Arc::clone(&activations));
+
+        assert!(region_overlay_extended_style().contains(WS_EX_NOACTIVATE));
+        assert_eq!(
+            binding.prepare_client_rect().unwrap(),
+            Rect::new(100, 200, 800, 600)
+        );
+        assert_eq!(
+            binding.validate_client_rect().unwrap(),
+            Rect::new(100, 200, 800, 600)
+        );
+        assert_eq!(
+            activations.load(Ordering::SeqCst),
+            1,
+            "the observation-only post-overlay check must not reactivate the target"
+        );
+    }
+
+    #[test]
+    fn authoring_overlay_is_topmost_but_never_activates() {
+        let style = region_overlay_extended_style();
+
+        assert!(style.contains(WS_EX_TOPMOST));
+        assert!(style.contains(WS_EX_NOACTIVATE));
+        assert_eq!(region_overlay_show_command(), SW_SHOWNOACTIVATE);
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeConcreteWindowImage {
+        outer_rect: Rect,
+        image: RgbaImage,
+    }
+
+    impl ConcreteWindowImageSource for FakeConcreteWindowImage {
+        fn capture_window(&self, _window_id: u32) -> Result<CapturedWindowImage> {
+            Ok(CapturedWindowImage {
+                outer_rect: self.outer_rect,
+                image: self.image.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn concrete_window_capture_crops_the_window_frame_not_monitor_pixels() {
+        let outer_rect = Rect::new(90, 180, 120, 100);
+        let client = FakeClientGeometry {
+            client_rect: Rect::new(100, 200, 100, 70),
+        };
+        let image = RgbaImage::from_fn(120, 100, |x, y| image::Rgba([x as u8, y as u8, 77, 255]));
+        let capture = XcapWindowRegionCapture::with_sources(
+            42,
+            client,
+            FakeConcreteWindowImage { outer_rect, image },
+        );
+
+        let captured = capture.capture(Rect::new(5, 6, 10, 8)).unwrap();
+
+        assert_eq!(captured.rgba.dimensions(), (10, 8));
+        assert_eq!(captured.rgba.get_pixel(0, 0).0, [15, 26, 77, 255]);
+        assert_eq!(captured.rgba.get_pixel(9, 7).0, [24, 33, 77, 255]);
+    }
+
+    #[test]
+    fn concrete_window_capture_build_enables_windows_graphics_capture() {
+        let manifest = include_str!("../../../Cargo.toml");
+
+        assert!(
+            manifest.contains(r#"xcap = { version = "0.9.4", features = ["wgc"] }"#),
+            "xcap Window::capture_image must use WGC rather than the GDI fallback"
+        );
+    }
+
+    #[test]
+    fn guard_and_atomic_capture_share_the_canonical_high_bit_window_snapshot() {
+        let identity = CanonicalWindowIdentity::from_xcap_window_id(0x8000_0001);
+        let source = FakeWindowsSnapshot(CanonicalWindowsSnapshot {
+            identity,
+            process_id: 7,
+            process_started_at_100ns: 100,
+            process_path: r#"C:\games\Diablo IV.exe"#.to_string(),
+            client_rect: Rect::new(1_208, -269, 1_008, 729),
+            dpi: 144,
+            display: DisplayProfileInputs {
+                display_id: 11,
+                monitor_rect: Rect::new(0, -1_080, 1_920, 1_080),
+                work_rect: Rect::new(0, -1_080, 1_920, 1_040),
+                flags: 1,
+            },
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
+        });
+        let guard = WindowsTargetGuard::with_snapshot_source_for_test(
+            identity,
+            DurableTargetHints {
+                process_path: String::new(),
+                window_class: String::new(),
+                title_contains: String::new(),
+            },
+            source.clone(),
+        );
+        let snapshots =
+            WindowsXcapWindowSnapshotSource::with_snapshot_source_for_test(identity, source);
+        let capture = AtomicFrameCapture::new(snapshots, FakeRawCapture, FixedClock);
+
+        let target = guard.snapshot().unwrap();
+        let frame = capture.capture_frame(Rect::new(25, 40, 100, 80)).unwrap();
+
+        assert_eq!(identity.hwnd().0 as isize, i32::MIN as isize + 1);
+        assert_eq!(frame.metadata.window_id, target.window_id);
+        assert_eq!(frame.metadata.window_revision, target.window_revision);
+        assert_eq!(frame.metadata.client_width, target.client_rect.width);
+        assert_eq!(frame.metadata.client_height, target.client_rect.height);
+        assert_eq!(frame.metadata.geometry_revision, target.geometry_revision);
+        assert_eq!(
+            frame.metadata.display_profile_revision,
+            target.display_profile_revision
+        );
+        assert_eq!(frame.metadata.dpi, target.dpi);
+    }
+
+    #[test]
+    fn right_click_selects_right_button_flags() {
+        assert_eq!(
+            mouse_button_flags(MouseButton::Right),
+            (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
+        );
+    }
+
+    #[test]
+    fn production_atomic_capture_constructor_is_available_for_macro_runtime_wiring() {
+        let _capture = xcap_atomic_window_capture(42);
+    }
+
+    #[test]
+    fn concrete_window_capture_translates_local_region_to_screen_coordinates() {
+        let window = Rect::new(1_200, -300, 800, 600);
+
+        assert_eq!(
+            window_local_to_screen(window, Rect::new(25, 40, 100, 80)).unwrap(),
+            Rect::new(1_225, -260, 100, 80)
+        );
+        assert!(window_local_to_screen(window, Rect::new(750, 40, 100, 80)).is_err());
+    }
+
+    #[test]
+    fn framed_window_translation_uses_client_origin_and_bounds_not_xcap_outer_frame() {
+        let xcap_outer_frame = Rect::new(1_200, -300, 1_024, 768);
+        let client = FakeClientGeometry {
+            // Eight-pixel side frame plus a 31-pixel title bar.
+            client_rect: Rect::new(1_208, -269, 1_008, 729),
+        };
+        let local = Rect::new(25, 40, 100, 80);
+        let capture = XcapWindowRegionCapture::with_geometry(42, client);
+
+        let translated = capture.screen_rect(local).unwrap();
+
+        assert_eq!(translated, Rect::new(1_233, -229, 100, 80));
+        assert_ne!(
+            translated,
+            window_local_to_screen(xcap_outer_frame, local).unwrap()
+        );
+        assert!(capture.screen_rect(Rect::new(950, 700, 100, 80)).is_err());
+    }
+
+    #[test]
+    fn xcap_window_id_reconstruction_sign_extends_windows_user_handles() {
+        assert_eq!(
+            CanonicalWindowIdentity::from_xcap_window_id(42).hwnd().0 as isize,
+            42
+        );
+        assert_eq!(
+            CanonicalWindowIdentity::from_xcap_window_id(0x8000_0001)
+                .hwnd()
+                .0 as isize,
+            i32::MIN as isize + 1
+        );
+    }
+
+    #[test]
+    fn window_revision_changes_when_same_hwnd_and_pid_belong_to_restarted_process() {
+        let identity = CanonicalWindowIdentity::from_xcap_window_id(42);
+        let before = FakeWindowsSnapshot(CanonicalWindowsSnapshot {
+            identity,
+            process_id: 7,
+            process_started_at_100ns: 100,
+            process_path: String::new(),
+            client_rect: Rect::new(0, 0, 800, 600),
+            dpi: 96,
+            display: DisplayProfileInputs {
+                display_id: 11,
+                monitor_rect: Rect::new(0, 0, 1_920, 1_080),
+                work_rect: Rect::new(0, 0, 1_920, 1_040),
+                flags: 1,
+            },
+            is_visible: true,
+            is_minimized: false,
+            is_foreground: true,
+        })
+        .0;
+        let mut after = before.clone();
+        after.process_started_at_100ns = 101;
+
+        assert_ne!(before.window_revision(), after.window_revision());
+    }
+
+    #[test]
+    fn macro_capture_normalizes_virtual_screen_rect_to_target_client() {
+        let request = MacroCaptureRequest {
+            id: CaptureRequestId(9),
+            kind: MacroCaptureKind::TextRegion,
+            target_client: Rect::new(-1_600, 120, 1_280, 720),
+            min_size: 10,
+        };
+
+        let response = normalize_macro_capture(request, Rect::new(-1_320, 390, 420, 86)).unwrap();
+
+        assert_eq!(response.id, CaptureRequestId(9));
+        assert!(matches!(
+            response.selection,
+            MacroCaptureSelection::Region(rect)
+                if rect == crate::engine::types::RectRatio::from_rect_relative(
+                    Rect::new(-1_600, 120, 1_280, 720),
+                    Rect::new(-1_320, 390, 420, 86)
+                )
+        ));
+    }
+
+    #[test]
+    fn macro_capture_distinguishes_point_region_and_template() {
+        let target = Rect::new(100, 200, 800, 600);
+        let rect = Rect::new(300, 350, 200, 120);
+        let point = normalize_macro_capture(
+            MacroCaptureRequest {
+                id: CaptureRequestId(1),
+                kind: MacroCaptureKind::ClickPoint,
+                target_client: target,
+                min_size: 1,
+            },
+            rect,
+        )
+        .unwrap();
+        assert!(matches!(
+            point.selection,
+            MacroCaptureSelection::Point(crate::engine::types::PointRatio { x, y })
+                if (x - 0.375).abs() < f32::EPSILON && (y - 0.35).abs() < f32::EPSILON
+        ));
+
+        let template = normalize_macro_capture(
+            MacroCaptureRequest {
+                id: CaptureRequestId(2),
+                kind: MacroCaptureKind::TemplateCrop,
+                target_client: target,
+                min_size: 4,
+            },
+            rect,
+        )
+        .unwrap();
+        assert!(matches!(
+            template.selection,
+            MacroCaptureSelection::TemplateCrop { screen_rect, .. } if screen_rect == rect
+        ));
+    }
+
+    #[test]
+    fn macro_capture_rejects_too_small_and_outside_target() {
+        let request = MacroCaptureRequest {
+            id: CaptureRequestId(1),
+            kind: MacroCaptureKind::ImageSearchRegion,
+            target_client: Rect::new(100, 100, 500, 400),
+            min_size: 10,
+        };
+        assert!(normalize_macro_capture(request, Rect::new(150, 150, 9, 20)).is_err());
+        assert!(normalize_macro_capture(request, Rect::new(90, 150, 20, 20)).is_err());
+    }
 }

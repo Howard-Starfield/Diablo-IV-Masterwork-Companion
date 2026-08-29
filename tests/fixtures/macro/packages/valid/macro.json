@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "id": "fixture-macro",
+  "name": "Fixture Macro",
+  "revision": 1,
+  "target": {
+    "process_path": "game.exe",
+    "window_class": "game",
+    "title_contains": "Diablo",
+    "captured_client_width": 1920,
+    "captured_client_height": 1080,
+    "captured_dpi": 96
+  },
+  "regions": [],
+  "points": [],
+  "text_rules": [],
+  "image_rules": [
+    {
+      "id": "fixture-image",
+      "revision": 1,
+      "region_id": "fixture-region",
+      "template": {
+        "id": "fixture-template",
+        "revision": 1,
+        "content_hash": "2081b07f6c4d9146b58e724c40d019f001167d76d1a35ca1dd5081c507309d5f"
+      },
+      "transparent_mask": null,
+      "threshold": 0.95,
+      "scales_percent": [100],
+      "stable_frames": 2,
+      "maximum_center_drift_px": 2,
+      "minimum_runner_up_margin": 0.05,
+      "match_policy": "exactly_one",
+      "poll_interval_ms": 100,
+      "timeout_ms": { "kind": "finite", "value": 5000 }
+    }
+  ],
+  "blocks": [],
+  "safety": {
+    "max_runtime_ms": { "kind": "finite", "value": 10000 },
+    "max_clicks": { "kind": "finite", "value": 10 },
+    "max_observation_retries": { "kind": "finite", "value": 10 },
+    "max_observations_per_second": 10,
+    "minimum_click_interval_ms": 100,
+    "focus_loss": "stop"
+  }
+}

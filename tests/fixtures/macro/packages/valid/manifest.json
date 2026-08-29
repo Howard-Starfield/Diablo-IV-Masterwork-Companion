@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "definition": "macro.json",
+  "assets": [
+    {
+      "asset": {
+        "id": "fixture-template",
+        "revision": 1,
+        "content_hash": "2081b07f6c4d9146b58e724c40d019f001167d76d1a35ca1dd5081c507309d5f"
+      },
+      "path": "assets/2081b07f6c4d9146b58e724c40d019f001167d76d1a35ca1dd5081c507309d5f.png"
+    }
+  ]
+}

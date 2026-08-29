@@ -2418,6 +2418,14 @@ fn inspector_editor_command(
             timeout_ms: timeout_ms.clone(),
             cooldown_ms: *cooldown_ms,
         },
+        InspectorIntent::SetAction { block_id, action } => EditorCommand::SetAction {
+            path: path(block_id)?,
+            action: action.clone(),
+        },
+        InspectorIntent::AddWatchLane { block_id } => {
+            let draft = draft.ok_or_else(|| "No draft is open.".to_string())?;
+            return Ok(Some(watch_insert_lane_command(draft, block_id)?));
+        }
     };
     Ok(Some(command))
 }
@@ -2510,6 +2518,7 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
             ("+ Action", PaletteKind::Action),
             ("+ IF", PaletteKind::If),
             ("+ Repeat", PaletteKind::Repeat),
+            ("+ Continuous", PaletteKind::Continuous),
             ("+ Watch", PaletteKind::Watch),
             ("+ Wait", PaletteKind::Wait),
             ("+ Stop", PaletteKind::Stop),
@@ -2586,11 +2595,24 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                 let _ = dispatch_editor_command(
                     state,
                     EditorCommand::SetLaneEnabled {
-                        group_id,
+                        group_id: group_id.clone(),
                         lane_id: selected.clone(),
                         enabled: !enabled,
                     },
                 );
+            }
+            if ui.add_enabled(editable, Button::new("Add Lane")).clicked() {
+                match state
+                    .draft
+                    .as_ref()
+                    .ok_or_else(|| "No draft is open.".to_string())
+                    .and_then(|draft| watch_insert_lane_command(draft, &group_id))
+                {
+                    Ok(command) => {
+                        let _ = dispatch_editor_command(state, command);
+                    }
+                    Err(message) => state.editor_feedback = Some(message),
+                }
             }
         });
         return;
@@ -2667,6 +2689,23 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                     },
                 },
             );
+        }
+        if matches!(
+            block.as_ref().map(|block| &block.kind),
+            Some(crate::engine::macro_engine::BlockKind::WatchGroup { .. })
+        ) && ui.add_enabled(editable, Button::new("Add Lane")).clicked()
+        {
+            match state
+                .draft
+                .as_ref()
+                .ok_or_else(|| "No draft is open.".to_string())
+                .and_then(|draft| watch_insert_lane_command(draft, &selected))
+            {
+                Ok(command) => {
+                    let _ = dispatch_editor_command(state, command);
+                }
+                Err(message) => state.editor_feedback = Some(message),
+            }
         }
         if !matches!(path.container, ContainerPath::Root)
             && ui
@@ -3200,6 +3239,7 @@ fn conversion_choices(
             }
         }
         BlockKind::RepeatN { .. } => {
+            targets.push(("Continuous".into(), ConversionTarget::Continuous));
             for (source_id, condition) in observation_sources(draft) {
                 targets.push((
                     format!("Repeat Until: {source_id}"),
@@ -3211,7 +3251,20 @@ fn conversion_choices(
             }
         }
         BlockKind::RepeatUntil { .. } => {
-            targets.push(("Repeat N".into(), ConversionTarget::RepeatN { count: 2 }))
+            targets.push(("Repeat N".into(), ConversionTarget::RepeatN { count: 2 }));
+            targets.push(("Continuous".into(), ConversionTarget::Continuous));
+        }
+        BlockKind::Continuous { .. } => {
+            targets.push(("Repeat N".into(), ConversionTarget::RepeatN { count: 2 }));
+            for (source_id, condition) in observation_sources(draft) {
+                targets.push((
+                    format!("Repeat Until: {source_id}"),
+                    ConversionTarget::RepeatUntil {
+                        condition: condition_with_source(condition, source_id),
+                        max_iterations: Limit::Finite(100),
+                    },
+                ));
+            }
         }
         _ => {}
     }
@@ -3275,6 +3328,7 @@ fn conversion_target_changes(
                 button: target_button,
             },
         ) => region_id != target_id || button != target_button,
+        (BlockKind::Continuous { .. }, ConversionTarget::Continuous) => false,
         _ => true,
     }
 }
@@ -3462,9 +3516,9 @@ fn conversion_target_family(target: &ConversionTarget) -> BlockFamily {
         ConversionTarget::ClickPoint { .. } | ConversionTarget::ClickRegion { .. } => {
             BlockFamily::SavedLocationClick
         }
-        ConversionTarget::RepeatN { .. } | ConversionTarget::RepeatUntil { .. } => {
-            BlockFamily::Loop
-        }
+        ConversionTarget::RepeatN { .. }
+        | ConversionTarget::RepeatUntil { .. }
+        | ConversionTarget::Continuous => BlockFamily::Loop,
     }
 }
 
@@ -3502,7 +3556,9 @@ fn block_family_for_ui(block: &crate::engine::macro_engine::Block) -> BlockFamil
         BlockKind::Action {
             action: Action::ClickPoint { .. } | Action::ClickRegion { .. },
         } => BlockFamily::SavedLocationClick,
-        BlockKind::RepeatN { .. } | BlockKind::RepeatUntil { .. } => BlockFamily::Loop,
+        BlockKind::RepeatN { .. }
+        | BlockKind::RepeatUntil { .. }
+        | BlockKind::Continuous { .. } => BlockFamily::Loop,
         _ => BlockFamily::Other,
     }
 }
@@ -3523,6 +3579,7 @@ enum PaletteKind {
     Action,
     If,
     Repeat,
+    Continuous,
     Watch,
     Wait,
     Stop,
@@ -3564,6 +3621,7 @@ fn palette_command_for_selection(
             PaletteKind::Action => "action",
             PaletteKind::If => "if",
             PaletteKind::Repeat => "repeat",
+            PaletteKind::Continuous => "continuous",
             PaletteKind::Watch => "watch",
             PaletteKind::Wait => "wait",
             PaletteKind::Stop => "stop",
@@ -3622,6 +3680,7 @@ fn palette_command_for_selection(
             count: 2,
             body: vec![],
         },
+        PaletteKind::Continuous => BlockKind::Continuous { body: vec![] },
         PaletteKind::Watch => {
             let Some((source_id, condition)) = source else {
                 return Err("Add or select an observation before inserting a Watch Group.".into());
@@ -3660,6 +3719,50 @@ fn palette_command_for_selection(
             id,
             enabled: true,
             kind,
+        },
+    })
+}
+
+fn watch_insert_lane_command(draft: &EditorDraft, group_id: &str) -> Result<EditorCommand, String> {
+    use crate::engine::macro_engine::{
+        BlockKind, Condition, MAX_WATCH_GROUP_LANES, PassiveCondition, WatchLane,
+    };
+    let path = locate_block_path(draft, group_id)
+        .ok_or_else(|| format!("Watch Group '{group_id}' is no longer available."))?;
+    let block = block_at_path(draft, &path)
+        .ok_or_else(|| format!("Watch Group '{group_id}' is no longer available."))?;
+    let BlockKind::WatchGroup { group } = &block.kind else {
+        return Err("Add Lane needs a selected Watch Group.".into());
+    };
+    if group.lanes.len() >= MAX_WATCH_GROUP_LANES {
+        return Err(format!(
+            "Watch Group supports at most {MAX_WATCH_GROUP_LANES} lanes."
+        ));
+    }
+    let condition = if let Some(lane) = group.lanes.first() {
+        lane.condition.clone()
+    } else {
+        let Some((source_id, condition)) = observation_source(draft, None) else {
+            return Err("Add or select an observation before adding a Watch lane.".into());
+        };
+        match condition {
+            Condition::Text { rule_id, .. } => PassiveCondition::Text {
+                source_block_id: source_id,
+                rule_id,
+            },
+            Condition::Image { rule_id, .. } => PassiveCondition::Image {
+                source_block_id: source_id,
+                rule_id,
+            },
+        }
+    };
+    Ok(EditorCommand::InsertLane {
+        group_id: group_id.to_string(),
+        lane: WatchLane {
+            id: next_unique_id(draft, "lane"),
+            enabled: true,
+            condition,
+            then_body: vec![],
         },
     })
 }
@@ -4360,6 +4463,7 @@ mod tests {
             PaletteKind::Action,
             PaletteKind::If,
             PaletteKind::Repeat,
+            PaletteKind::Continuous,
             PaletteKind::Watch,
             PaletteKind::Wait,
             PaletteKind::Stop,
@@ -4419,6 +4523,41 @@ mod tests {
                 owner_id: "observe-1".into()
             }
         );
+    }
+
+    #[test]
+    fn palette_inserts_continuous_beside_repeat() {
+        let mut draft = fixture();
+        let command = palette_command(&draft, Some("observe-1"), PaletteKind::Continuous).unwrap();
+        let EditorCommand::InsertBlock { block, target } = command else {
+            panic!()
+        };
+        assert!(matches!(block.kind, BlockKind::Continuous { .. }));
+        assert_eq!(target.container, ContainerPath::Root);
+        apply_editor_command(&mut draft, EditorCommand::InsertBlock { target, block }).unwrap();
+        assert!(
+            draft
+                .blocks
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Continuous { .. }))
+        );
+    }
+
+    #[test]
+    fn watch_add_lane_appends_a_second_lane() {
+        let mut draft = fixture();
+        let command = palette_command(&draft, Some("observe-1"), PaletteKind::Watch).unwrap();
+        apply_editor_command(&mut draft, command).unwrap();
+        let watch_id = draft
+            .blocks
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::WatchGroup { .. }))
+            .map(|block| block.id.clone())
+            .expect("watch");
+        assert_eq!(draft.watch_lane_ids(&watch_id).len(), 1);
+        let command = watch_insert_lane_command(&draft, &watch_id).unwrap();
+        apply_editor_command(&mut draft, command).unwrap();
+        assert_eq!(draft.watch_lane_ids(&watch_id).len(), 2);
     }
 
     #[test]

@@ -10,6 +10,8 @@ use crate::engine::macro_engine::{
 use crate::ui_theme::text;
 
 const EMPTY_INSPECTOR_PROMPT: &str = "Select a canonical canvas block.";
+pub const IF_BRANCH_STATUS: &str =
+    "If true runs THEN. If false runs ELSE. Then continues after the If.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InspectorIntent {
@@ -154,43 +156,43 @@ pub fn project_inspector(
     };
     if let Some(block) = find_block(&definition.blocks, selected_id) {
         return match &block.kind {
-            BlockKind::Observe { condition }
-            | BlockKind::If { condition, .. }
-            | BlockKind::RepeatUntil { condition, .. } => match condition {
-                Condition::Text { rule_id, mode, .. } => definition
-                    .text_rules
-                    .iter()
-                    .find(|rule| rule.id == *rule_id)
-                    .map(|rule| {
-                        text_projection(
-                            selected_id,
-                            rule,
-                            mode,
-                            selected_problems(),
-                            flow_fields(&block.kind),
-                            repeat_until_max(&block.kind),
-                            true,
-                        )
-                    })
-                    .unwrap_or(InspectorProjection::Empty),
-                Condition::Image { rule_id, mode, .. } => definition
-                    .image_rules
-                    .iter()
-                    .find(|rule| rule.id == *rule_id)
-                    .map(|rule| {
-                        image_projection(
-                            selected_id,
-                            rule,
-                            mode,
-                            selected_problems(),
-                            flow_fields(&block.kind),
-                            repeat_until_max(&block.kind),
-                            &definition.image_rules,
-                            true,
-                        )
-                    })
-                    .unwrap_or(InspectorProjection::Empty),
-            },
+            BlockKind::Observe { condition } | BlockKind::RepeatUntil { condition, .. } => {
+                match condition {
+                    Condition::Text { rule_id, mode, .. } => definition
+                        .text_rules
+                        .iter()
+                        .find(|rule| rule.id == *rule_id)
+                        .map(|rule| {
+                            text_projection(
+                                selected_id,
+                                rule,
+                                mode,
+                                selected_problems(),
+                                flow_fields(&block.kind),
+                                repeat_until_max(&block.kind),
+                                true,
+                            )
+                        })
+                        .unwrap_or(InspectorProjection::Empty),
+                    Condition::Image { rule_id, mode, .. } => definition
+                        .image_rules
+                        .iter()
+                        .find(|rule| rule.id == *rule_id)
+                        .map(|rule| {
+                            image_projection(
+                                selected_id,
+                                rule,
+                                mode,
+                                selected_problems(),
+                                flow_fields(&block.kind),
+                                repeat_until_max(&block.kind),
+                                &definition.image_rules,
+                                true,
+                            )
+                        })
+                        .unwrap_or(InspectorProjection::Empty),
+                }
+            }
             BlockKind::WatchGroup { group } => InspectorProjection::Flow(FlowInspector {
                 block_id: selected_id.into(),
                 kind: "WATCH GROUP".into(),
@@ -372,7 +374,14 @@ fn flow_projection(id: &str, kind: &BlockKind, problems: Vec<String>) -> Inspect
             vec![("Limit".into(), "Unlimited".into())],
             None,
         ),
-        BlockKind::If { .. } => ("IF", vec![], None),
+        BlockKind::If { .. } => (
+            "IF",
+            vec![
+                ("THEN".into(), "insert target".into()),
+                ("ELSE".into(), "insert target".into()),
+            ],
+            None,
+        ),
         _ => ("BLOCK", vec![], None),
     };
     InspectorProjection::Flow(FlowInspector {
@@ -388,7 +397,6 @@ fn flow_fields(kind: &BlockKind) -> Vec<(String, String)> {
         BlockKind::RepeatUntil { max_iterations, .. } => {
             vec![("Max iterations".into(), format_limit(max_iterations))]
         }
-        BlockKind::If { .. } => vec![("Branches".into(), "THEN / ELSE".into())],
         _ => vec![],
     }
 }
@@ -651,6 +659,13 @@ pub fn show(
         }
         InspectorProjection::Flow(p) => {
             heading(ui, &p.kind, &p.block_id);
+            if p.kind == "IF" {
+                ui.label(
+                    RichText::new(IF_BRANCH_STATUS)
+                        .size(text::SUPPORTING)
+                        .color(Color32::from_gray(174)),
+                );
+            }
             for (k, v) in &p.fields {
                 field(ui, k, v);
             }
@@ -1163,6 +1178,41 @@ mod tests {
         assert!(text.actions.contains(&InspectorIntent::RecaptureRegion {
             region_id: "scan".into()
         }));
+    }
+
+    #[test]
+    fn if_inspector_names_then_and_else_as_insert_targets() {
+        let mut definition = definition();
+        definition.blocks.push(Block {
+            id: "if-1".into(),
+            enabled: true,
+            kind: BlockKind::If {
+                condition: Condition::Text {
+                    source_block_id: "observe".into(),
+                    rule_id: "rule".into(),
+                    mode: ObserveMode::CheckNow,
+                },
+                then_body: vec![],
+                else_body: vec![],
+            },
+        });
+
+        let InspectorProjection::Flow(flow) = project_inspector(&definition, "if-1", &[]) else {
+            panic!("if inspector");
+        };
+        assert_eq!(flow.kind, "IF");
+        assert!(
+            flow.fields
+                .contains(&("THEN".into(), "insert target".into()))
+        );
+        assert!(
+            flow.fields
+                .contains(&("ELSE".into(), "insert target".into()))
+        );
+        assert_eq!(
+            IF_BRANCH_STATUS,
+            "If true runs THEN. If false runs ELSE. Then continues after the If."
+        );
     }
 
     #[test]

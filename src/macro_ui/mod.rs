@@ -1477,6 +1477,9 @@ fn select_canvas(state: &mut MacroPageState, selection: CanvasSelection) {
         CanvasSelection::Block(id) => Some(id.clone()),
         CanvasSelection::Lane { lane_id, .. } => Some(lane_id.clone()),
         CanvasSelection::TimeoutBody { .. } => None,
+        CanvasSelection::IfThen { if_id } | CanvasSelection::IfElse { if_id } => {
+            Some(if_id.clone())
+        }
     };
     state.selected_canvas = Some(selection);
 }
@@ -1556,6 +1559,16 @@ fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAc
 }
 
 fn current_canvas_selection(state: &MacroPageState) -> Option<CanvasSelection> {
+    if let Some(selected) = &state.selected_canvas {
+        if matches!(
+            selected,
+            CanvasSelection::IfThen { .. }
+                | CanvasSelection::IfElse { .. }
+                | CanvasSelection::TimeoutBody { .. }
+        ) {
+            return Some(selected.clone());
+        }
+    }
     if let Some(id) = &state.selected_block_id {
         if let Some((group_id, _, _, _)) = state
             .draft
@@ -2419,6 +2432,13 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
             RichText::new(feedback)
                 .size(text::SUPPORTING)
                 .color(Color32::from_rgb(196, 154, 106)),
+        );
+    }
+    if selection_is_if(state.draft.as_ref(), selected_canvas.as_ref()) {
+        ui.label(
+            RichText::new(inspector::IF_BRANCH_STATUS)
+                .size(text::SUPPORTING)
+                .color(Color32::from_gray(174)),
         );
     }
     if let Some(intent) = state.pending_inspector_intent.clone() {
@@ -3532,6 +3552,9 @@ fn palette_command_for_selection(
     let selected_id = selected.and_then(|selection| match selection {
         CanvasSelection::Block(id) => Some(id.as_str()),
         CanvasSelection::Lane { lane_id, .. } => Some(lane_id.as_str()),
+        CanvasSelection::IfThen { if_id } | CanvasSelection::IfElse { if_id } => {
+            Some(if_id.as_str())
+        }
         CanvasSelection::TimeoutBody { .. } => None,
     });
     let id = next_unique_id(
@@ -3664,6 +3687,20 @@ fn insertion_target(draft: &EditorDraft, selected: Option<&CanvasSelection>) -> 
         let index = container_len(draft, &container).unwrap_or(0);
         return InsertionTarget { container, index };
     }
+    if let CanvasSelection::IfThen { if_id } = selected {
+        let container = ContainerPath::IfThen {
+            if_id: if_id.clone(),
+        };
+        let index = container_len(draft, &container).unwrap_or(0);
+        return InsertionTarget { container, index };
+    }
+    if let CanvasSelection::IfElse { if_id } = selected {
+        let container = ContainerPath::IfElse {
+            if_id: if_id.clone(),
+        };
+        let index = container_len(draft, &container).unwrap_or(0);
+        return InsertionTarget { container, index };
+    }
     let CanvasSelection::Block(selected_id) = selected else {
         return InsertionTarget {
             container: ContainerPath::Root,
@@ -3708,6 +3745,23 @@ fn insertion_target(draft: &EditorDraft, selected: Option<&CanvasSelection>) -> 
             container: path.container,
             index,
         }
+    }
+}
+
+fn selection_is_if(draft: Option<&EditorDraft>, selected: Option<&CanvasSelection>) -> bool {
+    match selected {
+        Some(CanvasSelection::IfThen { .. } | CanvasSelection::IfElse { .. }) => true,
+        Some(CanvasSelection::Block(id)) => draft.is_some_and(|draft| {
+            locate_block_path(draft, id)
+                .and_then(|path| block_at_path(draft, &path))
+                .is_some_and(|block| {
+                    matches!(
+                        block.kind,
+                        crate::engine::macro_engine::BlockKind::If { .. }
+                    )
+                })
+        }),
+        _ => false,
     }
 }
 
@@ -4365,6 +4419,47 @@ mod tests {
                 owner_id: "observe-1".into()
             }
         );
+    }
+
+    #[test]
+    fn palette_inserts_into_selected_if_else_branch() {
+        let mut draft = fixture();
+        let command = palette_command(&draft, Some("observe-1"), PaletteKind::If).unwrap();
+        let EditorCommand::InsertBlock { block, .. } = &command else {
+            panic!()
+        };
+        let if_id = block.id.clone();
+        apply_editor_command(&mut draft, command).unwrap();
+
+        let else_selection = CanvasSelection::IfElse {
+            if_id: if_id.clone(),
+        };
+        let command =
+            palette_command_for_selection(&draft, Some(&else_selection), PaletteKind::Wait)
+                .unwrap();
+        let EditorCommand::InsertBlock { target, block } = command else {
+            panic!()
+        };
+        assert_eq!(
+            target.container,
+            ContainerPath::IfElse {
+                if_id: if_id.clone()
+            }
+        );
+        apply_editor_command(&mut draft, EditorCommand::InsertBlock { target, block }).unwrap();
+
+        let if_block = draft.blocks.iter().find(|block| block.id == if_id).unwrap();
+        let BlockKind::If {
+            then_body,
+            else_body,
+            ..
+        } = &if_block.kind
+        else {
+            panic!()
+        };
+        assert!(then_body.is_empty());
+        assert_eq!(else_body.len(), 1);
+        assert!(matches!(else_body[0].kind, BlockKind::Wait { .. }));
     }
 
     #[test]

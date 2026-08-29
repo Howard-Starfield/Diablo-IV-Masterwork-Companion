@@ -86,6 +86,8 @@ pub enum CanvasSelection {
     Block(String),
     Lane { group_id: String, lane_id: String },
     TimeoutBody { owner_id: String },
+    IfThen { if_id: String },
+    IfElse { if_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -497,10 +499,13 @@ fn append_group(
             CanvasGroupKind::TimeoutBody => Some(CanvasSelection::TimeoutBody {
                 owner_id: owner.id.clone(),
             }),
-            CanvasGroupKind::IfThen
-            | CanvasGroupKind::IfElse
-            | CanvasGroupKind::LoopBody
-            | CanvasGroupKind::WatchLaneThen => None,
+            CanvasGroupKind::IfThen => Some(CanvasSelection::IfThen {
+                if_id: owner.id.clone(),
+            }),
+            CanvasGroupKind::IfElse => Some(CanvasSelection::IfElse {
+                if_id: owner.id.clone(),
+            }),
+            CanvasGroupKind::LoopBody | CanvasGroupKind::WatchLaneThen => None,
         },
         None,
     );
@@ -800,6 +805,35 @@ mod tests {
                 OutputPort::IfElse("if-1".into()),
                 OutputPort::Next("if-1".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn if_groups_expose_typed_then_and_else_insert_targets() {
+        let graph = project_canvas(&fixture_if());
+        let then_group = graph
+            .groups
+            .iter()
+            .find(|group| group.id.kind == CanvasGroupKind::IfThen)
+            .unwrap();
+        let else_group = graph
+            .groups
+            .iter()
+            .find(|group| group.id.kind == CanvasGroupKind::IfElse)
+            .unwrap();
+        assert_eq!(then_group.label, "THEN");
+        assert_eq!(else_group.label, "ELSE");
+        assert_eq!(
+            then_group.selection,
+            Some(CanvasSelection::IfThen {
+                if_id: "if-1".into()
+            })
+        );
+        assert_eq!(
+            else_group.selection,
+            Some(CanvasSelection::IfElse {
+                if_id: "if-1".into()
+            })
         );
     }
 

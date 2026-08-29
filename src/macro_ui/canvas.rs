@@ -1,11 +1,12 @@
 use eframe::egui::{self, Color32, Id, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
 
 use crate::macro_ui::canvas_layout::{
-    CanvasViewport, LayoutEdit, node_rect, reveal_node, visible_nodes,
+    CanvasViewport, LayoutEdit, NODE_HEIGHT, NODE_WIDTH, SIBLING_GAP, node_rect, reveal_node,
+    visible_nodes,
 };
 use crate::macro_ui::canvas_model::{
-    CanvasConnectionError, CanvasEdgeKind, CanvasProjection, CanvasSelection, OutputPort,
-    connection_command, insertion_target_for_port,
+    CanvasConnectionError, CanvasEdgeKind, CanvasGroup, CanvasGroupKind, CanvasProjection,
+    CanvasSelection, OutputPort, connection_command, insertion_target_for_port,
 };
 use crate::macro_ui::{BlockFamily, EditorCommand, EditorDraft};
 use crate::ui_state::MacroCanvasLayout;
@@ -21,6 +22,7 @@ pub enum CanvasHit {
     Node(String),
     Input(String),
     Output(OutputPort),
+    Group(CanvasSelection),
 }
 
 impl Default for CanvasHit {
@@ -125,7 +127,10 @@ fn gesture_for_start(
         CanvasHit::Output(port) if is_editable_output(port) => Some(CanvasGesture::Connector {
             source: port.clone(),
         }),
-        CanvasHit::Background | CanvasHit::Input(_) | CanvasHit::Output(_) => None,
+        CanvasHit::Background
+        | CanvasHit::Input(_)
+        | CanvasHit::Output(_)
+        | CanvasHit::Group(_) => None,
     }
 }
 
@@ -202,14 +207,17 @@ pub fn finish_connection(
             }
             return CanvasResponse {
                 action: Some(CanvasAction::OpenAddStep {
-                    source,
+                    source: source.clone(),
                     world_position: [0.0, 0.0],
                     allowed: allowed_families(),
                 }),
+                selection: selection_for_port(&source),
                 ..Default::default()
             };
         }
-        CanvasHit::Output(_) => return rejected_response(CanvasConnectionError::InvalidPort),
+        CanvasHit::Output(_) | CanvasHit::Group(_) => {
+            return rejected_response(CanvasConnectionError::InvalidPort);
+        }
     };
     match connection_command(draft, source.clone(), &target_id) {
         Ok(editor_command) => CanvasResponse {
@@ -376,19 +384,32 @@ pub fn show(
                     }
                 }
                 CanvasGesture::Connector { source } => {
-                    let mut connection = draft.map_or_else(
-                        || rejected_response(CanvasConnectionError::MissingSource("draft".into())),
-                        |draft| finish_connection(draft, source.clone(), hit.clone()),
-                    );
-                    if let Some(CanvasAction::OpenAddStep { world_position, .. }) =
-                        connection.action.as_mut()
-                    {
-                        *world_position = pointer
-                            .map(|point| viewport.world_from_screen(canvas_rect, point))
-                            .map(|point| [point.x, point.y])
-                            .unwrap_or([0.0, 0.0]);
+                    if let Some(selection) = match &hit {
+                        CanvasHit::Output(port) => selection_for_port(port),
+                        CanvasHit::Group(selection) => Some(selection.clone()),
+                        _ => None,
+                    } {
+                        result.selection = Some(selection.clone());
+                        result.action = Some(CanvasAction::Select(selection));
+                    } else {
+                        let mut connection = draft.map_or_else(
+                            || {
+                                rejected_response(CanvasConnectionError::MissingSource(
+                                    "draft".into(),
+                                ))
+                            },
+                            |draft| finish_connection(draft, source.clone(), hit.clone()),
+                        );
+                        if let Some(CanvasAction::OpenAddStep { world_position, .. }) =
+                            connection.action.as_mut()
+                        {
+                            *world_position = pointer
+                                .map(|point| viewport.world_from_screen(canvas_rect, point))
+                                .map(|point| [point.x, point.y])
+                                .unwrap_or([0.0, 0.0]);
+                        }
+                        result = connection;
                     }
-                    result = connection;
                 }
                 CanvasGesture::Pan { .. } => {}
             }
@@ -449,7 +470,24 @@ fn selection_for_hit(graph: &CanvasProjection, hit: &CanvasHit) -> Option<Canvas
         CanvasHit::Node(id) | CanvasHit::Input(id) => {
             graph.node(id).map(|node| node.selection.clone())
         }
-        CanvasHit::Background | CanvasHit::Output(_) => None,
+        CanvasHit::Output(port) => selection_for_port(port),
+        CanvasHit::Group(selection) => Some(selection.clone()),
+        CanvasHit::Background => None,
+    }
+}
+
+fn selection_for_port(port: &OutputPort) -> Option<CanvasSelection> {
+    match port {
+        OutputPort::IfThen(id) => Some(CanvasSelection::IfThen { if_id: id.clone() }),
+        OutputPort::IfElse(id) => Some(CanvasSelection::IfElse { if_id: id.clone() }),
+        OutputPort::TimeoutBody(id) => Some(CanvasSelection::TimeoutBody {
+            owner_id: id.clone(),
+        }),
+        OutputPort::WatchLane { group_id, lane_id } => Some(CanvasSelection::Lane {
+            group_id: group_id.clone(),
+            lane_id: lane_id.clone(),
+        }),
+        OutputPort::Next(_) | OutputPort::LoopBody(_) | OutputPort::LoopReturn(_) => None,
     }
 }
 
@@ -477,6 +515,17 @@ fn hit_test(
         }
         return CanvasHit::Node(node.id.clone());
     }
+    for group in graph.groups.iter().rev() {
+        let Some(selection) = group.selection.as_ref() else {
+            continue;
+        };
+        let Some(bounds) = group_world_rect(graph, group, layout) else {
+            continue;
+        };
+        if screen_rect(viewport, canvas, bounds).contains(point) {
+            return CanvasHit::Group(selection.clone());
+        }
+    }
     CanvasHit::Background
 }
 
@@ -494,7 +543,7 @@ fn paint_canvas(
 ) {
     painter.rect_filled(canvas, 4.0, colors::CANVAS);
     paint_grid(painter, viewport, canvas);
-    paint_groups(painter, graph, layout, viewport, canvas);
+    paint_groups(painter, graph, layout, viewport, canvas, selected);
     paint_edges(painter, graph, layout, viewport, canvas, active_block);
     for node in visible_nodes(graph, layout, viewport, canvas) {
         paint_node(
@@ -554,20 +603,35 @@ fn paint_groups(
     layout: &MacroCanvasLayout,
     viewport: &CanvasViewport,
     canvas: Rect,
+    selected: Option<&CanvasSelection>,
 ) {
     for group in &graph.groups {
-        let Some(bounds) = group
-            .member_ids
-            .iter()
-            .filter_map(|id| graph.node(id))
-            .map(|node| node_rect(node, layout))
-            .reduce(|left, right| left.union(right))
-        else {
+        let Some(bounds) = group_world_rect(graph, group, layout) else {
             continue;
         };
-        let rect = screen_rect(viewport, canvas, bounds.expand(18.0));
-        painter.rect_filled(rect, 8.0, Color32::from_white_alpha(5));
-        painter.rect_stroke(rect, 8.0, Stroke::new(1.0, Color32::from_white_alpha(44)));
+        let rect = screen_rect(viewport, canvas, bounds);
+        let highlighted = group.selection.as_ref() == selected;
+        painter.rect_filled(
+            rect,
+            8.0,
+            if highlighted {
+                Color32::from_rgb(48, 32, 58)
+            } else {
+                Color32::from_white_alpha(5)
+            },
+        );
+        painter.rect_stroke(
+            rect,
+            8.0,
+            Stroke::new(
+                if highlighted { 1.6 } else { 1.0 },
+                if highlighted {
+                    colors::DECIDE_PURPLE
+                } else {
+                    Color32::from_white_alpha(44)
+                },
+            ),
+        );
         painter.text(
             rect.left_top() + Vec2::new(8.0, 6.0),
             egui::Align2::LEFT_TOP,
@@ -576,6 +640,45 @@ fn paint_groups(
             colors::SUPPORTING_TEXT,
         );
     }
+}
+
+fn group_world_rect(
+    graph: &CanvasProjection,
+    group: &CanvasGroup,
+    layout: &MacroCanvasLayout,
+) -> Option<Rect> {
+    let member_bounds = group
+        .member_ids
+        .iter()
+        .filter_map(|id| graph.node(id))
+        .map(|node| node_rect(node, layout))
+        .reduce(|left, right| left.union(right));
+    if let Some(bounds) = member_bounds {
+        return Some(bounds.expand(18.0));
+    }
+    match group.id.kind {
+        CanvasGroupKind::IfThen | CanvasGroupKind::IfElse => {
+            let owner = graph.node(&group.id.owner_id)?;
+            Some(empty_if_branch_slot(
+                node_rect(owner, layout),
+                group.id.kind,
+            ))
+        }
+        CanvasGroupKind::LoopBody
+        | CanvasGroupKind::WatchLaneThen
+        | CanvasGroupKind::TimeoutBody => None,
+    }
+}
+
+fn empty_if_branch_slot(owner: Rect, kind: CanvasGroupKind) -> Rect {
+    let offset_x = match kind {
+        CanvasGroupKind::IfElse => NODE_WIDTH + SIBLING_GAP,
+        _ => 0.0,
+    };
+    Rect::from_min_size(
+        owner.left_bottom() + Vec2::new(offset_x, 24.0),
+        Vec2::new(NODE_WIDTH, NODE_HEIGHT * 0.55),
+    )
 }
 
 fn paint_edges(
@@ -811,5 +914,32 @@ mod tests {
     #[test]
     fn generated_loop_return_is_not_an_editable_connector_handle() {
         assert!(!is_editable_output(&OutputPort::LoopReturn("loop".into())));
+    }
+
+    #[test]
+    fn if_else_port_click_selects_else_insert_target() {
+        let graph = crate::macro_ui::canvas_model::project_canvas(
+            &crate::macro_ui::test_support::fixture_if(),
+        );
+        assert_eq!(
+            selection_for_hit(
+                &graph,
+                &CanvasHit::Output(OutputPort::IfElse("if-1".into())),
+            ),
+            Some(CanvasSelection::IfElse {
+                if_id: "if-1".into()
+            })
+        );
+        assert_eq!(
+            selection_for_hit(
+                &graph,
+                &CanvasHit::Group(CanvasSelection::IfElse {
+                    if_id: "if-1".into()
+                }),
+            ),
+            Some(CanvasSelection::IfElse {
+                if_id: "if-1".into()
+            })
+        );
     }
 }

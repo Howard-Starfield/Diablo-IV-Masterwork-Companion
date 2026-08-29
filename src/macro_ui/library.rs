@@ -117,7 +117,7 @@ pub fn show(
                         .color(Color32::from_gray(205)),
                 );
                 ui.label(
-                    RichText::new("The guided creator arrives in the next phase.")
+                    RichText::new("Use New Macro or Guided wizard to create one.")
                         .size(text::SUPPORTING)
                         .color(Color32::from_gray(120)),
                 );

@@ -649,7 +649,7 @@ fn child_bodies(block: &Block) -> Vec<&[Block]> {
     }
 }
 
-fn block_category(kind: &BlockKind) -> BlockCategory {
+pub(crate) fn block_category(kind: &BlockKind) -> BlockCategory {
     match kind {
         BlockKind::Observe { .. } | BlockKind::WatchGroup { .. } => BlockCategory::Observe,
         BlockKind::If { .. } => BlockCategory::Decide,
@@ -664,7 +664,7 @@ fn block_category(kind: &BlockKind) -> BlockCategory {
     }
 }
 
-fn block_presentation(kind: &BlockKind) -> (String, String) {
+pub(crate) fn block_presentation(kind: &BlockKind) -> (String, String) {
     match kind {
         BlockKind::Observe { condition } => condition_presentation(condition),
         BlockKind::Action { action } => {

@@ -1,0 +1,4 @@
+﻿feature: PR-macro-list
+entry: launch, Macro tab, New Macro at click-rel 0.10,0.28 (Create starter removed on shell tip)
+display: owned window 916x1120
+notes: STEPS list. OCR (Tesseract) used to locate + IF (between Action/Repeat), ELSE empty, + Wait, Duplicate/Down. list-04 Wait under ELSE; list-05 duplicate+Down reorder.

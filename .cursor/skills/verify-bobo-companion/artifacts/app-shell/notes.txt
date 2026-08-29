@@ -1,0 +1,6 @@
+﻿feature: app-shell
+entry: launch + enchant screenshot; Macro tab via click-rel (~0.36,0.035)
+isolation: LOCALAPPDATA+APPDATA sandbox
+window: 916x1120 at left=1270
+proof: enchant.png shows Enchant chrome; macro.png shows Macro library/canvas
+cleanup: session cleared; artifacts retained

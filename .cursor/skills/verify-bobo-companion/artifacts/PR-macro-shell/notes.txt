@@ -1,0 +1,4 @@
+feature: PR-macro-shell
+Capture Target: SKIPPED — no Diablo IV window in verification session (plan Appendix C).
+Unbound: Not connected / Not bound evidenced on shell-01 / earlier owner shots.
+History: shell-04-history.png (Close History / No saved run history).

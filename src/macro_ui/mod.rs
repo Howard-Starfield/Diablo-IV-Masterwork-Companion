@@ -2149,7 +2149,11 @@ fn workspace(
         PaneMode::CanvasWithDrawers => {
             section(ui, "STEPS", |ui| {
                 editor_toolbar(ui, state);
-                let list_height = (ui.available_height() - 120.0).max(220.0);
+                // Keep room for drawer bodies when open so Library/New Macro stays reachable.
+                let drawer_reserve = 52.0
+                    + if state.library_drawer_open { 200.0 } else { 0.0 }
+                    + if state.inspector_drawer_open { 220.0 } else { 0.0 };
+                let list_height = (ui.available_height() - drawer_reserve).max(160.0);
                 ui.allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
                     selection = show_step_list(
                         ui,

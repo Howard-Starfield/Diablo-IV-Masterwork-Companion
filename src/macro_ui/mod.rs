@@ -19,7 +19,7 @@ pub use library::{MacroLibraryRow, project_definition};
 pub use monitor::RunDefinitionSnapshot;
 pub use wizard::*;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use eframe::egui::{self, Button, Color32, Frame, RichText, Stroke, Ui};
 
@@ -376,6 +376,11 @@ pub struct MacroPageState {
     intents: MacroIntentQueue,
     pub selected_block_id: Option<String>,
     selected_canvas: Option<CanvasSelection>,
+    /// Session-local collapsed container ids (If / Repeat / Continuous / Watch).
+    pub collapsed_step_containers: HashSet<String>,
+    /// Drawer chrome: Library / Inspector closed by default; Inspector opens on select.
+    pub library_drawer_open: bool,
+    pub inspector_drawer_open: bool,
     pub pending_inspector_intent: Option<inspector::InspectorIntent>,
     pub editor_feedback: Option<String>,
     pending_conversion: Option<PendingConversion>,
@@ -420,6 +425,9 @@ impl Default for MacroPageState {
             intents: MacroIntentQueue::with_capacity(MacroIntentQueue::DEFAULT_CAPACITY),
             selected_block_id: None,
             selected_canvas: None,
+            collapsed_step_containers: HashSet::new(),
+            library_drawer_open: false,
+            inspector_drawer_open: false,
             pending_inspector_intent: None,
             editor_feedback: None,
             pending_conversion: None,
@@ -554,6 +562,7 @@ impl MacroPageState {
         self.set_selected_saved(saved);
         self.selected_block_id = None;
         self.selected_canvas = None;
+        self.collapsed_step_containers.clear();
         self.editor_feedback = None;
     }
 
@@ -1250,14 +1259,9 @@ pub enum PaneMode {
     CanvasWithDrawers,
 }
 
-pub fn pane_mode(width: f32) -> PaneMode {
-    if width >= 1100.0 {
-        PaneMode::ThreePane
-    } else if width >= 720.0 {
-        PaneMode::ThreePaneCompact
-    } else {
-        PaneMode::CanvasWithDrawers
-    }
+/// Recorder STEPS-first layout: Library and Inspector are drawers at every width.
+pub fn pane_mode(_width: f32) -> PaneMode {
+    PaneMode::CanvasWithDrawers
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1510,6 +1514,10 @@ fn select_canvas(state: &mut MacroPageState, selection: CanvasSelection) {
         }
     };
     state.selected_canvas = Some(selection);
+    // Recorder layout: open Inspector when a step is selected.
+    if state.selected_block_id.is_some() {
+        state.inspector_drawer_open = true;
+    }
 }
 
 fn apply_wizard_ui_action(state: &mut MacroPageState, action: wizard::WizardUiAction) {
@@ -2089,6 +2097,7 @@ fn workspace(
         .collect::<Vec<_>>();
     match pane_mode(ui.available_width()) {
         PaneMode::ThreePane | PaneMode::ThreePaneCompact => {
+            // Retained for very wide layouts if re-enabled; default path is drawers.
             let compact = pane_mode(ui.available_width()) == PaneMode::ThreePaneCompact;
             let (library_width, inspector_width) =
                 pane_widths_for_mode(&state.canvas_layout, compact);
@@ -2124,7 +2133,7 @@ fn workspace(
                 .show_inside(ui, |ui| {
                     section(ui, "STEPS", |ui| {
                         editor_toolbar(ui, state);
-                        let list_height = (ui.available_height() - 160.0).max(180.0);
+                        let list_height = (ui.available_height() - 120.0).max(220.0);
                         ui.allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
                             selection = show_step_list(
                                 ui,
@@ -2140,7 +2149,7 @@ fn workspace(
         PaneMode::CanvasWithDrawers => {
             section(ui, "STEPS", |ui| {
                 editor_toolbar(ui, state);
-                let list_height = (ui.available_height() - 160.0).max(180.0);
+                let list_height = (ui.available_height() - 120.0).max(220.0);
                 ui.allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
                     selection = show_step_list(
                         ui,
@@ -2152,16 +2161,28 @@ fn workspace(
                 editor_selection_actions(ui, state);
             });
             ui.add_space(8.0);
-            egui::CollapsingHeader::new("Library drawer")
-                .default_open(false)
-                .show(ui, |ui| library_pane(ui, state, &filtered_rows));
-            egui::CollapsingHeader::new("Inspector drawer")
-                .default_open(false)
-                .show(ui, |ui| {
-                    if let Some(intent) = inspector::show(ui, &projection, editable) {
-                        handle_inspector_intent(state, intent);
-                    }
-                });
+            {
+                let response = egui::CollapsingHeader::new("Library")
+                    .id_source("macro-library-drawer")
+                    .open(Some(state.library_drawer_open))
+                    .show(ui, |ui| library_pane(ui, state, &filtered_rows));
+                if response.header_response.clicked() {
+                    state.library_drawer_open = !state.library_drawer_open;
+                }
+            }
+            {
+                let response = egui::CollapsingHeader::new("Inspector")
+                    .id_source("macro-inspector-drawer")
+                    .open(Some(state.inspector_drawer_open))
+                    .show(ui, |ui| {
+                        if let Some(intent) = inspector::show(ui, &projection, editable) {
+                            handle_inspector_intent(state, intent);
+                        }
+                    });
+                if response.header_response.clicked() {
+                    state.inspector_drawer_open = !state.inspector_drawer_open;
+                }
+            }
         }
     }
     selection
@@ -2278,6 +2299,7 @@ fn create_starter_draft(state: &mut MacroPageState) {
     state.draft = Some(EditorDraft::new(starter_macro_definition()));
     state.selected_block_id = Some("observe-1".into());
     state.selected_canvas = Some(CanvasSelection::Block("observe-1".into()));
+    state.inspector_drawer_open = true;
     state.editor_feedback = Some("Created an unsaved starter draft for editor authoring.".into());
 }
 
@@ -2314,8 +2336,17 @@ fn show_step_list(
         ui.label("Create or select a macro to inspect its steps.");
         return None;
     };
-    let rows = step_list::project_step_list(draft);
-    step_list::show(ui, &rows, current_selection, active_block)
+    let rows = step_list::project_step_list_collapsed(draft, &state.collapsed_step_containers);
+    match step_list::show(ui, &rows, current_selection, active_block) {
+        Some(step_list::StepListAction::Select(selection)) => Some(selection),
+        Some(step_list::StepListAction::ToggleCollapse(id)) => {
+            if !state.collapsed_step_containers.remove(&id) {
+                state.collapsed_step_containers.insert(id);
+            }
+            None
+        }
+        None => None,
+    }
 }
 
 fn dispatch_editor_command(
@@ -2545,59 +2576,85 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
             }
         });
     }
-    ui.horizontal_wrapped(|ui| {
+    ui.horizontal(|ui| {
         if ui.add_enabled(editable, Button::new("Undo")).clicked() {
             let _ = dispatch_editor_command(state, EditorCommand::Undo);
         }
         if ui.add_enabled(editable, Button::new("Redo")).clicked() {
             let _ = dispatch_editor_command(state, EditorCommand::Redo);
         }
-        if ui.add_enabled(editable, Button::new("+ Note")).clicked() {
-            if let Some(draft) = &state.draft {
-                let block = crate::engine::macro_engine::Block {
-                    id: next_unique_id(draft, "note"),
-                    enabled: true,
-                    kind: crate::engine::macro_engine::BlockKind::Comment {
-                        text: "New step".into(),
-                    },
-                };
-                let target = insertion_target(draft, selected_canvas.as_ref());
-                let _ =
-                    dispatch_editor_command(state, EditorCommand::InsertBlock { target, block });
-            }
-        }
-    });
-    ui.label(
-        RichText::new("Add step")
-            .size(text::SUPPORTING)
-            .color(Color32::from_gray(174)),
-    );
-    ui.horizontal_wrapped(|ui| {
-        for (label, kind) in [
-            ("+ Observe", PaletteKind::Observe),
-            ("+ Action", PaletteKind::Action),
-            ("+ IF", PaletteKind::If),
-            ("+ Repeat", PaletteKind::Repeat),
-            ("+ Continuous", PaletteKind::Continuous),
-            ("+ Watch", PaletteKind::Watch),
-            ("+ Wait", PaletteKind::Wait),
-            ("+ Stop", PaletteKind::Stop),
-        ] {
-            if ui.add_enabled(editable, Button::new(label)).clicked() {
-                let command = state
-                    .draft
-                    .as_ref()
-                    .ok_or_else(|| "No draft is open.".to_string())
-                    .and_then(|draft| {
-                        palette_command_for_selection(draft, selected_canvas.as_ref(), kind)
-                    });
-                match command {
-                    Ok(command) => {
-                        let _ = dispatch_editor_command(state, command);
+        ui.separator();
+        ui.add_enabled_ui(editable, |ui| {
+            ui.menu_button("Add", |ui| {
+                for (label, kind) in [
+                    ("Observe", PaletteKind::Observe),
+                    ("Action", PaletteKind::Action),
+                    ("IF", PaletteKind::If),
+                    ("Repeat", PaletteKind::Repeat),
+                    ("Continuous", PaletteKind::Continuous),
+                    ("Watch", PaletteKind::Watch),
+                    ("Wait", PaletteKind::Wait),
+                    ("Stop", PaletteKind::Stop),
+                ] {
+                    if ui.button(label).clicked() {
+                        let command = state
+                            .draft
+                            .as_ref()
+                            .ok_or_else(|| "No draft is open.".to_string())
+                            .and_then(|draft| {
+                                palette_command_for_selection(
+                                    draft,
+                                    selected_canvas.as_ref(),
+                                    kind,
+                                )
+                            });
+                        match command {
+                            Ok(command) => {
+                                let _ = dispatch_editor_command(state, command);
+                            }
+                            Err(message) => state.editor_feedback = Some(message),
+                        }
+                        ui.close_menu();
                     }
-                    Err(message) => state.editor_feedback = Some(message),
                 }
-            }
+                if ui.button("Note").clicked() {
+                    if let Some(draft) = &state.draft {
+                        let block = crate::engine::macro_engine::Block {
+                            id: next_unique_id(draft, "note"),
+                            enabled: true,
+                            kind: crate::engine::macro_engine::BlockKind::Comment {
+                                text: "New step".into(),
+                            },
+                        };
+                        let target = insertion_target(draft, selected_canvas.as_ref());
+                        let _ = dispatch_editor_command(
+                            state,
+                            EditorCommand::InsertBlock { target, block },
+                        );
+                    }
+                    ui.close_menu();
+                }
+            });
+        });
+        if ui
+            .add(Button::new(if state.library_drawer_open {
+                "Library ▾"
+            } else {
+                "Library"
+            }))
+            .clicked()
+        {
+            state.library_drawer_open = !state.library_drawer_open;
+        }
+        if ui
+            .add(Button::new(if state.inspector_drawer_open {
+                "Inspector ▾"
+            } else {
+                "Inspector"
+            }))
+            .clicked()
+        {
+            state.inspector_drawer_open = !state.inspector_drawer_open;
         }
     });
 }
@@ -2786,6 +2843,61 @@ fn editor_selection_actions(ui: &mut Ui, state: &mut MacroPageState) {
                 },
             );
         }
+        ui.add_enabled_ui(editable, |ui| {
+            ui.menu_button("More", |ui| {
+                if let ContainerPath::IfThen { ref if_id } | ContainerPath::IfElse { ref if_id } =
+                    path.container
+                {
+                    let branch = if matches!(path.container, ContainerPath::IfThen { .. }) {
+                        IfBranch::Then
+                    } else {
+                        IfBranch::Else
+                    };
+                    if ui.button("Transfer THEN / ELSE").clicked() {
+                        let _ = dispatch_editor_command(
+                            state,
+                            EditorCommand::TransferIfBranch {
+                                if_id: if_id.clone(),
+                                branch,
+                                block_id: path.block_id.clone(),
+                                to_index: 0,
+                            },
+                        );
+                        ui.close_menu();
+                    }
+                }
+                let choices = state
+                    .draft
+                    .as_ref()
+                    .and_then(|draft| {
+                        block
+                            .as_ref()
+                            .map(|b| conversion_choices(draft, b, &path))
+                    })
+                    .unwrap_or_default();
+                for (label, preview) in choices {
+                    if ui.button(label).clicked() {
+                        state.pending_conversion = Some(preview);
+                        ui.close_menu();
+                    }
+                }
+                let replacements = state
+                    .draft
+                    .as_ref()
+                    .and_then(|draft| {
+                        block
+                            .as_ref()
+                            .map(|b| replacement_choices(draft, b, &path))
+                    })
+                    .unwrap_or_default();
+                for (label, preview) in replacements {
+                    if ui.button(label).clicked() {
+                        state.pending_conversion = Some(preview);
+                        ui.close_menu();
+                    }
+                }
+            });
+        });
     });
     if let Some(block) = block {
         ui.horizontal_wrapped(|ui| match block.kind {
@@ -2829,29 +2941,6 @@ fn editor_selection_actions(ui: &mut Ui, state: &mut MacroPageState) {
                 }
             }
         });
-        if let ContainerPath::IfThen { ref if_id } | ContainerPath::IfElse { ref if_id } =
-            path.container
-        {
-            let branch = if matches!(path.container, ContainerPath::IfThen { .. }) {
-                IfBranch::Then
-            } else {
-                IfBranch::Else
-            };
-            if ui
-                .add_enabled(editable, Button::new("Transfer THEN / ELSE"))
-                .clicked()
-            {
-                let _ = dispatch_editor_command(
-                    state,
-                    EditorCommand::TransferIfBranch {
-                        if_id: if_id.clone(),
-                        branch,
-                        block_id: path.block_id.clone(),
-                        to_index: 0,
-                    },
-                );
-            }
-        }
         if state
             .pending_conversion
             .as_ref()
@@ -2888,31 +2977,6 @@ fn editor_selection_actions(ui: &mut Ui, state: &mut MacroPageState) {
             } else if cancel {
                 cancel_pending_conversion(state);
             }
-        } else {
-            let choices = state
-                .draft
-                .as_ref()
-                .map(|draft| conversion_choices(draft, &block, &path))
-                .unwrap_or_default();
-            ui.horizontal_wrapped(|ui| {
-                for (label, preview) in choices {
-                    if ui.add_enabled(editable, Button::new(label)).clicked() {
-                        state.pending_conversion = Some(preview);
-                    }
-                }
-            });
-            let replacements = state
-                .draft
-                .as_ref()
-                .map(|draft| replacement_choices(draft, &block, &path))
-                .unwrap_or_default();
-            ui.horizontal_wrapped(|ui| {
-                for (label, preview) in replacements {
-                    if ui.add_enabled(editable, Button::new(label)).clicked() {
-                        state.pending_conversion = Some(preview);
-                    }
-                }
-            });
         }
     }
 }
@@ -4162,13 +4226,18 @@ mod tests {
     }
 
     #[test]
-    fn nine_hundred_pixel_window_keeps_three_compact_panes() {
-        assert_eq!(pane_mode(900.0), PaneMode::ThreePaneCompact);
+    fn nine_hundred_pixel_window_uses_step_drawers() {
+        assert_eq!(pane_mode(900.0), PaneMode::CanvasWithDrawers);
     }
 
     #[test]
     fn narrow_window_keeps_canvas_and_uses_drawers() {
         assert_eq!(pane_mode(719.0), PaneMode::CanvasWithDrawers);
+    }
+
+    #[test]
+    fn wide_window_also_prefers_drawers_for_steps_hero() {
+        assert_eq!(pane_mode(1400.0), PaneMode::CanvasWithDrawers);
     }
 
     #[test]

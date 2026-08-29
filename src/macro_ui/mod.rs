@@ -4463,6 +4463,47 @@ mod tests {
     }
 
     #[test]
+    fn palette_inserts_into_selected_if_then_branch() {
+        let mut draft = fixture();
+        let command = palette_command(&draft, Some("observe-1"), PaletteKind::If).unwrap();
+        let EditorCommand::InsertBlock { block, .. } = &command else {
+            panic!()
+        };
+        let if_id = block.id.clone();
+        apply_editor_command(&mut draft, command).unwrap();
+
+        let then_selection = CanvasSelection::IfThen {
+            if_id: if_id.clone(),
+        };
+        let command =
+            palette_command_for_selection(&draft, Some(&then_selection), PaletteKind::Wait)
+                .unwrap();
+        let EditorCommand::InsertBlock { target, block } = command else {
+            panic!()
+        };
+        assert_eq!(
+            target.container,
+            ContainerPath::IfThen {
+                if_id: if_id.clone()
+            }
+        );
+        apply_editor_command(&mut draft, EditorCommand::InsertBlock { target, block }).unwrap();
+
+        let if_block = draft.blocks.iter().find(|block| block.id == if_id).unwrap();
+        let BlockKind::If {
+            then_body,
+            else_body,
+            ..
+        } = &if_block.kind
+        else {
+            panic!()
+        };
+        assert!(else_body.is_empty());
+        assert_eq!(then_body.len(), 1);
+        assert!(matches!(then_body[0].kind, BlockKind::Wait { .. }));
+    }
+
+    #[test]
     fn real_block_id_with_timeout_suffix_is_not_treated_as_a_timeout_marker() {
         let mut draft = fixture();
         let BlockKind::Observe { condition } = &mut draft.blocks[0].kind else {

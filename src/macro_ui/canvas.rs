@@ -942,4 +942,69 @@ mod tests {
             })
         );
     }
+
+    fn empty_if_hit_setup() -> (CanvasProjection, MacroCanvasLayout) {
+        use crate::engine::macro_engine::BlockKind;
+        let mut definition = crate::macro_ui::test_support::fixture_if();
+        let BlockKind::If {
+            then_body,
+            else_body,
+            ..
+        } = &mut definition.blocks[0].kind
+        else {
+            panic!()
+        };
+        then_body.clear();
+        else_body.clear();
+        let graph = crate::macro_ui::canvas_model::project_canvas(&definition);
+        let mut layout = MacroCanvasLayout::default();
+        layout.node_positions.insert("if-1".into(), [40.0, 20.0]);
+        (graph, layout)
+    }
+
+    fn hit_world(graph: &CanvasProjection, layout: &MacroCanvasLayout, world: Pos2) -> CanvasHit {
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(2000.0, 2000.0));
+        let viewport = CanvasViewport::from_layout(layout, [2000.0, 2000.0]);
+        hit_test(
+            graph,
+            layout,
+            &viewport,
+            canvas,
+            viewport.screen_from_world(canvas, world),
+        )
+    }
+
+    fn empty_if_group_hit(kind: CanvasGroupKind) -> (CanvasProjection, CanvasHit) {
+        let (graph, layout) = empty_if_hit_setup();
+        let group = graph
+            .groups
+            .iter()
+            .find(|group| group.id.kind == kind)
+            .unwrap();
+        let bounds = group_world_rect(&graph, group, &layout).unwrap();
+        let hit = hit_world(&graph, &layout, bounds.center());
+        (graph, hit)
+    }
+
+    #[test]
+    fn empty_if_else_slot_click_selects_else_insert_target() {
+        let (graph, hit) = empty_if_group_hit(CanvasGroupKind::IfElse);
+        assert_eq!(
+            selection_for_hit(&graph, &hit),
+            Some(CanvasSelection::IfElse {
+                if_id: "if-1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn empty_if_then_slot_click_selects_then_insert_target() {
+        let (graph, hit) = empty_if_group_hit(CanvasGroupKind::IfThen);
+        assert_eq!(
+            selection_for_hit(&graph, &hit),
+            Some(CanvasSelection::IfThen {
+                if_id: "if-1".into()
+            })
+        );
+    }
 }

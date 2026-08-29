@@ -33,9 +33,9 @@ use crate::ui_state::{MacroCanvasLayout, UiStateStore};
 use canvas_model::{CanvasSelection, project_canvas};
 use history::HistoryError;
 
+use canvas_layout::reconcile_layout;
 #[cfg(test)]
 use canvas_layout::{CanvasLayoutEngine, CanvasLayoutError, LayoutEdit, fit_view, graph_bounds};
-use canvas_layout::reconcile_layout;
 use history::{EditDomain, UiEditHistory};
 use monitor::{
     MonitorProjection, project_last_completion,
@@ -180,6 +180,49 @@ pub enum MacroRunIntent {
     RunOnce,
     ContinuousObservation,
     ContinuousLive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTargetFacts {
+    pub title: String,
+    pub is_foreground: bool,
+    pub is_visible: bool,
+    pub is_minimized: bool,
+    pub client_width: u32,
+    pub client_height: u32,
+    pub dpi: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LiveTargetStatus {
+    #[default]
+    Unbound,
+    Bound(LiveTargetFacts),
+    Lost {
+        title: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunHistoryRow {
+    pub run_id: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusChrome {
+    window: String,
+    foreground: String,
+    display: String,
+    geometry: String,
+}
+
+pub fn run_history_feedback(rows: &[RunHistoryRow]) -> String {
+    match rows.len() {
+        0 => "No saved run history.".to_string(),
+        1 => "1 saved run history entry.".to_string(),
+        count => format!("{count} saved run history entries."),
+    }
 }
 
 /// Public composition vocabulary. The native shell translates these bounded UI-only values into
@@ -328,6 +371,8 @@ pub struct MacroPageState {
     pub ui_edit_history: UiEditHistory,
     canvas_layout_dirty: bool,
     canvas_layout_hydrated: bool,
+    pub live_target: LiveTargetStatus,
+    pub run_history: Option<Vec<RunHistoryRow>>,
     intents: MacroIntentQueue,
     pub selected_block_id: Option<String>,
     selected_canvas: Option<CanvasSelection>,
@@ -370,6 +415,8 @@ impl Default for MacroPageState {
             ui_edit_history: UiEditHistory::default(),
             canvas_layout_dirty: false,
             canvas_layout_hydrated: false,
+            live_target: LiveTargetStatus::Unbound,
+            run_history: None,
             intents: MacroIntentQueue::with_capacity(MacroIntentQueue::DEFAULT_CAPACITY),
             selected_block_id: None,
             selected_canvas: None,
@@ -542,6 +589,30 @@ impl MacroPageState {
         *store.macro_layout_mut(&macro_id) = self.canvas_layout.clone();
         store.mark_dirty();
         self.canvas_layout_dirty = false;
+    }
+
+    pub fn open_run_history(&mut self, rows: Vec<RunHistoryRow>) {
+        self.run_history = Some(rows);
+    }
+
+    pub(crate) fn record_side_pane_widths(&mut self, library: (f32, f32), inspector: (f32, f32)) {
+        let mut changed = false;
+        if library.1 > 50.0 && (library.1 - library.0).abs() > 4.0 {
+            self.canvas_layout.library_width = library.1;
+            changed = true;
+        }
+        if inspector.1 > 50.0 && (inspector.1 - inspector.0).abs() > 4.0 {
+            self.canvas_layout.inspector_width = inspector.1;
+            changed = true;
+        }
+        self.canvas_layout_dirty |= changed;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pane_widths(&mut self, library_width: f32, inspector_width: f32) {
+        self.canvas_layout.library_width = library_width;
+        self.canvas_layout.inspector_width = inspector_width;
+        self.canvas_layout_dirty = true;
     }
 
     #[cfg(test)]
@@ -1246,8 +1317,8 @@ pub fn run_control_availability(state: &MacroPageState) -> RunControlAvailabilit
 pub struct MacroPage;
 
 impl MacroPage {
-    pub const BOTTOM_MIN_HEIGHT: f32 = 184.0;
-    pub const BOTTOM_DEFAULT_HEIGHT: f32 = 276.0;
+    pub const BOTTOM_MIN_HEIGHT: f32 = 168.0;
+    pub const BOTTOM_DEFAULT_HEIGHT: f32 = 204.0;
     pub const BOTTOM_MAX_HEIGHT: f32 = 520.0;
 
     pub fn show(ui: &mut Ui, state: &mut MacroPageState) {
@@ -1289,8 +1360,7 @@ impl MacroPage {
                 select_canvas(state, CanvasSelection::Block(target));
             }
             ui.add_space(8.0);
-            if let Some(target) = workspace(ui, state, &library_rows, &monitor, &problems)
-            {
+            if let Some(target) = workspace(ui, state, &library_rows, &monitor, &problems) {
                 select_canvas(state, target);
             }
         });
@@ -1557,6 +1627,7 @@ fn status_strip(
         .inner_margin(egui::Margin::same(11.0))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                let chrome = status_chrome(state);
                 status_fact(
                     ui,
                     "TARGET",
@@ -1567,46 +1638,15 @@ fn status_strip(
                         .filter(|title| !title.is_empty())
                         .unwrap_or("No target selected"),
                 );
-                status_fact(ui, "WINDOW", "Not connected");
-                status_fact(ui, "FOREGROUND", "Unknown");
-                status_fact(
-                    ui,
-                    "DISPLAY",
-                    state
-                        .draft
-                        .as_ref()
-                        .map(|definition| {
-                            format!(
-                                "{}x{} | {} DPI",
-                                definition.target.captured_client_width,
-                                definition.target.captured_client_height,
-                                definition.target.captured_dpi
-                            )
-                        })
-                        .as_deref()
-                        .unwrap_or("--"),
-                );
-                status_fact(ui, "GEOMETRY", "Snapshot only");
+                status_fact(ui, "WINDOW", chrome.window.as_str());
+                status_fact(ui, "FOREGROUND", chrome.foreground.as_str());
+                status_fact(ui, "DISPLAY", chrome.display.as_str());
+                status_fact(ui, "GEOMETRY", chrome.geometry.as_str());
                 status_fact(ui, "REVISION", revision_summary(state, monitor).as_str());
                 status_fact(ui, "VALIDATION", validation_summary(state, problems));
             });
             ui.add_space(9.0);
             ui.horizontal_wrapped(|ui| {
-                if state.draft.is_none()
-                    && ui
-                        .add_enabled(
-                            state.wizard.is_none() && state.active_wizard_request.is_none(),
-                            Button::new("Create starter draft"),
-                        )
-                        .clicked()
-                {
-                    state.begin_draft_session();
-                    state.draft = Some(EditorDraft::new(starter_macro_definition()));
-                    state.selected_block_id = Some("observe-1".into());
-                    state.selected_canvas = Some(CanvasSelection::Block("observe-1".into()));
-                    state.editor_feedback =
-                        Some("Created an unsaved starter draft for editor authoring.".into());
-                }
                 let wizard_pending = state.active_wizard_request.is_some();
                 if state.wizard.is_none()
                     && ui
@@ -1655,12 +1695,58 @@ fn status_strip(
                 if ui.add_enabled(can_save, Button::new("Save")).clicked() {
                     state.enqueue_intent(MacroIntent::Save);
                 }
+                let history_open = state.run_history.is_some();
+                if ui
+                    .add(Button::new(if history_open {
+                        "Close History"
+                    } else {
+                        "History"
+                    }))
+                    .clicked()
+                {
+                    if history_open {
+                        state.run_history = None;
+                    } else {
+                        state.enqueue_intent(MacroIntent::ShowHistory);
+                    }
+                }
                 if let Some(target) = inspector::problem_navigation_target(problems, 0) {
                     if ui.small_button("Open first problem").clicked() {
                         navigate = Some(target);
                     }
                 }
             });
+            if let Some(rows) = state.run_history.clone() {
+                ui.add_space(8.0);
+                if rows.is_empty() {
+                    ui.label(
+                        RichText::new("No saved run history.")
+                            .size(text::SUPPORTING)
+                            .color(Color32::from_gray(176)),
+                    );
+                } else {
+                    for row in rows {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(row.run_id.as_str())
+                                    .monospace()
+                                    .size(text::META)
+                                    .color(Color32::from_gray(202)),
+                            );
+                            ui.label(
+                                RichText::new(format!("{} bytes", row.bytes))
+                                    .size(text::META)
+                                    .color(Color32::from_gray(150)),
+                            );
+                            if ui.small_button("Delete").clicked() {
+                                state.enqueue_intent(MacroIntent::DeleteHistory {
+                                    run_id: row.run_id,
+                                });
+                            }
+                        });
+                    }
+                }
+            }
         });
     navigate
 }
@@ -1885,6 +1971,76 @@ fn status_fact(ui: &mut Ui, label: &str, value: &str) {
     ui.add_space(10.0);
 }
 
+fn snapshot_display(state: &MacroPageState) -> Option<String> {
+    state.draft.as_ref().map(|definition| {
+        format!(
+            "{}x{} | {} DPI",
+            definition.target.captured_client_width,
+            definition.target.captured_client_height,
+            definition.target.captured_dpi
+        )
+    })
+}
+
+fn status_chrome(state: &MacroPageState) -> StatusChrome {
+    let snapshot = snapshot_display(state);
+    match &state.live_target {
+        LiveTargetStatus::Unbound => StatusChrome {
+            window: "Not connected".into(),
+            foreground: "Not bound".into(),
+            display: snapshot.clone().unwrap_or_else(|| "--".into()),
+            geometry: if snapshot.is_some() {
+                "Snapshot only".into()
+            } else {
+                "--".into()
+            },
+        },
+        LiveTargetStatus::Bound(facts) => {
+            let foreground = if !facts.is_visible {
+                "Hidden"
+            } else if facts.is_minimized {
+                "Minimized"
+            } else if facts.is_foreground {
+                "Foreground"
+            } else {
+                "Background"
+            };
+            let title = if facts.title.is_empty() {
+                "Connected".to_string()
+            } else {
+                facts.title.clone()
+            };
+            StatusChrome {
+                window: title,
+                foreground: foreground.into(),
+                display: format!(
+                    "{}x{} | {} DPI",
+                    facts.client_width, facts.client_height, facts.dpi
+                ),
+                geometry: format!("Live {}x{}", facts.client_width, facts.client_height),
+            }
+        }
+        LiveTargetStatus::Lost { title } => StatusChrome {
+            window: if title.is_empty() {
+                "Lost".into()
+            } else {
+                format!("Lost ({title})")
+            },
+            foreground: "Unknown".into(),
+            display: snapshot.unwrap_or_else(|| "--".into()),
+            geometry: "Snapshot only".into(),
+        },
+    }
+}
+
+fn pane_widths_for_mode(layout: &MacroCanvasLayout, compact: bool) -> (f32, f32) {
+    let max = if compact { 230.0 } else { 340.0 };
+    (
+        layout.sanitized_library_width().clamp(150.0, max),
+        layout.sanitized_inspector_width().clamp(170.0, max),
+    )
+}
+
 fn revision_summary(state: &MacroPageState, monitor: &MonitorProjection) -> String {
     let draft = state
         .draft
@@ -1934,11 +2090,12 @@ fn workspace(
     match pane_mode(ui.available_width()) {
         PaneMode::ThreePane | PaneMode::ThreePaneCompact => {
             let compact = pane_mode(ui.available_width()) == PaneMode::ThreePaneCompact;
-            let side_width = if compact { 175.0 } else { 250.0 };
+            let (library_width, inspector_width) =
+                pane_widths_for_mode(&state.canvas_layout, compact);
             let side_max = if compact { 230.0 } else { 340.0 };
-            egui::SidePanel::left("macro-library-pane")
+            let library_panel = egui::SidePanel::left("macro-library-pane")
                 .resizable(true)
-                .default_width(side_width)
+                .default_width(library_width)
                 .min_width(150.0)
                 .max_width(side_max)
                 .show_inside(ui, |ui| {
@@ -1946,9 +2103,9 @@ fn workspace(
                         library_pane(ui, state, &filtered_rows);
                     });
                 });
-            egui::SidePanel::right("macro-inspector-pane")
+            let inspector_panel = egui::SidePanel::right("macro-inspector-pane")
                 .resizable(true)
-                .default_width(side_width)
+                .default_width(inspector_width)
                 .min_width(170.0)
                 .max_width(side_max)
                 .show_inside(ui, |ui| {
@@ -1958,23 +2115,24 @@ fn workspace(
                         }
                     });
                 });
+            state.record_side_pane_widths(
+                (library_width, library_panel.response.rect.width()),
+                (inspector_width, inspector_panel.response.rect.width()),
+            );
             egui::CentralPanel::default()
                 .frame(Frame::none())
                 .show_inside(ui, |ui| {
                     section(ui, "STEPS", |ui| {
                         editor_toolbar(ui, state);
                         let list_height = (ui.available_height() - 160.0).max(180.0);
-                        ui.allocate_ui(
-                            egui::vec2(ui.available_width(), list_height),
-                            |ui| {
-                                selection = show_step_list(
-                                    ui,
-                                    state,
-                                    monitor.active_block.as_deref(),
-                                    selected_canvas.as_ref(),
-                                );
-                            },
-                        );
+                        ui.allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
+                            selection = show_step_list(
+                                ui,
+                                state,
+                                monitor.active_block.as_deref(),
+                                selected_canvas.as_ref(),
+                            );
+                        });
                         editor_selection_actions(ui, state);
                     });
                 });
@@ -2404,7 +2562,8 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                     },
                 };
                 let target = insertion_target(draft, selected_canvas.as_ref());
-                let _ = dispatch_editor_command(state, EditorCommand::InsertBlock { target, block });
+                let _ =
+                    dispatch_editor_command(state, EditorCommand::InsertBlock { target, block });
             }
         }
     });
@@ -4052,6 +4211,82 @@ mod tests {
     fn bottom_panel_has_a_resizable_height_range_for_compact_layouts() {
         assert!(MacroPage::BOTTOM_MIN_HEIGHT < MacroPage::BOTTOM_DEFAULT_HEIGHT);
         assert!(MacroPage::BOTTOM_DEFAULT_HEIGHT < MacroPage::BOTTOM_MAX_HEIGHT);
+        assert!(MacroPage::BOTTOM_DEFAULT_HEIGHT <= 220.0);
+    }
+
+    #[test]
+    fn unbound_status_does_not_claim_a_live_window() {
+        let chrome = status_chrome(&MacroPageState::default());
+        assert_eq!(chrome.window, "Not connected");
+        assert_eq!(chrome.foreground, "Not bound");
+        assert_eq!(chrome.display, "--");
+        assert_eq!(chrome.geometry, "--");
+    }
+
+    #[test]
+    fn unbound_draft_keeps_snapshot_geometry() {
+        let state = MacroPageState {
+            draft: Some(fixture()),
+            ..MacroPageState::default()
+        };
+        let chrome = status_chrome(&state);
+        assert_eq!(chrome.window, "Not connected");
+        assert_eq!(chrome.foreground, "Not bound");
+        assert_eq!(chrome.display, "1280x720 | 96 DPI");
+        assert_eq!(chrome.geometry, "Snapshot only");
+    }
+
+    #[test]
+    fn bound_status_uses_live_capture_facts() {
+        let mut state = MacroPageState::default();
+        state.live_target = LiveTargetStatus::Bound(LiveTargetFacts {
+            title: "Diablo IV".into(),
+            is_foreground: true,
+            is_visible: true,
+            is_minimized: false,
+            client_width: 1920,
+            client_height: 1080,
+            dpi: 144,
+        });
+        let chrome = status_chrome(&state);
+        assert_eq!(chrome.window, "Diablo IV");
+        assert_eq!(chrome.foreground, "Foreground");
+        assert_eq!(chrome.display, "1920x1080 | 144 DPI");
+        assert_eq!(chrome.geometry, "Live 1920x1080");
+    }
+
+    #[test]
+    fn lost_binding_does_not_pretend_connected() {
+        let mut state = MacroPageState::default();
+        state.live_target = LiveTargetStatus::Lost {
+            title: "Diablo IV".into(),
+        };
+        let chrome = status_chrome(&state);
+        assert_eq!(chrome.window, "Lost (Diablo IV)");
+        assert_eq!(chrome.foreground, "Unknown");
+        assert_eq!(chrome.geometry, "Snapshot only");
+    }
+
+    #[test]
+    fn empty_run_history_stays_honest() {
+        assert_eq!(run_history_feedback(&[]), "No saved run history.");
+        let mut state = MacroPageState::default();
+        state.open_run_history(Vec::new());
+        assert_eq!(state.run_history.as_ref().map(Vec::len), Some(0));
+        state.enqueue_intent(MacroIntent::ShowHistory);
+        assert!(matches!(
+            state.take_intent(),
+            Some(MacroIntent::ShowHistory)
+        ));
+    }
+
+    #[test]
+    fn persisted_pane_widths_follow_the_list_mode_range() {
+        let mut layout = MacroCanvasLayout::default();
+        layout.library_width = 260.0;
+        layout.inspector_width = 320.0;
+        assert_eq!(pane_widths_for_mode(&layout, false), (260.0, 320.0));
+        assert_eq!(pane_widths_for_mode(&layout, true), (230.0, 230.0));
     }
 
     #[test]

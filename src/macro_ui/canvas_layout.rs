@@ -28,10 +28,6 @@ pub enum LayoutEdit {
         before: Option<[f32; 2]>,
         after: Option<[f32; 2]>,
     },
-    Layout {
-        before: MacroCanvasLayout,
-        after: MacroCanvasLayout,
-    },
 }
 
 impl LayoutEdit {
@@ -57,16 +53,6 @@ impl LayoutEdit {
                     layout.node_positions.remove(id);
                 }
             },
-            Self::Layout {
-                before: previous,
-                after: next,
-            } => {
-                *layout = if before {
-                    previous.clone()
-                } else {
-                    next.clone()
-                }
-            }
         }
     }
 }

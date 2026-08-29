@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod acceptance_tests;
+#[cfg(test)]
 mod canvas;
 mod canvas_layout;
 mod canvas_model;
@@ -8,6 +9,7 @@ mod history;
 mod inspector;
 mod library;
 mod monitor;
+mod step_list;
 #[cfg(test)]
 mod test_support;
 mod wizard;
@@ -28,12 +30,12 @@ use crate::engine::macro_engine::{
 use crate::ui_theme::text;
 
 use crate::ui_state::{MacroCanvasLayout, UiStateStore};
-use canvas_model::{CanvasProjection, CanvasSelection, insertion_target_for_port, project_canvas};
+use canvas_model::{CanvasSelection, project_canvas};
 use history::HistoryError;
 
 #[cfg(test)]
-use canvas_layout::{CanvasLayoutEngine, CanvasLayoutError};
-use canvas_layout::{LayoutEdit, auto_arrange, fit_view, graph_bounds, reconcile_layout};
+use canvas_layout::{CanvasLayoutEngine, CanvasLayoutError, LayoutEdit, fit_view, graph_bounds};
+use canvas_layout::reconcile_layout;
 use history::{EditDomain, UiEditHistory};
 use monitor::{
     MonitorProjection, project_last_completion,
@@ -329,7 +331,6 @@ pub struct MacroPageState {
     intents: MacroIntentQueue,
     pub selected_block_id: Option<String>,
     selected_canvas: Option<CanvasSelection>,
-    pending_canvas_port: Option<canvas_model::OutputPort>,
     pub pending_inspector_intent: Option<inspector::InspectorIntent>,
     pub editor_feedback: Option<String>,
     pending_conversion: Option<PendingConversion>,
@@ -372,7 +373,6 @@ impl Default for MacroPageState {
             intents: MacroIntentQueue::with_capacity(MacroIntentQueue::DEFAULT_CAPACITY),
             selected_block_id: None,
             selected_canvas: None,
-            pending_canvas_port: None,
             pending_inspector_intent: None,
             editor_feedback: None,
             pending_conversion: None,
@@ -558,49 +558,16 @@ impl MacroPageState {
             return Err(CanvasLayoutError::MissingNode(block_id.into()));
         }
         let edit = CanvasLayoutEngine::move_node(&mut self.canvas_layout, block_id, position)?;
-        if let LayoutEdit::NodePosition { before, after, .. } = &edit {
-            if before == after {
-                return Ok(());
-            }
+        let LayoutEdit::NodePosition { before, after, .. } = &edit;
+        if before == after {
+            return Ok(());
         }
         self.ui_edit_history.record_layout(edit);
         self.canvas_layout_dirty = true;
         Ok(())
     }
 
-    pub fn auto_arrange_canvas(&mut self) {
-        let Some(draft) = &self.draft else { return };
-        let mut next = auto_arrange(&project_canvas(draft));
-        let before = self.canvas_layout.clone();
-        next.pan = before.pan;
-        next.zoom = before.zoom;
-        next.library_width = before.library_width;
-        next.inspector_width = before.inspector_width;
-        if before == next {
-            return;
-        }
-        self.canvas_layout = next.clone();
-        self.ui_edit_history.record_layout(LayoutEdit::Layout {
-            before,
-            after: next,
-        });
-        self.canvas_layout_dirty = true;
-    }
-
-    pub fn reset_canvas_zoom(&mut self) {
-        self.canvas_layout.zoom = 1.0;
-        self.canvas_layout_dirty = true;
-    }
-
-    fn record_canvas_layout_edit(&mut self, edit: LayoutEdit) {
-        self.ui_edit_history.record_layout(edit);
-        self.canvas_layout_dirty = true;
-    }
-
-    fn mark_canvas_layout_changed(&mut self) {
-        self.canvas_layout_dirty = true;
-    }
-
+    #[cfg(test)]
     pub fn fit_canvas_view(&mut self, canvas_size: [f32; 2]) {
         let Some(draft) = &self.draft else { return };
         let viewport = fit_view(
@@ -1303,15 +1270,6 @@ impl MacroPage {
             .unwrap_or_default();
         let library_rows =
             project_library_rows(state, &monitor, &problems, last_completion.as_ref());
-        let canvas = state
-            .draft
-            .as_ref()
-            .map(|definition| project_canvas(definition))
-            .unwrap_or(CanvasProjection {
-                nodes: Vec::new(),
-                groups: Vec::new(),
-                edges: Vec::new(),
-            });
 
         ui.set_width(ui.available_width());
         ui.vertical(|ui| {
@@ -1331,7 +1289,7 @@ impl MacroPage {
                 select_canvas(state, CanvasSelection::Block(target));
             }
             ui.add_space(8.0);
-            if let Some(target) = workspace(ui, state, &library_rows, &canvas, &monitor, &problems)
+            if let Some(target) = workspace(ui, state, &library_rows, &monitor, &problems)
             {
                 select_canvas(state, target);
             }
@@ -1948,7 +1906,6 @@ fn workspace(
     ui: &mut Ui,
     state: &mut MacroPageState,
     library_rows: &[MacroLibraryRow],
-    canvas: &CanvasProjection,
     monitor: &MonitorProjection,
     problems: &[ValidationProblem],
 ) -> Option<CanvasSelection> {
@@ -2004,28 +1961,37 @@ fn workspace(
             egui::CentralPanel::default()
                 .frame(Frame::none())
                 .show_inside(ui, |ui| {
-                    section(ui, "EVENT CANVAS", |ui| {
+                    section(ui, "STEPS", |ui| {
                         editor_toolbar(ui, state);
-                        selection = show_interactive_canvas(
-                            ui,
-                            state,
-                            canvas,
-                            monitor.active_block.as_deref(),
-                            selected_canvas.as_ref(),
+                        let list_height = (ui.available_height() - 160.0).max(180.0);
+                        ui.allocate_ui(
+                            egui::vec2(ui.available_width(), list_height),
+                            |ui| {
+                                selection = show_step_list(
+                                    ui,
+                                    state,
+                                    monitor.active_block.as_deref(),
+                                    selected_canvas.as_ref(),
+                                );
+                            },
                         );
+                        editor_selection_actions(ui, state);
                     });
                 });
         }
         PaneMode::CanvasWithDrawers => {
-            section(ui, "EVENT CANVAS", |ui| {
+            section(ui, "STEPS", |ui| {
                 editor_toolbar(ui, state);
-                selection = show_interactive_canvas(
-                    ui,
-                    state,
-                    canvas,
-                    monitor.active_block.as_deref(),
-                    selected_canvas.as_ref(),
-                );
+                let list_height = (ui.available_height() - 160.0).max(180.0);
+                ui.allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
+                    selection = show_step_list(
+                        ui,
+                        state,
+                        monitor.active_block.as_deref(),
+                        selected_canvas.as_ref(),
+                    );
+                });
+                editor_selection_actions(ui, state);
             });
             ui.add_space(8.0);
             egui::CollapsingHeader::new("Library drawer")
@@ -2157,29 +2123,26 @@ fn create_starter_draft(state: &mut MacroPageState) {
     state.editor_feedback = Some("Created an unsaved starter draft for editor authoring.".into());
 }
 
-fn show_interactive_canvas(
+fn show_step_list(
     ui: &mut Ui,
     state: &mut MacroPageState,
-    canvas: &CanvasProjection,
     active_block: Option<&str>,
     current_selection: Option<&CanvasSelection>,
 ) -> Option<CanvasSelection> {
-    if canvas.nodes.is_empty() {
-        ui.label("Create or select a macro to inspect its canonical blocks.");
+    if state.draft.is_none() {
+        ui.label("Create or select a macro to inspect its steps.");
         return None;
     }
     let shortcuts = !ui.ctx().wants_keyboard_input()
         && ui.input(|input| {
             (input.modifiers.command && input.key_pressed(egui::Key::Z))
                 || (input.modifiers.command && input.key_pressed(egui::Key::Y))
-                || input.key_pressed(egui::Key::F)
         });
     if shortcuts {
         let input = ui.input(|input| {
             (
                 input.modifiers.command && input.key_pressed(egui::Key::Z),
                 input.modifiers.command && input.key_pressed(egui::Key::Y),
-                input.key_pressed(egui::Key::F),
             )
         });
         if input.0 {
@@ -2188,48 +2151,13 @@ fn show_interactive_canvas(
         if input.1 {
             let _ = dispatch_editor_command(state, EditorCommand::Redo);
         }
-        if input.2 {
-            state.fit_canvas_view([ui.available_width().max(1.0), canvas::CANVAS_HEIGHT]);
-        }
     }
-    let editable = state.editor_mutations_allowed();
-    let response = canvas::show(
-        ui,
-        canvas,
-        &mut state.canvas_layout,
-        current_selection,
-        active_block,
-        state.draft.as_ref(),
-        editable,
-    );
-    apply_canvas_response(state, response)
-}
-
-fn apply_canvas_response(
-    state: &mut MacroPageState,
-    response: canvas::CanvasResponse,
-) -> Option<CanvasSelection> {
-    if response.layout_changed {
-        state.mark_canvas_layout_changed();
-    }
-    if let Some(edit) = response.layout_edit {
-        state.record_canvas_layout_edit(edit);
-    }
-    if let Some(command) = response.editor_command {
-        let _ = dispatch_editor_command(state, command);
-    }
-    match response.action {
-        Some(canvas::CanvasAction::RejectedConnection(message)) => {
-            state.editor_feedback = Some(format!("Connection rejected: {message}"));
-        }
-        Some(canvas::CanvasAction::OpenAddStep { source, .. }) => {
-            state.pending_canvas_port = Some(source);
-            state.editor_feedback =
-                Some("Choose a block below to add it at the connector drop location.".into());
-        }
-        _ => {}
-    }
-    response.selection
+    let Some(draft) = state.draft.as_ref() else {
+        ui.label("Create or select a macro to inspect its steps.");
+        return None;
+    };
+    let rows = step_list::project_step_list(draft);
+    step_list::show(ui, &rows, current_selection, active_block)
 }
 
 fn dispatch_editor_command(
@@ -2432,9 +2360,7 @@ fn inspector_editor_command(
 
 fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
     let editable = state.editor_mutations_allowed();
-    let selected = state.selected_block_id.clone();
     let selected_canvas = current_canvas_selection(state);
-    let pending_canvas_port = state.pending_canvas_port.clone();
     if let Some(feedback) = &state.editor_feedback {
         ui.label(
             RichText::new(feedback)
@@ -2468,18 +2394,6 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
         if ui.add_enabled(editable, Button::new("Redo")).clicked() {
             let _ = dispatch_editor_command(state, EditorCommand::Redo);
         }
-        if ui
-            .add_enabled(editable, Button::new("Auto arrange"))
-            .clicked()
-        {
-            state.auto_arrange_canvas();
-        }
-        if ui.button("Fit view").clicked() {
-            state.fit_canvas_view([ui.available_width().max(1.0), 600.0]);
-        }
-        if ui.button("Reset zoom").clicked() {
-            state.reset_canvas_zoom();
-        }
         if ui.add_enabled(editable, Button::new("+ Note")).clicked() {
             if let Some(draft) = &state.draft {
                 let block = crate::engine::macro_engine::Block {
@@ -2489,29 +2403,16 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                         text: "New step".into(),
                     },
                 };
-                let target = if let Some(port) = pending_canvas_port.as_ref() {
-                    match insertion_target_for_port(&draft.definition, port) {
-                        Ok(target) => target,
-                        Err(error) => {
-                            state.editor_feedback =
-                                Some(format!("Connection rejected: {}", error.message()));
-                            return;
-                        }
-                    }
-                } else {
-                    InsertionTarget {
-                        container: ContainerPath::Root,
-                        index: draft.blocks.len(),
-                    }
-                };
-                if dispatch_editor_command(state, EditorCommand::InsertBlock { target, block })
-                    .is_ok()
-                {
-                    state.pending_canvas_port = None;
-                }
+                let target = insertion_target(draft, selected_canvas.as_ref());
+                let _ = dispatch_editor_command(state, EditorCommand::InsertBlock { target, block });
             }
         }
     });
+    ui.label(
+        RichText::new("Add step")
+            .size(text::SUPPORTING)
+            .color(Color32::from_gray(174)),
+    );
     ui.horizontal_wrapped(|ui| {
         for (label, kind) in [
             ("+ Observe", PaletteKind::Observe),
@@ -2529,26 +2430,24 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
                     .as_ref()
                     .ok_or_else(|| "No draft is open.".to_string())
                     .and_then(|draft| {
-                        let command =
-                            palette_command_for_selection(draft, selected_canvas.as_ref(), kind)?;
-                        if let Some(port) = pending_canvas_port.as_ref() {
-                            retarget_insert_command(draft, port, command)
-                        } else {
-                            Ok(command)
-                        }
+                        palette_command_for_selection(draft, selected_canvas.as_ref(), kind)
                     });
                 match command {
                     Ok(command) => {
-                        if dispatch_editor_command(state, command).is_ok() {
-                            state.pending_canvas_port = None;
-                        }
+                        let _ = dispatch_editor_command(state, command);
                     }
                     Err(message) => state.editor_feedback = Some(message),
                 }
             }
         }
     });
-    let Some(selected) = selected else { return };
+}
+
+fn editor_selection_actions(ui: &mut Ui, state: &mut MacroPageState) {
+    let editable = state.editor_mutations_allowed();
+    let Some(selected) = state.selected_block_id.clone() else {
+        return;
+    };
     if let Some((group_id, index, len, enabled)) = state
         .draft
         .as_ref()
@@ -2857,19 +2756,6 @@ fn editor_toolbar(ui: &mut Ui, state: &mut MacroPageState) {
             });
         }
     }
-}
-
-fn retarget_insert_command(
-    draft: &EditorDraft,
-    port: &canvas_model::OutputPort,
-    command: EditorCommand,
-) -> Result<EditorCommand, String> {
-    let EditorCommand::InsertBlock { block, .. } = command else {
-        return Err("Canvas Add step can only insert a new canonical block.".into());
-    };
-    let target = insertion_target_for_port(&draft.definition, port)
-        .map_err(|error| format!("Connection rejected: {}", error.message()))?;
-    Ok(EditorCommand::InsertBlock { target, block })
 }
 
 fn conversion_preview_ui(ui: &mut Ui, pending: &mut PendingConversion) {

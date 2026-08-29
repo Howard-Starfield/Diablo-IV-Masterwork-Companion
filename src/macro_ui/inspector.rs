@@ -9,7 +9,7 @@ use crate::engine::macro_engine::{
 };
 use crate::ui_theme::text;
 
-const EMPTY_INSPECTOR_PROMPT: &str = "Select a canonical canvas block.";
+const EMPTY_INSPECTOR_PROMPT: &str = "Select a step.";
 pub const IF_BRANCH_STATUS: &str =
     "If true runs THEN. If false runs ELSE. Then continues after the If.";
 
@@ -1692,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_inspector_prompt_refers_to_a_canvas_block() {
-        assert_eq!(EMPTY_INSPECTOR_PROMPT, "Select a canonical canvas block.");
+    fn empty_inspector_prompt_refers_to_a_step() {
+        assert_eq!(EMPTY_INSPECTOR_PROMPT, "Select a step.");
     }
 }

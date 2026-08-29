@@ -47,9 +47,10 @@ use crate::engine::{
 };
 use crate::macro_ui::{
     AuthoringSessionId, EditorAuthoringKind, EditorAuthoringOutcome, EditorAuthoringRequest,
-    EditorAuthoringResult, EditorDraft, ImagePackageReverificationStage, MacroIntent, MacroPage,
-    MacroPageState, RunDefinitionSnapshot, SavedMacroIdentity, WizardAuthoringKind,
-    WizardAuthoringOutcome, WizardAuthoringRequest, WizardAuthoringResult, WizardDetector,
+    EditorAuthoringResult, EditorDraft, ImagePackageReverificationStage, LiveTargetFacts,
+    LiveTargetStatus, MacroIntent, MacroPage, MacroPageState, RunDefinitionSnapshot, RunHistoryRow,
+    SavedMacroIdentity, WizardAuthoringKind, WizardAuthoringOutcome, WizardAuthoringRequest,
+    WizardAuthoringResult, WizardDetector, run_history_feedback,
 };
 use crate::ui_state::UiStateStore;
 use eframe::{
@@ -744,6 +745,31 @@ impl NativeApp {
         self.macro_state.library_rows = rows;
     }
 
+    fn refresh_run_history(&mut self) {
+        let result = match self.macro_store.as_ref() {
+            None => Ok(Vec::new()),
+            Some(store) => store.list_run_history().map(|history| {
+                history
+                    .into_iter()
+                    .map(|entry| RunHistoryRow {
+                        run_id: entry.run_id,
+                        bytes: entry.bytes,
+                    })
+                    .collect()
+            }),
+        };
+        match result {
+            Ok(rows) => {
+                self.macro_state.editor_feedback = Some(run_history_feedback(&rows));
+                self.macro_state.open_run_history(rows);
+            }
+            Err(error) => {
+                self.macro_state.editor_feedback = Some(format!("History unavailable: {error}"));
+                self.macro_state.open_run_history(Vec::new());
+            }
+        }
+    }
+
     fn select_saved_macro(&mut self, macro_id: String) {
         if self.macro_controller.is_some() {
             self.macro_state.editor_feedback =
@@ -1294,28 +1320,23 @@ impl NativeApp {
                     }
                 }
                 MacroIntent::ShowHistory => {
-                    if let Some(store) = self.macro_store.as_ref() {
-                        match store.list_run_history() {
-                            Ok(history) => {
-                                self.macro_state.editor_feedback = Some(format!(
-                                    "{} saved run history entr{}.",
-                                    history.len(),
-                                    if history.len() == 1 { "y" } else { "ies" }
-                                ))
-                            }
-                            Err(error) => {
-                                self.macro_state.editor_feedback =
-                                    Some(format!("History unavailable: {error}"))
-                            }
-                        }
-                    }
+                    self.refresh_run_history();
                 }
                 MacroIntent::DeleteHistory { run_id } => {
-                    if let Some(store) = self.macro_store.as_ref() {
-                        if let Err(error) = store.delete_run_history(&run_id) {
+                    let delete_result = self
+                        .macro_store
+                        .as_ref()
+                        .map(|store| store.delete_run_history(&run_id));
+                    match delete_result {
+                        None => {}
+                        Some(Err(error)) => {
                             self.macro_state.editor_feedback =
                                 Some(format!("History delete failed: {error}"));
                         }
+                        Some(Ok(())) if self.macro_state.run_history.is_some() => {
+                            self.refresh_run_history();
+                        }
+                        Some(Ok(())) => {}
                     }
                 }
                 MacroIntent::Export {
@@ -2080,6 +2101,11 @@ impl App for NativeApp {
                         match self.page {
                             AppPage::Enchant => self.content(ui, ctx),
                             AppPage::Macro => {
+                                self.macro_state.live_target =
+                                    project_live_target(active_capture_binding(
+                                        &self.macro_state,
+                                        &self.macro_authoring_targets,
+                                    ));
                                 self.macro_state.hydrate_canvas_layout(&self.ui_state_store);
                                 MacroPage::show(ui, &mut self.macro_state);
                                 self.macro_state
@@ -2834,6 +2860,39 @@ fn prune_authoring_targets<T>(
     active_sessions: &[AuthoringSessionId],
 ) {
     targets.retain(|session, _| active_sessions.contains(session));
+}
+
+fn active_capture_binding<'a>(
+    state: &MacroPageState,
+    targets: &'a HashMap<AuthoringSessionId, CapturedTargetBinding>,
+) -> Option<&'a CapturedTargetBinding> {
+    state
+        .active_draft_session()
+        .and_then(|session| targets.get(&session))
+        .or_else(|| {
+            state
+                .active_wizard_session()
+                .and_then(|session| targets.get(&session))
+        })
+}
+
+fn project_live_target(binding: Option<&CapturedTargetBinding>) -> LiveTargetStatus {
+    let Some(binding) = binding else {
+        return LiveTargetStatus::Unbound;
+    };
+    let title = binding.profile().title.clone();
+    match binding.observe() {
+        Ok(snapshot) => LiveTargetStatus::Bound(LiveTargetFacts {
+            title,
+            is_foreground: snapshot.is_foreground,
+            is_visible: snapshot.is_visible,
+            is_minimized: snapshot.is_minimized,
+            client_width: snapshot.client_rect.width,
+            client_height: snapshot.client_rect.height,
+            dpi: snapshot.dpi,
+        }),
+        Err(_) => LiveTargetStatus::Lost { title },
+    }
 }
 
 fn publish_pending_template_if_current(
@@ -3693,6 +3752,12 @@ mod routing_tests {
         );
         assert_eq!(bottom_surface(AppPage::Macro), BottomSurface::MacroMonitor);
         assert!(MacroPage::BOTTOM_MAX_HEIGHT < APP_HEIGHT);
+        assert!(MacroPage::BOTTOM_DEFAULT_HEIGHT <= 220.0);
+    }
+
+    #[test]
+    fn missing_capture_binding_projects_unbound_status() {
+        assert_eq!(project_live_target(None), LiveTargetStatus::Unbound);
     }
 
     #[test]

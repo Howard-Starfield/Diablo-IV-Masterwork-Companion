@@ -1148,6 +1148,10 @@ impl CapturedTargetBinding {
         &self.profile
     }
 
+    pub fn observe(&self) -> Result<TargetSnapshot> {
+        self.guard.snapshot()
+    }
+
     /// Brings the selected target forward, then revalidates its concrete HWND,
     /// process instance and capture geometry. Only absolute movement is refreshed.
     pub fn prepare_client_rect(&self) -> Result<Rect> {

@@ -55,10 +55,31 @@ impl Default for MacroCanvasLayout {
 }
 
 impl MacroCanvasLayout {
+    pub const MIN_PANE_WIDTH: f32 = 120.0;
+    pub const MAX_PANE_WIDTH: f32 = 480.0;
+
+    pub fn sanitized_library_width(&self) -> f32 {
+        Self::sanitize_pane_width(self.library_width, Self::default().library_width)
+    }
+
+    pub fn sanitized_inspector_width(&self) -> f32 {
+        Self::sanitize_pane_width(self.inspector_width, Self::default().inspector_width)
+    }
+
+    fn sanitize_pane_width(value: f32, fallback: f32) -> f32 {
+        if value.is_finite() && value > 0.0 {
+            value.clamp(Self::MIN_PANE_WIDTH, Self::MAX_PANE_WIDTH)
+        } else {
+            fallback
+        }
+    }
+
     #[cfg(test)]
     pub fn is_finite(&self) -> bool {
         self.pan.iter().all(|value| value.is_finite())
             && self.zoom.is_finite()
+            && self.library_width.is_finite()
+            && self.inspector_width.is_finite()
             && self
                 .node_positions
                 .values()
@@ -81,12 +102,16 @@ impl MacroCanvasLayout {
             self.zoom = zoom;
             changed = true;
         }
-        if !self.library_width.is_finite() {
-            self.library_width = Self::default().library_width;
+        let library_width =
+            Self::sanitize_pane_width(self.library_width, Self::default().library_width);
+        if self.library_width != library_width {
+            self.library_width = library_width;
             changed = true;
         }
-        if !self.inspector_width.is_finite() {
-            self.inspector_width = Self::default().inspector_width;
+        let inspector_width =
+            Self::sanitize_pane_width(self.inspector_width, Self::default().inspector_width);
+        if self.inspector_width != inspector_width {
+            self.inspector_width = inspector_width;
             changed = true;
         }
         let before = self.node_positions.len();
@@ -266,6 +291,28 @@ mod tests {
         assert_eq!(layout.zoom, 1.75);
         assert_eq!(layout.node_positions.len(), 1);
         assert!(layout.is_finite());
+    }
+
+    #[test]
+    fn out_of_range_pane_widths_are_clamped_before_use() {
+        let mut state = AppUiState {
+            macro_layouts: BTreeMap::from([(
+                "macro".to_string(),
+                MacroCanvasLayout {
+                    library_width: 12_000.0,
+                    inspector_width: f32::NAN,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(sanitize_state(&mut state));
+        let layout = &state.macro_layouts["macro"];
+        assert_eq!(layout.library_width, MacroCanvasLayout::MAX_PANE_WIDTH);
+        assert_eq!(
+            layout.inspector_width,
+            MacroCanvasLayout::default().inspector_width
+        );
     }
 
     #[test]

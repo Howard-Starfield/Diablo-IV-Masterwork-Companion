@@ -1,21 +1,27 @@
+use std::collections::HashSet;
+
 use eframe::egui::{self, Color32, Frame, RichText, Sense, Stroke, Ui};
 
 use crate::engine::macro_engine::{Block, BlockKind, Condition, MacroDefinition, TimeoutOutcome};
 use crate::macro_ui::canvas_model::{CanvasSelection, block_category, block_presentation};
 use crate::ui_theme::{BlockCategory, category_style, colors, text};
 
-const INDENT_PX: f32 = 20.0;
+const INDENT_PX: f32 = 18.0;
+const ROW_MIN_HEIGHT: f32 = 40.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepListRow {
     Block {
         id: String,
         indent: usize,
+        display_index: u32,
         title: String,
         summary: String,
         enabled: bool,
         category: BlockCategory,
         selection: CanvasSelection,
+        /// When set, this block is a collapsible container.
+        collapse: Option<CollapseChrome>,
     },
     Section {
         title: String,
@@ -23,6 +29,18 @@ pub enum StepListRow {
         selection: Option<CanvasSelection>,
         empty: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollapseChrome {
+    pub collapsed: bool,
+    pub child_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepListAction {
+    Select(CanvasSelection),
+    ToggleCollapse(String),
 }
 
 impl StepListRow {
@@ -47,6 +65,25 @@ impl StepListRow {
         }
     }
 
+    #[cfg(test)]
+    pub fn display_index(&self) -> Option<u32> {
+        match self {
+            Self::Block { display_index, .. } => Some(*display_index),
+            Self::Section { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_collapsed_container(&self) -> bool {
+        matches!(
+            self,
+            Self::Block {
+                collapse: Some(CollapseChrome { collapsed: true, .. }),
+                ..
+            }
+        )
+    }
+
     pub fn selection(&self) -> Option<&CanvasSelection> {
         match self {
             Self::Block { selection, .. } => Some(selection),
@@ -56,28 +93,88 @@ impl StepListRow {
 }
 
 pub fn project_step_list(definition: &MacroDefinition) -> Vec<StepListRow> {
+    project_step_list_collapsed(definition, &HashSet::new())
+}
+
+pub fn project_step_list_collapsed(
+    definition: &MacroDefinition,
+    collapsed: &HashSet<String>,
+) -> Vec<StepListRow> {
     let mut rows = Vec::new();
-    append_blocks(&definition.blocks, 0, &mut rows);
+    let mut next_index = 1u32;
+    append_blocks(&definition.blocks, 0, collapsed, &mut next_index, &mut rows);
     rows
 }
 
-fn append_blocks(blocks: &[Block], indent: usize, rows: &mut Vec<StepListRow>) {
+fn append_blocks(
+    blocks: &[Block],
+    indent: usize,
+    collapsed: &HashSet<String>,
+    next_index: &mut u32,
+    rows: &mut Vec<StepListRow>,
+) {
     for block in blocks {
         let (title, summary) = block_presentation(&block.kind);
+        let collapse = container_collapse(block, collapsed);
+        let skip_children = collapse
+            .as_ref()
+            .is_some_and(|chrome| chrome.collapsed);
         rows.push(StepListRow::Block {
             id: block.id.clone(),
             indent,
+            display_index: *next_index,
             title,
             summary,
             enabled: block.enabled,
             category: block_category(&block.kind),
             selection: CanvasSelection::Block(block.id.clone()),
+            collapse,
         });
-        append_owned(block, indent + 1, rows);
+        *next_index += 1;
+        if !skip_children {
+            append_owned(block, indent + 1, collapsed, next_index, rows);
+        }
     }
 }
 
-fn append_owned(block: &Block, indent: usize, rows: &mut Vec<StepListRow>) {
+fn container_collapse(block: &Block, collapsed: &HashSet<String>) -> Option<CollapseChrome> {
+    let child_count = match &block.kind {
+        BlockKind::If {
+            then_body,
+            else_body,
+            ..
+        } => then_body.len() + else_body.len(),
+        BlockKind::RepeatN { body, .. }
+        | BlockKind::RepeatUntil { body, .. }
+        | BlockKind::Continuous { body } => body.len(),
+        BlockKind::WatchGroup { group } => {
+            let lanes: usize = group.lanes.iter().map(|lane| lane.then_body.len()).sum();
+            let timeout = match &group.timeout_outcome {
+                TimeoutOutcome::RunBody { body } => body.len(),
+                TimeoutOutcome::StopError { .. } | TimeoutOutcome::Continue => 0,
+            };
+            lanes + timeout
+        }
+        BlockKind::Observe { .. }
+        | BlockKind::Action { .. }
+        | BlockKind::Wait { .. }
+        | BlockKind::StopSuccess
+        | BlockKind::StopError { .. }
+        | BlockKind::Comment { .. } => return None,
+    };
+    Some(CollapseChrome {
+        collapsed: collapsed.contains(&block.id),
+        child_count,
+    })
+}
+
+fn append_owned(
+    block: &Block,
+    indent: usize,
+    collapsed: &HashSet<String>,
+    next_index: &mut u32,
+    rows: &mut Vec<StepListRow>,
+) {
     match &block.kind {
         BlockKind::If {
             condition,
@@ -93,7 +190,7 @@ fn append_owned(block: &Block, indent: usize, rows: &mut Vec<StepListRow>) {
                 then_body.is_empty(),
                 rows,
             );
-            append_blocks(then_body, indent + 1, rows);
+            append_blocks(then_body, indent + 1, collapsed, next_index, rows);
             push_section(
                 "ELSE",
                 indent,
@@ -103,19 +200,19 @@ fn append_owned(block: &Block, indent: usize, rows: &mut Vec<StepListRow>) {
                 else_body.is_empty(),
                 rows,
             );
-            append_blocks(else_body, indent + 1, rows);
-            append_timeout(condition, &block.id, indent, rows);
+            append_blocks(else_body, indent + 1, collapsed, next_index, rows);
+            append_timeout(condition, &block.id, indent, collapsed, next_index, rows);
         }
         BlockKind::RepeatN { body, .. } | BlockKind::Continuous { body } => {
             push_section("LOOP BODY", indent, None, body.is_empty(), rows);
-            append_blocks(body, indent + 1, rows);
+            append_blocks(body, indent + 1, collapsed, next_index, rows);
         }
         BlockKind::RepeatUntil {
             condition, body, ..
         } => {
             push_section("LOOP BODY", indent, None, body.is_empty(), rows);
-            append_blocks(body, indent + 1, rows);
-            append_timeout(condition, &block.id, indent, rows);
+            append_blocks(body, indent + 1, collapsed, next_index, rows);
+            append_timeout(condition, &block.id, indent, collapsed, next_index, rows);
         }
         BlockKind::WatchGroup { group } => {
             for lane in &group.lanes {
@@ -129,7 +226,7 @@ fn append_owned(block: &Block, indent: usize, rows: &mut Vec<StepListRow>) {
                     lane.then_body.is_empty(),
                     rows,
                 );
-                append_blocks(&lane.then_body, indent + 1, rows);
+                append_blocks(&lane.then_body, indent + 1, collapsed, next_index, rows);
             }
             if let TimeoutOutcome::RunBody { body } = &group.timeout_outcome {
                 push_section(
@@ -141,11 +238,11 @@ fn append_owned(block: &Block, indent: usize, rows: &mut Vec<StepListRow>) {
                     body.is_empty(),
                     rows,
                 );
-                append_blocks(body, indent + 1, rows);
+                append_blocks(body, indent + 1, collapsed, next_index, rows);
             }
         }
         BlockKind::Observe { condition } => {
-            append_timeout(condition, &block.id, indent, rows);
+            append_timeout(condition, &block.id, indent, collapsed, next_index, rows);
         }
         BlockKind::Action { .. }
         | BlockKind::Wait { .. }
@@ -159,6 +256,8 @@ fn append_timeout(
     condition: &Condition,
     owner_id: &str,
     indent: usize,
+    collapsed: &HashSet<String>,
+    next_index: &mut u32,
     rows: &mut Vec<StepListRow>,
 ) {
     let Some(body) = timeout_body(condition) else {
@@ -173,7 +272,7 @@ fn append_timeout(
         body.is_empty(),
         rows,
     );
-    append_blocks(body, indent + 1, rows);
+    append_blocks(body, indent + 1, collapsed, next_index, rows);
 }
 
 fn timeout_body(condition: &Condition) -> Option<&[Block]> {
@@ -213,7 +312,7 @@ pub fn show(
     rows: &[StepListRow],
     current: Option<&CanvasSelection>,
     active_block: Option<&str>,
-) -> Option<CanvasSelection> {
+) -> Option<StepListAction> {
     if rows.is_empty() {
         ui.label(
             RichText::new("Create or select a macro to inspect its steps.")
@@ -222,7 +321,7 @@ pub fn show(
         );
         return None;
     }
-    let mut selection = None;
+    let mut action = None;
     egui::ScrollArea::vertical()
         .id_source("macro-step-list")
         .auto_shrink([false, false])
@@ -230,12 +329,12 @@ pub fn show(
             ui.set_width(ui.available_width());
             for row in rows {
                 if let Some(next) = show_row(ui, row, current, active_block) {
-                    selection = Some(next);
+                    action = Some(next);
                 }
-                ui.add_space(4.0);
+                ui.add_space(6.0);
             }
         });
-    selection
+    action
 }
 
 fn show_row(
@@ -243,11 +342,11 @@ fn show_row(
     row: &StepListRow,
     current: Option<&CanvasSelection>,
     active_block: Option<&str>,
-) -> Option<CanvasSelection> {
+) -> Option<StepListAction> {
     let selected = row.selection() == current;
     let is_section = matches!(row, StepListRow::Section { .. });
     let indent = row.indent() as f32 * INDENT_PX;
-    let mut chosen = None;
+    let mut action = None;
     ui.horizontal(|ui| {
         ui.add_space(indent);
         let fill = if selected {
@@ -265,17 +364,20 @@ fn show_row(
         let response = Frame::none()
             .fill(fill)
             .stroke(Stroke::new(1.0, stroke))
-            .rounding(5.0)
-            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
             .show(ui, |ui| {
+                ui.set_min_height(ROW_MIN_HEIGHT);
                 ui.set_width((ui.available_width() - 4.0).max(80.0));
                 match row {
                     StepListRow::Block {
                         id,
+                        display_index,
                         title,
                         summary,
                         enabled,
                         category,
+                        collapse,
                         ..
                     } => {
                         let style = category_style(*category);
@@ -285,6 +387,34 @@ fn show_row(
                             Color32::from_gray(130)
                         };
                         ui.horizontal(|ui| {
+                            if let Some(chrome) = collapse {
+                                let chevron = if chrome.collapsed { "▸" } else { "▾" };
+                                let toggle = ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(chevron)
+                                                .size(text::BODY)
+                                                .color(Color32::from_gray(180)),
+                                        )
+                                        .sense(Sense::click()),
+                                    )
+                                    .on_hover_text(if chrome.collapsed {
+                                        "Expand group"
+                                    } else {
+                                        "Collapse group"
+                                    });
+                                if toggle.clicked() {
+                                    action = Some(StepListAction::ToggleCollapse(id.clone()));
+                                }
+                            } else {
+                                ui.add_space(14.0);
+                            }
+                            ui.label(
+                                RichText::new(format!("{display_index:02}"))
+                                    .monospace()
+                                    .size(text::SUPPORTING)
+                                    .color(Color32::from_gray(140)),
+                            );
                             ui.label(
                                 RichText::new(style.icon)
                                     .size(text::BODY)
@@ -296,6 +426,13 @@ fn show_row(
                                     .strong()
                                     .color(title_color),
                             );
+                            if let Some(chrome) = collapse {
+                                ui.label(
+                                    RichText::new(format!("({})", chrome.child_count))
+                                        .size(text::META)
+                                        .color(Color32::from_gray(140)),
+                                );
+                            }
                             if !*enabled {
                                 ui.label(
                                     RichText::new("Disabled")
@@ -328,7 +465,7 @@ fn show_row(
                             );
                             if *empty {
                                 ui.label(
-                                    RichText::new("empty")
+                                    RichText::new("empty · click to insert")
                                         .size(text::META)
                                         .color(Color32::from_gray(130)),
                                 );
@@ -339,13 +476,13 @@ fn show_row(
             })
             .response;
         let clickable = response.interact(Sense::click());
-        if clickable.clicked() {
+        if clickable.clicked() && action.is_none() {
             if let Some(selection) = row.selection() {
-                chosen = Some(selection.clone());
+                action = Some(StepListAction::Select(selection.clone()));
             }
         }
     });
-    chosen
+    action
 }
 
 #[cfg(test)]
@@ -404,6 +541,37 @@ mod tests {
                 if_id: "if-1".into()
             })
         );
+        assert_eq!(rows[0].display_index(), Some(1));
+        assert_eq!(rows[2].display_index(), Some(2));
+        assert_eq!(rows[4].display_index(), Some(3));
+    }
+
+    #[test]
+    fn step_list_collapsed_if_hides_then_else() {
+        let mut collapsed = HashSet::new();
+        collapsed.insert("if-1".into());
+        let rows = project_step_list_collapsed(&fixture_if(), &collapsed);
+        assert_eq!(
+            row_titles(&rows),
+            vec![(0, "If".into(), Some("if-1".into()))]
+        );
+        assert!(rows[0].is_collapsed_container());
+        assert_eq!(rows[0].display_index(), Some(1));
+        match &rows[0] {
+            StepListRow::Block {
+                collapse: Some(chrome),
+                ..
+            } => assert_eq!(chrome.child_count, 2),
+            _ => panic!("expected collapsible If"),
+        }
+    }
+
+    #[test]
+    fn step_list_expanded_after_collapse_restores_branches() {
+        let rows = project_step_list_collapsed(&fixture_if(), &HashSet::new());
+        assert!(rows.iter().any(|row| row.title() == "THEN"));
+        assert!(rows.iter().any(|row| row.title() == "ELSE"));
+        assert_eq!(rows.iter().filter(|row| row.block_id().is_some()).count(), 3);
     }
 
     #[test]
